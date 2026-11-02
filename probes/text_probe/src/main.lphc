@@ -1,0 +1,295 @@
+@mode(host.native)
+
+# Probe for appkit.text: TextArea read/write, edits through insert (onChange),
+# fonts, alignment and text color (appkit.controls values); on a second area
+# the plain-text editor setup, border and inset, the selection API with the
+# UTF-16 / scalar conversions, and undo / redo with onEdited (which also runs
+# after Undo and Redo, unlike onChange). The output is checked against
+# selftest.out by run_all.sh --probes.
+
+from appkit.app import (appInit, run, quit, after, isSelfTest, Window, View, pixelHex);
+from appkit.text import (TextArea, TextRange, utf16Offset, scalarIndex, preferredScrollerStyle,
+    SCROLLER_LEGACY, SCROLLER_OVERLAY);
+from appkit.controls import (Font, ColorRef, systemColor, monospacedDigitSystemFont,
+    systemFontWithWeight, TEXT_CENTER, TEXT_RIGHT, TEXT_NATURAL, WEIGHT_REGULAR, WEIGHT_SEMIBOLD,
+    COLOR_SECONDARY_LABEL);
+
+var g_areas: list[TextArea] = [];
+
+## The styling read-back.
+func testStyle(): void {
+    let ta = g_areas[0];
+    println("alignment: " + ta.alignment());
+    ta.setAlignment(TEXT_CENTER);
+    println("setAlignment(center): " + ta.alignment());
+    ta.setAlignment(TEXT_RIGHT);
+    println("setAlignment(right): " + ta.alignment());
+    var bad = "no error";
+    try {
+        ta.setAlignment("middle");
+    } catch (ValueError as e) {
+        bad = "ValueError";
+    }
+    println("bad alignment: " + bad);
+    ta.setAlignment(TEXT_NATURAL);
+    ta.applyFont(monospacedDigitSystemFont(15.0, WEIGHT_REGULAR));
+    println("applyFont size: " + ta.font().size().to_string());
+    ta.applyFont(systemFontWithWeight(14.0, WEIGHT_SEMIBOLD));
+    println("semibold: " + (ta.font().weight() > 0.2).to_string());
+    ta.applyTextColor(systemColor(COLOR_SECONDARY_LABEL));
+    println("text color: " + ta.textColorRef().name());
+    return;
+}
+
+var g_changes: int = 0;
+## The second area's onChange and onEdited counts.
+var g_changes2: int = 0;
+var g_edits2: int = 0;
+
+func fmtRange(r: TextRange): string {
+    let s = "(" + r.location.to_string() + ", " + r.length.to_string() + ")";
+    return s;
+}
+
+func fmtInset(ta: TextArea): string {
+    let p = ta.textInset();
+    let s = (p.x as int).to_string() + " x " + (p.y as int).to_string();
+    return s;
+}
+
+## Plain-text setup, border, inset, editable (the second area).
+func testSetup(): void {
+    let ta = g_areas[1];
+    println("[setup]");
+    println("rich text by default: " + ta.isRichText().to_string());
+    println("border by default: " + ta.hasBorder().to_string());
+    ta.usePlainText(false);
+    println("usePlainText(false): rich " + ta.isRichText().to_string() + ", undo "
+        + ta.allowsUndo().to_string() + ", substitutions " + ta.smartSubstitutions().to_string());
+    ta.usePlainText(true);
+    println("usePlainText(true): substitutions " + ta.smartSubstitutions().to_string());
+    ta.setSmartSubstitutions(false);
+    println("setSmartSubstitutions(false): " + ta.smartSubstitutions().to_string());
+    ta.setRichText(true);
+    println("setRichText(true): " + ta.isRichText().to_string());
+    ta.setRichText(false);
+    ta.setAllowsUndo(false);
+    println("setAllowsUndo(false): " + ta.allowsUndo().to_string());
+    ta.setAllowsUndo(true);
+    ta.setBorder(true);
+    println("setBorder(true): " + ta.hasBorder().to_string());
+    ta.setTextInset(10.0, 6.0);
+    println("setTextInset: " + fmtInset(ta));
+    ta.setEditable(false);
+    println("setEditable(false): " + ta.isEditable().to_string());
+    ta.setEditable(true);
+    println("editable again: " + ta.isEditable().to_string());
+    return;
+}
+
+func styleName(style: int): string {
+    if (style == SCROLLER_LEGACY) {
+        return "legacy";
+    }
+    if (style == SCROLLER_OVERLAY) {
+        return "overlay";
+    }
+    let other = "other " + style.to_string();
+    return other;
+}
+
+## Whether the strip beside the text (6 points in from the right edge) is
+## drawn in another color than the empty text background next to it.
+func stripDrawn(area: View): bool {
+    let w = area.frame().w;
+    let strip = area.colorAt(w - 6.0, 40.0);
+    let text_bg = area.colorAt(w - 40.0, 40.0);
+    let differs = pixelHex(strip) != pixelHex(text_bg);
+    return differs;
+}
+
+## The scrollers of the second area: style, which scrollers exist,
+## auto-hiding, and what a render shows.
+func testScrollers(): void {
+    let ta = g_areas[1];
+    println("[scrollers]");
+    let preferred = preferredScrollerStyle();
+    println("preferred style is legacy or overlay: "
+        + (preferred == SCROLLER_LEGACY or preferred == SCROLLER_OVERLAY).to_string());
+    println("starts with the preferred style: " + (ta.scrollerStyle() == preferred).to_string());
+    println("constants: legacy " + SCROLLER_LEGACY.to_string() + ", overlay " + SCROLLER_OVERLAY.to_string());
+    println("vertical " + ta.hasVerticalScroller().to_string() + ", horizontal "
+        + ta.hasHorizontalScroller().to_string() + ", autohides " + ta.autohidesScrollers().to_string());
+    ta.setText("short");
+    ta.setScrollerStyle(SCROLLER_LEGACY);
+    println("setScrollerStyle(legacy): " + styleName(ta.scrollerStyle()) + ", shown "
+        + ta.verticalScrollerShown().to_string() + ", strip drawn " + stripDrawn(ta.area).to_string());
+    ta.setAutohidesScrollers(true);
+    println("setAutohidesScrollers(true): " + ta.autohidesScrollers().to_string() + ", shown with short text "
+        + ta.verticalScrollerShown().to_string() + ", strip drawn " + stripDrawn(ta.area).to_string());
+    var long_text = "";
+    var i = 0;
+    while (i < 30) {
+        long_text = long_text + "line " + i.to_string() + "\n";
+        i = i + 1;
+    }
+    ta.setText(long_text);
+    println("  with 30 lines: shown " + ta.verticalScrollerShown().to_string());
+    ta.setText("short");
+    ta.setAutohidesScrollers(false);
+    ta.setScrollerStyle(SCROLLER_OVERLAY);
+    println("setScrollerStyle(overlay): " + styleName(ta.scrollerStyle()) + ", strip drawn "
+        + stripDrawn(ta.area).to_string());
+    var bad = "no error";
+    try {
+        ta.setScrollerStyle(5);
+    } catch (ValueError as e) {
+        bad = "ValueError";
+    }
+    println("setScrollerStyle(5): " + bad + ", still " + styleName(ta.scrollerStyle()));
+    ta.setScrollers(true, true);
+    println("setScrollers(true, true): vertical " + ta.hasVerticalScroller().to_string() + ", horizontal "
+        + ta.hasHorizontalScroller().to_string());
+    ta.setScrollers(false, false);
+    println("setScrollers(false, false): vertical " + ta.hasVerticalScroller().to_string() + ", horizontal "
+        + ta.hasHorizontalScroller().to_string() + ", shown " + ta.verticalScrollerShown().to_string());
+    ta.setScrollers(true, false);
+    return;
+}
+
+## Selection, offsets and insert at the selection (the second area).
+func testSelection(): void {
+    let ta = g_areas[1];
+    println("[selection]");
+    let t = "héllo 😀 world";
+    ta.setText(t);
+    println("scalars " + t.length().to_string() + ", utf16Length " + ta.utf16Length().to_string());
+    println("utf16Offset(8): " + utf16Offset(t, 8).to_string() + ", scalarIndex(9): "
+        + scalarIndex(t, 9).to_string() + ", inside the pair scalarIndex(7): " + scalarIndex(t, 7).to_string()
+        + ", past the end scalarIndex(99): " + scalarIndex(t, 99).to_string());
+    var bad = "no error";
+    try {
+        utf16Offset(t, 99);
+    } catch (ValueError as e) {
+        bad = "ValueError";
+    }
+    println("utf16Offset past the end: " + bad);
+    ta.setSelectedRange(utf16Offset(t, 8), 5);
+    println("selectedRange: " + fmtRange(ta.selectedRange()) + " [" + ta.selectedText() + "]");
+    ta.setSelectedRange(6, 2);
+    println("the emoji: " + fmtRange(ta.selectedRange()) + " [" + ta.selectedText() + "]");
+    ta.scrollRangeToVisible(0, 1);
+    var bad_range = "no error";
+    try {
+        ta.setSelectedRange(14, 1);
+    } catch (ValueError as e) {
+        bad_range = "ValueError";
+    }
+    println("setSelectedRange(14, 1): " + bad_range);
+    var bad_scroll = "no error";
+    try {
+        ta.scrollRangeToVisible(-1, 0);
+    } catch (ValueError as e) {
+        bad_scroll = "ValueError";
+    }
+    println("scrollRangeToVisible(-1, 0): " + bad_scroll);
+    ta.setSelectedRange(9, 5);
+    let before = g_changes2;
+    ta.insert("there");
+    println("insert over the selection: [" + ta.text() + "] caret " + fmtRange(ta.selectedRange())
+        + ", onChange ran: " + (g_changes2 == before + 1).to_string());
+    ta.moveToStart();
+    println("moveToStart: " + fmtRange(ta.selectedRange()) + ", selectedText [" + ta.selectedText() + "]");
+    ta.moveToEnd();
+    println("moveToEnd: " + fmtRange(ta.selectedRange()));
+    ta.selectAll();
+    println("selectAll: " + fmtRange(ta.selectedRange()) + " [" + ta.selectedText() + "]");
+    return;
+}
+
+func undoState(ta: TextArea): string {
+    let s = "[" + ta.text() + "] undo " + ta.canUndo().to_string() + ", redo " + ta.canRedo().to_string();
+    return s;
+}
+
+## Undo and redo, undo steps and onEdited (the second area).
+func testUndo(): void {
+    let ta = g_areas[1];
+    println("[undo]");
+    ta.setText("");
+    ta.clearUndoHistory();
+    ta.focus();
+    println("cleared: " + undoState(ta));
+    println("undo() with nothing to undo: " + ta.undo().to_string());
+    ta.insert("alpha");
+    ta.endUndoStep();
+    ta.insert(" beta");
+    ta.endUndoStep();
+    println("typed: " + undoState(ta) + ", onChange " + g_changes2.to_string() + ", onEdited "
+        + g_edits2.to_string());
+    let changes = g_changes2;
+    let edit_count = g_edits2;
+    println("undo(): " + ta.undo().to_string() + " -> " + undoState(ta));
+    println("  after undo: onChange ran " + (g_changes2 - changes).to_string() + "x, onEdited ran "
+        + (g_edits2 - edit_count).to_string() + "x");
+    println("undo(): " + ta.undo().to_string() + " -> " + undoState(ta));
+    println("undo() again: " + ta.undo().to_string());
+    let edits_redo = g_edits2;
+    println("redo(): " + ta.redo().to_string() + " -> " + undoState(ta));
+    println("redo(): " + ta.redo().to_string() + " -> " + undoState(ta));
+    println("  after two redos: onEdited ran " + (g_edits2 - edits_redo).to_string() + "x");
+    println("redo() again: " + ta.redo().to_string());
+    # breakUndoCoalescing alone ends the typing run, not the event's group:
+    # both inserts are still one Undo here.
+    ta.insert(" x");
+    ta.breakUndoCoalescing();
+    ta.insert("y");
+    ta.undo();
+    println("breakUndoCoalescing, one undo: " + undoState(ta));
+    ta.insert(" gamma");
+    ta.endUndoStep();
+    ta.clearUndoHistory();
+    println("clearUndoHistory: " + undoState(ta));
+    ta.setText("loaded");
+    println("setText keeps onEdited quiet: onEdited " + g_edits2.to_string());
+    return;
+}
+
+pub func main(): void {
+    appInit("Text Probe");
+    let win = Window("Text Probe", 420.0, 400.0);
+    g_areas.push(TextArea());
+    let ta = g_areas[0];
+    ta.setFont(14.0, true);
+    ta.setSmartSubstitutions(false);
+    ta.setText("line one\nline two — ✓");
+    ta.onChange(func(): void { global g_changes; g_changes = g_changes + 1; });
+    win.add(ta.area, 10.0, 150.0, 400.0, 240.0);
+    g_areas.push(TextArea());
+    let ta2 = g_areas[1];
+    ta2.setFont(13.0, false);
+    ta2.onChange(func(): void { global g_changes2; g_changes2 = g_changes2 + 1; });
+    ta2.onEdited(func(): void { global g_edits2; g_edits2 = g_edits2 + 1; });
+    win.add(ta2.area, 10.0, 10.0, 400.0, 130.0);
+
+    if (isSelfTest()) {
+        after(0.4, func(): void {
+            println("text: [" + ta.text() + "]");
+            ta.focus();
+            ta.insert("\nthird line");
+            println("after insert: [" + ta.text() + "]");
+            println("changes: " + g_changes.to_string());
+            ta.setText("replaced");
+            println("after setText: [" + ta.text() + "] changes: " + g_changes.to_string());
+            ta.setText("line one\nline two — ✓\nthird line");
+            testStyle();
+            testSetup();
+            testScrollers();
+            testSelection();
+            testUndo();
+            if (runtime.args().len() > 1) { win.snapshot(runtime.args()[1]); }
+            quit();
+        });
+    }
+    run(win);
+}

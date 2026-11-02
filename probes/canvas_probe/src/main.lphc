@@ -1,0 +1,471 @@
+@mode(host.native)
+
+# Probe for appkit.canvas: a Canvas that draws shapes, paths and text, a
+# freehand stroke from mouse events, and typed text from key events. A second
+# canvas (in its own window) draws line caps, joins and dashes, which are
+# read back from its pixels and from its exported PNG, and carries per-region
+# tool tips.
+# `--self-test [png]` drives it with synthetic NSEvents, prints the observed
+# values, snapshots the window and quits.
+
+from appkit.objc import (cls, sel, nsstr, str_of, msg, msgI, msgII, msgIIII);
+from appkit.app import (appInit, run, quit, after, isSelfTest, isDarkMode, Window, Pixel, loadBitmap);
+from appkit.canvas import (Canvas, Graphics, LINE_CAP_BUTT, LINE_CAP_ROUND, LINE_CAP_SQUARE,
+    LINE_JOIN_MITER, LINE_JOIN_ROUND, LINE_JOIN_BEVEL);
+from appkit.controls import (ColorRef, Color, srgbColor, systemColor, COLOR_SYSTEM_BLUE, COLOR_LABEL);
+
+var g_draws: int = 0;
+var g_last_w: float = 0.0;
+var g_last_h: float = 0.0;
+var g_text_w: float = 0.0;
+var g_drawn_canvas: int = 0;
+var g_dirty: list[float] = [];
+var g_stroke: list[float] = [];
+var g_events: list[string] = [];
+var g_typed: string = "";
+var g_codes: list[int] = [];
+## The ColorRefs the scene draws with (made once: index 0 teal, 1 system blue,
+## 2 the label color).
+var g_colors: list[ColorRef] = [];
+var g_wins: list[Window] = [];
+var g_canvases: list[Canvas] = [];
+
+## What the style canvas's draw handler read back (printed by the
+## self-test), and whether it draws its last line with the class-wide default
+## cap (no setLineCap).
+var g_style_log: list[string] = [];
+
+## "painted" (black ink), "blank" (the white background) or "partial".
+func ink(p: Pixel): string {
+    if (p.r < 100 and p.g < 100 and p.b < 100) {
+        return "painted";
+    }
+    if (p.r > 200 and p.g > 200 and p.b > 200) {
+        return "blank";
+    }
+    return "partial";
+}
+
+## Whether `f` throws a ValueError.
+func throwsValueError(f: fn(): void): bool {
+    var threw = false;
+    try {
+        f();
+    } catch (ValueError as e) {
+        threw = true;
+    }
+    return threw;
+}
+
+## The style canvas: caps, joins and dashes in black on white.
+func drawStyles(g: Graphics): void {
+    global g_style_log;
+    g_style_log = [];
+    g.clear(1.0, 1.0, 1.0);
+    g_style_log.push("defaults: cap " + g.lineCap().to_string() + ", join " + g.lineJoin().to_string()
+        + ", dash " + g.lineDash().len().to_string());
+    g.setStrokeColor(0.0, 0.0, 0.0, 1.0);
+    # Before any setLineCap: NSBezierPath's class-wide default cap.
+    g.setLineWidth(10.0);
+    g.line(20.0, 190.0, 80.0, 190.0);
+
+    # Joins: right-angle corners at x = 80, 180, 280 (y = 30), 20 pt wide.
+    g.setLineWidth(20.0);
+    let joins = [LINE_JOIN_MITER, LINE_JOIN_ROUND, LINE_JOIN_BEVEL];
+    var j = 0;
+    while (j < 3) {
+        let cx = 80.0 + 100.0 * (j as float);
+        g.setLineJoin(joins[j]);
+        g.polyline([cx - 50.0, 30.0, cx, 30.0, cx, 80.0]);
+        j = j + 1;
+    }
+    g_style_log.push("lineJoin after setLineJoin(bevel): " + g.lineJoin().to_string());
+
+    # Caps: 10 pt lines from x = 20 to 80.
+    g.setLineWidth(10.0);
+    g.setLineJoin(LINE_JOIN_MITER);
+    g.setLineCap(LINE_CAP_BUTT);
+    g.line(20.0, 110.0, 80.0, 110.0);
+    g.setLineCap(LINE_CAP_ROUND);
+    g.line(20.0, 130.0, 80.0, 130.0);
+    g.setLineCap(LINE_CAP_SQUARE);
+    g.line(20.0, 150.0, 80.0, 150.0);
+    g_style_log.push("lineCap after setLineCap(square): " + g.lineCap().to_string());
+
+    # Dashes: 4 pt lines from x = 120.
+    g.setLineCap(LINE_CAP_BUTT);
+    g.setLineWidth(4.0);
+    g.setLineDash([10.0, 10.0], 0.0);
+    g.line(120.0, 130.0, 380.0, 130.0);
+    g.setLineDash([10.0, 10.0], 5.0);
+    g.line(120.0, 150.0, 380.0, 150.0);
+    g_style_log.push("lineDash: " + fmtList(g.lineDash()) + " phase " + fmt(g.lineDashPhase()));
+    g.setLineCap(LINE_CAP_ROUND);
+    g.setLineDash([0.0, 8.0], 0.0);
+    g.line(120.0, 170.0, 380.0, 170.0);
+    g.setLineDash([], 0.0);
+    g_style_log.push("solid again: dash " + g.lineDash().len().to_string());
+
+    g_style_log.push("setLineCap(7) ValueError: " + throwsValueError(func(): void { g.setLineCap(7); }).to_string());
+    g_style_log.push("setLineJoin(-2) ValueError: " + throwsValueError(func(): void { g.setLineJoin(-2); }).to_string());
+    g_style_log.push("setLineDash([-1]) ValueError: "
+        + throwsValueError(func(): void { g.setLineDash([-1.0], 0.0); }).to_string());
+    g_style_log.push("setLineDash([0, 0]) ValueError: "
+        + throwsValueError(func(): void { g.setLineDash([0.0, 0.0], 0.0); }).to_string());
+    return;
+}
+
+## The style canvas checks: pixels of a render and of the exported PNG, the
+## class-wide default cap, and the tool tips.
+func testStyles(): void {
+    let canvas = g_canvases[1];
+    canvas.display();
+    for (line in g_style_log) {
+        println("style " + line);
+    }
+    let b = canvas.render();
+    println("render is sRGB: " + b.isSrgb().to_string());
+    println("join miter: (88, 22) " + ink(b.colorAt(88.0, 22.0)) + ", (86, 24) " + ink(b.colorAt(86.0, 24.0)));
+    println("join round: (188, 22) " + ink(b.colorAt(188.0, 22.0)) + ", (186, 24) " + ink(b.colorAt(186.0, 24.0)));
+    println("join bevel: (288, 22) " + ink(b.colorAt(288.0, 22.0)) + ", (286, 24) " + ink(b.colorAt(286.0, 24.0)));
+    println("cap butt: inside " + ink(b.colorAt(50.0, 110.0)) + ", 3 pt past the end " + ink(b.colorAt(83.0, 110.0)));
+    println("cap round: inside " + ink(b.colorAt(50.0, 130.0)) + ", 3 pt past the end " + ink(b.colorAt(83.0, 130.0))
+        + ", 3 pt past and 4 pt aside " + ink(b.colorAt(83.0, 134.0)));
+    println("cap square: inside " + ink(b.colorAt(50.0, 150.0)) + ", 3 pt past the end " + ink(b.colorAt(83.0, 150.0))
+        + ", 3 pt past and 4 pt aside " + ink(b.colorAt(83.0, 154.0)));
+    println("dash [10, 10]: " + ink(b.colorAt(125.0, 130.0)) + " " + ink(b.colorAt(135.0, 130.0)) + " "
+        + ink(b.colorAt(145.0, 130.0)));
+    println("dash phase 5: " + ink(b.colorAt(122.0, 150.0)) + " " + ink(b.colorAt(130.0, 150.0)) + " "
+        + ink(b.colorAt(140.0, 150.0)));
+    println("dots [0, 8] round: " + ink(b.colorAt(128.0, 170.0)) + " " + ink(b.colorAt(132.0, 170.0)));
+    println("unset cap (class default butt): " + ink(b.colorAt(83.0, 190.0)));
+
+    # The exported PNG: sRGB, the canvas's size, the same pixels.
+    let exe = str_of(msg(msg(cls("NSBundle"), sel("mainBundle")), sel("executablePath")));
+    let parts = exe.split("/");
+    var dir_parts: list[string] = [];
+    var i = 0;
+    while (i + 1 < parts.len()) {
+        dir_parts.push(parts[i]);
+        i = i + 1;
+    }
+    let dir = dir_parts.join("/") + "/.temp";
+    let fm = msg(cls("NSFileManager"), sel("defaultManager"));
+    msgIIII(fm, sel("createDirectoryAtPath:withIntermediateDirectories:attributes:error:"), nsstr(dir), 1, 0, 0);
+    let path = dir + "/canvas-probe-styles.png";
+    canvas.snapshot(path);
+    let png = loadBitmap(path, true);
+    let size = png.pointSize();
+    println("png: sRGB " + png.isSrgb().to_string() + ", " + fmt(size.x) + " x " + fmt(size.y) + " pt, same pixels: "
+        + (pixelHexOf(png.colorAt(50.0, 130.0)) == pixelHexOf(b.colorAt(50.0, 130.0))
+            and pixelHexOf(png.colorAt(135.0, 130.0)) == pixelHexOf(b.colorAt(135.0, 130.0))
+            and png.width() == b.width()).to_string());
+    println("png cap round past the end: " + ink(png.colorAt(83.0, 130.0)) + ", butt: " + ink(png.colorAt(83.0, 110.0)));
+    png.release();
+    b.release();
+    msgII(fm, sel("removeItemAtPath:error:"), nsstr(path), 0);
+    var unreadable = "no error";
+    try {
+        loadBitmap(path, true);
+    } catch (RuntimeError as e) {
+        unreadable = "RuntimeError";
+    }
+    println("loadBitmap(removed file): " + unreadable);
+
+    # An app that sets NSBezierPath's class-wide default cap (loup-macos-sketchpad
+    # does) keeps it for every stroke that does not set one.
+    msgI(cls("NSBezierPath"), sel("setDefaultLineCapStyle:"), LINE_CAP_ROUND);
+    canvas.display();
+    println("class default round: " + g_style_log[0] + ", unset cap past the end "
+        + ink(canvas.colorAt(83.0, 190.0)));
+    msgI(cls("NSBezierPath"), sel("setDefaultLineCapStyle:"), LINE_CAP_BUTT);
+    canvas.display();
+
+    # Tool tips per region.
+    let t1 = canvas.addToolTip(20.0, 100.0, 60.0, 20.0, "Butt cap");
+    let t2 = canvas.addToolTip(20.0, 120.0, 60.0, 20.0, "Round cap");
+    println("tool tip tags: " + (t1 != 0 and t2 != 0 and t1 != t2).to_string() + ", count "
+        + canvas.toolTipCount().to_string());
+    println("toolTipAt(50, 110): " + canvas.toolTipAt(50.0, 110.0) + ", (50, 125): " + canvas.toolTipAt(50.0, 125.0)
+        + ", (390, 190): [" + canvas.toolTipAt(390.0, 190.0) + "]");
+    canvas.addToolTip(40.0, 105.0, 10.0, 10.0, "Overlap");
+    println("overlapping, added last: " + canvas.toolTipAt(45.0, 110.0) + ", count " + canvas.toolTipCount().to_string());
+    canvas.removeToolTip(t1);
+    println("removeToolTip: count " + canvas.toolTipCount().to_string() + ", (25, 110): ["
+        + canvas.toolTipAt(25.0, 110.0) + "]");
+    var bad_tag = "no error";
+    try {
+        canvas.removeToolTip(t1);
+    } catch (ValueError as e) {
+        bad_tag = "ValueError";
+    }
+    println("removeToolTip again: " + bad_tag);
+    var bad_rect = "no error";
+    try {
+        canvas.addToolTip(0.0, 0.0, 0.0, 5.0, "empty");
+    } catch (ValueError as e) {
+        bad_rect = "ValueError";
+    }
+    println("addToolTip(empty rect): " + bad_rect);
+    println("other canvas count: " + g_canvases[0].toolTipCount().to_string());
+    canvas.removeAllToolTips();
+    println("removeAllToolTips: count " + canvas.toolTipCount().to_string());
+    canvas.addToolTip(120.0, 120.0, 260.0, 60.0, "Dashes");
+    return;
+}
+
+func pixelHexOf(p: Pixel): string {
+    let s = p.r.to_string() + "," + p.g.to_string() + "," + p.b.to_string();
+    return s;
+}
+
+## Whether the pixel `p` shows the color `c` (to within 2/255 per channel).
+func shows(p: Pixel, c: Color): bool {
+    let r = ((c.r * 255.0) + 0.5) as int;
+    let g = ((c.g * 255.0) + 0.5) as int;
+    let b = ((c.b * 255.0) + 0.5) as int;
+    let ok = (p.r - r) <= 2 and (r - p.r) <= 2 and (p.g - g) <= 2 and (g - p.g) <= 2
+        and (p.b - b) <= 2 and (b - p.b) <= 2;
+    return ok;
+}
+
+## The ColorRef read-back.
+func testColorRefs(canvas: Canvas): void {
+    let teal = canvas.colorAt(320.0, 215.0);
+    println("applyFillColor(srgb) drawn: " + shows(teal, g_colors[0].components()).to_string());
+    let blue = canvas.colorAt(370.0, 215.0);
+    println("applyFillColor(system blue) drawn as resolved: "
+        + shows(blue, g_colors[1].componentsIn(isDarkMode())).to_string());
+    return;
+}
+
+func fmt(v: float): string {
+    # Rounded to 1 decimal so both builds print the same text.
+    let tenths = ((v * 10.0) + 0.5) as int;
+    let whole = tenths / 10;
+    let frac = tenths - whole * 10;
+    let s = whole.to_string() + "." + frac.to_string();
+    return s;
+}
+
+func fmtList(vs: list[float]): string {
+    var parts: list[string] = [];
+    for (v in vs) {
+        parts.push(fmt(v));
+    }
+    let s = parts.join(" ");
+    return s;
+}
+
+func drawScene(g: Graphics): void {
+    global g_draws;
+    global g_last_w;
+    global g_last_h;
+    global g_text_w;
+    global g_drawn_canvas;
+    global g_dirty;
+    g_draws = g_draws + 1;
+    g_dirty = [g.dirtyX, g.dirtyY, g.dirtyW, g.dirtyH];
+    g_last_w = g.width;
+    g_last_h = g.height;
+    g_drawn_canvas = g.canvas;
+
+    g.clear(0.96, 0.95, 0.90);
+
+    # Rectangles: filled, blended, outlined, rounded.
+    g.setFillColor(0.85, 0.20, 0.20, 1.0);
+    g.fillRect(20.0, 20.0, 80.0, 50.0);
+    g.setFillColor(0.20, 0.40, 0.90, 0.5);
+    g.fillRect(60.0, 45.0, 80.0, 50.0);
+    g.setStrokeColor(0.0, 0.0, 0.0, 1.0);
+    g.setLineWidth(3.0);
+    g.strokeRect(160.0, 20.0, 80.0, 50.0);
+    g.setFillColor(0.95, 0.75, 0.10, 1.0);
+    g.fillRoundedRect(250.0, 20.0, 60.0, 50.0, 12.0);
+    g.setStrokeColor(0.40, 0.20, 0.0, 1.0);
+    g.setLineWidth(2.0);
+    g.strokeRoundedRect(250.0, 20.0, 60.0, 50.0, 12.0);
+
+    # Ovals.
+    g.setFillColor(0.10, 0.65, 0.30, 1.0);
+    g.fillOval(20.0, 110.0, 70.0, 70.0);
+    g.setStrokeColor(0.50, 0.10, 0.60, 1.0);
+    g.setLineWidth(4.0);
+    g.strokeOval(110.0, 110.0, 90.0, 60.0);
+
+    # Lines and a polyline.
+    g.setStrokeColor(0.0, 0.0, 0.0, 1.0);
+    g.setLineWidth(1.0);
+    g.line(220.0, 110.0, 340.0, 180.0);
+    g.setStrokeColor(0.90, 0.40, 0.0, 1.0);
+    g.setLineWidth(2.0);
+    g.polyline([220.0, 180.0, 250.0, 120.0, 280.0, 180.0, 310.0, 120.0, 340.0, 180.0]);
+
+    # A filled polygon (triangle) and a path star (fill + stroke).
+    g.setFillColor(0.30, 0.30, 0.30, 1.0);
+    g.fillPolygon([360.0, 20.0, 400.0, 90.0, 320.0, 90.0]);
+    g.setFillColor(1.0, 0.85, 0.0, 1.0);
+    g.setStrokeColor(0.60, 0.40, 0.0, 1.0);
+    g.setLineWidth(2.0);
+    g.beginPath();
+    g.moveTo(380.0, 110.0);
+    g.lineTo(392.0, 150.0);
+    g.lineTo(360.0, 125.0);
+    g.lineTo(400.0, 125.0);
+    g.lineTo(368.0, 150.0);
+    g.closePath();
+    g.fill();
+    g.stroke();
+
+    # Text, with its measured width underlined.
+    g.text(20.0, 200.0, "Hello, Canvas ✓", 20.0, 0.10, 0.10, 0.40);
+    g_text_w = g.textWidth("Hello, Canvas ✓", 20.0);
+    g.setStrokeColor(0.10, 0.10, 0.40, 1.0);
+    g.setLineWidth(1.0);
+    g.line(20.0, 228.0, 20.0 + g_text_w, 228.0);
+
+    # The freehand stroke from the mouse, and the typed text.
+    if (g_stroke.len() >= 4) {
+        g.setStrokeColor(0.80, 0.0, 0.50, 1.0);
+        g.setLineWidth(5.0);
+        g.polyline(g_stroke);
+    }
+    g.text(20.0, 280.0, "typed: " + g_typed, 14.0, 0.0, 0.0, 0.0);
+
+    # ColorRef swatches: a fixed sRGB teal, the dynamic system blue, and an
+    # outline in the (dynamic) label color.
+    g.applyFillColor(g_colors[0]);
+    g.fillRect(300.0, 200.0, 40.0, 30.0);
+    g.applyFillColor(g_colors[1]);
+    g.fillRect(350.0, 200.0, 40.0, 30.0);
+    g.applyStrokeColor(g_colors[2]);
+    g.setLineWidth(1.0);
+    g.strokeRect(300.0, 240.0, 90.0, 20.0);
+    return;
+}
+
+## The self-test, a plain module function: it finds the window and the
+## canvas in module-level lists (the timer that runs it captures nothing).
+func selfTest(): void {
+    let win = g_wins[0];
+    let canvas = g_canvases[0];
+    let canvas_h = canvas.handle;
+    println("drawn on screen: " + (canvas.drawCount() > 0).to_string());
+    let before = canvas.drawCount();
+    canvas.display();
+    println("display() drew: " + (canvas.drawCount() == before + 1).to_string());
+    println("handler draws == drawCount: " + (g_draws == canvas.drawCount()).to_string());
+    println("graphics canvas is the canvas: " + (g_drawn_canvas == canvas_h).to_string());
+    println("graphics size: " + fmt(g_last_w) + " x " + fmt(g_last_h));
+    println("text width > 100: " + (g_text_w > 100.0).to_string());
+    println("full draw dirty: " + fmtList(g_dirty));
+    let probe_g = Graphics(canvas_h, 12.0, 34.0, 1.0, 2.0, 3.0, 4.0);
+    println("Graphics(...) fields: " + fmt(probe_g.width) + " " + fmt(probe_g.height) + " "
+        + (probe_g.canvas == canvas_h).to_string() + " "
+        + fmtList([probe_g.dirtyX, probe_g.dirtyY, probe_g.dirtyW, probe_g.dirtyH]));
+    let before_partial = canvas.drawCount();
+    canvas.redrawRect(10.0, 20.0, 30.0, 40.0);
+    canvas.flush();
+    println("redrawRect + flush drew: " + (canvas.drawCount() == before_partial + 1).to_string()
+        + ", dirty: " + fmtList(g_dirty));
+    let before_flush = canvas.drawCount();
+    canvas.flush();
+    println("flush with nothing pending drew: " + (canvas.drawCount() > before_flush).to_string());
+
+    let f = canvas.frame();
+    println("canvas frame: " + fmt(f.x) + " " + fmt(f.y) + " " + fmt(f.w) + " " + fmt(f.h));
+    let w = canvas.toWindow(10.0, 20.0);
+    println("toWindow(10, 20): " + fmt(w.x) + "," + fmt(w.y));
+    let c = canvas.fromWindow(w.x, w.y);
+    println("fromWindow back: " + fmt(c.x) + "," + fmt(c.y));
+
+    canvas.sendMouse("down", 40.0, 250.0);
+    canvas.sendMouse("drag", 120.0, 300.0);
+    canvas.sendMouse("drag", 200.0, 250.0);
+    canvas.sendMouse("drag", 280.0, 300.0);
+    canvas.sendMouse("up", 380.0, 240.0);
+    println("mouse: " + g_events.join(" | "));
+    println("has focus after click: " + canvas.hasFocus().to_string());
+    try {
+        canvas.sendMouse("hover", 1.0, 1.0);
+    } catch (Exception as e) {
+        println("bad kind: " + e.message);
+    }
+
+    println("focus(): " + canvas.focus().to_string());
+    canvas.sendKey("h", 4);
+    canvas.sendKey("i", 34);
+    canvas.sendKey("!", 18);
+    println("typed: " + g_typed);
+    var codes: list[string] = [];
+    for (k in g_codes) {
+        codes.push(k.to_string());
+    }
+    println("key codes: " + codes.join(","));
+
+    let n = canvas.drawCount();
+    canvas.redraw();
+    canvas.display();
+    println("redraw + display drew again: " + (canvas.drawCount() > n).to_string());
+    testColorRefs(canvas);
+    testStyles();
+    if (runtime.args().len() > 1) { win.snapshot(runtime.args()[1]); }
+    quit();
+    return;
+}
+
+pub func main(): void {
+    appInit("Canvas Probe");
+    g_colors.push(srgbColor(0.16, 0.62, 0.56, 1.0));
+    g_colors.push(systemColor(COLOR_SYSTEM_BLUE));
+    g_colors.push(systemColor(COLOR_LABEL));
+    g_wins.push(Window("Canvas Probe", 420.0, 320.0));
+    let win = g_wins[0];
+    g_canvases.push(Canvas(420.0, 320.0));
+    let canvas = g_canvases[0];
+    win.add(canvas, 0.0, 0.0, 420.0, 320.0);
+
+    canvas.onDraw(drawScene);
+
+    # The style canvas, in a second window of its own.
+    g_wins.push(Window("Canvas Probe Styles", 400.0, 200.0));
+    g_canvases.push(Canvas(400.0, 200.0));
+    g_wins[1].add(g_canvases[1], 0.0, 0.0, 400.0, 200.0);
+    g_canvases[1].onDraw(drawStyles);
+    canvas.onMouseDown(func(x: float, y: float): void {
+        global g_stroke;
+        global g_events;
+        g_stroke = [x, y];
+        g_events.push("down " + fmt(x) + "," + fmt(y));
+        g_canvases[0].redraw();
+    });
+    canvas.onMouseDrag(func(x: float, y: float): void {
+        global g_stroke;
+        global g_events;
+        g_stroke.push(x);
+        g_stroke.push(y);
+        g_events.push("drag " + fmt(x) + "," + fmt(y));
+        g_canvases[0].redraw();
+    });
+    canvas.onMouseUp(func(x: float, y: float): void {
+        global g_stroke;
+        global g_events;
+        g_stroke.push(x);
+        g_stroke.push(y);
+        g_events.push("up " + fmt(x) + "," + fmt(y));
+        g_canvases[0].redraw();
+    });
+    canvas.onKey(func(chars: string, code: int): void {
+        global g_typed;
+        global g_codes;
+        g_typed = g_typed + chars;
+        g_codes.push(code);
+        g_canvases[0].redraw();
+    });
+
+    if (isSelfTest()) {
+        g_wins[1].show();
+        after(0.5, func(): void { selfTest(); });
+    }
+    run(win);
+}

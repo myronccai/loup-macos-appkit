@@ -1,0 +1,11 @@
+.temp/
+.loup-cache/
+*.loupbuild.fp
+.DS_Store
+/probes/*/canvas-probe
+/probes/*/controls-probe
+/probes/*/core-probe
+/probes/*/dialogs-probe
+/probes/*/layout-probe
+/probes/*/table-probe
+/probes/*/text-probe

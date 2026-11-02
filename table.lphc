@@ -1,0 +1,1245 @@
+@mode(host.native)
+
+# appkit.table — data-driven tables (NSTableView in an NSScrollView) and
+# simple one-column lists.
+#
+# The table is cell-based: there is no `tableView:viewForTableColumn:row:`
+# delegate method, so AppKit asks the data source for each cell's object value
+# (an NSString) and draws it with the column's text cell. The data source,
+# the delegate and the double-click target of EVERY table is one instance of
+# the run-time class `LoupTableSource`; its methods are Loup functions that
+# look up the Loup closures registered for the NSTableView that asked (the
+# registries below are keyed by the table's Objective-C pointer). The proxy
+# classes stay immutable (`handle`, `scroll`).
+#
+# A closure that throws is reported on stderr; the exception never unwinds
+# through AppKit (a data-source closure that throws yields 0 rows / "").
+#
+# Check boxes. `addCheckBoxColumn(id, title, width)` makes a column of
+# NSButtonCell switches (the only non-text cells). Its state comes from the
+# same `setCell` closure as text ("1" / "true" / "yes" / "on" / "x" =
+# checked); a click runs `onToggle(column, row, checked)` (or, without one,
+# `onEdit` with "1" / "0"). `isChecked` and `cellText` ("1" / "0") read it
+# back; `clickCheckBox(column, row)` clicks it in a test. A check-box column
+# stays clickable whatever `setEditable` says; `setColumnEditable(id, false)`
+# makes it read-only (the delegate's `tableView:shouldTrackCell:…` refuses
+# the click).
+#
+# Column styling and sizing. `setColumnAlignment` / `setColumnFont`
+# (appkit.controls TEXT_* names and Fonts, e.g. monospacedDigitSystemFont for
+# figures), `columnTitle` (header read-back), `setColumnWidth`,
+# `setColumnWidthRange(id, min, max)`, `setColumnResizing(id, COLUMN_FIXED |
+# COLUMN_AUTORESIZES | COLUMN_USER_RESIZES | COLUMN_RESIZABLE)` and the
+# table's `setColumnAutoresizing(AUTORESIZE_*)`. The widths given to
+# `addColumn` are a start only: once the table is in its window,
+# `sizeColumnsToFit()` (or `sizeLastColumnToFit()`) makes the columns fill
+# the visible width — without it a table whose columns add up to less shows
+# an empty strip at the right until the window is resized.
+#
+# Sorting. `onHeaderClick(column)` is the raw hook. `onSort(column,
+# ascending)` keeps the sort state for you: a click on the sorted column
+# flips the direction, a click on another sorts it ascending, and the header
+# indicator is already set when the handler runs (`sortColumn`,
+# `sortAscending`; `setSortIndicator` sets the starting state;
+# `setColumnSortable(id, false)` exempts a column).
+#
+# Clicks. `onSelect(row)` runs when the selection changes; `onClick(row)`
+# after every single click (the table's action, also on the row already
+# selected; -1 below the last row); `onDoubleClick(row)` on a double-click.
+#
+# Test hooks (each drives the path a user's action takes, so the same
+# handlers run): `clickRow(row)` (a click's steps: the table takes the
+# focus, the row becomes the selection unless the delegate refuses it —
+# `onSelect` when it changed — and the table's action runs `onClick`),
+# `clickHeader(id)` (the
+# delegate's tableView:didClickTableColumn:), `doubleClickRow(row)` (select,
+# then the table's double action), `clickCheckBox(id, row)`
+# (performClickOnCellAtColumn:row:), `commitEdit(id, row, text)` (editCell,
+# then the field editor types `text` and gets Return, so AppKit hands the
+# value to tableView:setObjectValue:forTableColumn:row: and `onEdit` runs).
+# Unknown columns and rows throw ValueError.
+
+from appkit.objc import (cls, sel, make, nsstr, nsint, str_of, msg, msgV, msgI, msgII, msgIIII,
+    msgD, msgRetD, objc_allocateClassPair, objc_registerClassPair, class_addMethod, load_appkit);
+from appkit.app import (View, runHandler);
+from appkit.controls import (Font, textAlignmentValue, textAlignmentName, TEXT_CENTER);
+
+## NSBezelBorder — the scroll view's frame.
+const BEZEL_BORDER: int = 2;
+## NSTableViewSolidVerticalGridLineMask | NSTableViewSolidHorizontalGridLineMask.
+const GRID_BOTH: int = 3;
+## NSTableColumnAutoresizingMask | NSTableColumnUserResizingMask.
+const COLUMN_RESIZE: int = 3;
+## NSButtonTypeSwitch / NSImageOnly (a check-box cell).
+const BUTTON_SWITCH: int = 3;
+const IMAGE_ONLY: int = 1;
+## A column maximum at or above this is "no maximum" (NSTableColumn's default
+## maxWidth is FLT_MAX).
+const UNLIMITED_WIDTH: float = 1.0e30;
+
+## Table column autoresizing (`setColumnAutoresizing`): no automatic resizing
+## (NSTableViewNoColumnAutoresizing).
+pub const AUTORESIZE_NONE: int = 0;
+## Table column autoresizing: every resizable column shares a width change
+## (the default for a TableView).
+pub const AUTORESIZE_UNIFORM: int = 1;
+## Table column autoresizing: the last resizable column first, then the
+## one before it, ….
+pub const AUTORESIZE_SEQUENTIAL: int = 2;
+## Table column autoresizing: the first resizable column first, then the next, ….
+pub const AUTORESIZE_REVERSE_SEQUENTIAL: int = 3;
+## Table column autoresizing: only the last column (a ListView's style).
+pub const AUTORESIZE_LAST: int = 4;
+## Table column autoresizing: only the first column.
+pub const AUTORESIZE_FIRST: int = 5;
+
+## Column resizing (`setColumnResizing`): a fixed width — neither the table
+## nor the user changes it.
+pub const COLUMN_FIXED: int = 0;
+## Column resizing: the table resizes the column (its autoresizing style),
+## the user cannot.
+pub const COLUMN_AUTORESIZES: int = 1;
+## Column resizing: only the user resizes the column (by dragging its edge).
+pub const COLUMN_USER_RESIZES: int = 2;
+## Column resizing: both (what `addColumn` gives every column).
+pub const COLUMN_RESIZABLE: int = 3;
+
+## The column identifier of a ListView's one column (for `cellText`,
+## `editCell`, `commitEdit`, `setColumnAlignment`, … on a list).
+pub const LIST_COLUMN: string = "item";
+
+var g_source_class: int = 0;
+var g_source: int = 0;
+var g_row_count: dict[int, fn(): int] = {};
+var g_cell: dict[int, fn(string, int): string] = {};
+var g_select: dict[int, fn(int): void] = {};
+var g_double: dict[int, fn(int): void] = {};
+var g_click: dict[int, fn(int): void] = {};
+# The table and row `clickRow` is clicking (the row its action reports, as
+# AppKit's clickedRow cannot be set); 0 / -1 otherwise.
+var g_test_click_table: int = 0;
+var g_test_click_row: int = -1;
+var g_edit: dict[int, fn(string, int, string): void] = {};
+var g_header_click: dict[int, fn(string): void] = {};
+var g_editable: dict[int, bool] = {};
+var g_header_view: dict[int, int] = {};
+var g_column_ids: dict[int, string] = {};
+var g_list_items: dict[int, list[string]] = {};
+# NSTableColumn → true for a check-box column (addCheckBoxColumn).
+var g_check_cols: dict[int, bool] = {};
+var g_toggle: dict[int, fn(string, int, bool): void] = {};
+var g_sort: dict[int, fn(string, bool): void] = {};
+# Table → the sorted column and its direction (setSortIndicator, onSort).
+var g_sort_col: dict[int, string] = {};
+var g_sort_asc: dict[int, bool] = {};
+# NSTableColumn → true when header clicks on it do not sort (setColumnSortable).
+var g_unsortable: dict[int, bool] = {};
+
+# ── dispatch ────────────────────────────────────────────────────────────────
+
+## The identifier string of the NSTableColumn `col` (cached by pointer).
+func columnId(col: int): string {
+    if (col == 0) {
+        return "";
+    }
+    if (g_column_ids.contains_key(col)) {
+        let cached = g_column_ids[col];
+        return cached;
+    }
+    let ident = str_of(msg(col, sel("identifier")));
+    g_column_ids[col] = ident;
+    return ident;
+}
+
+## The number of rows the Loup data source of `tv` reports (0 without one).
+func rowsOf(tv: int): int {
+    if (not g_row_count.contains_key(tv)) {
+        return 0;
+    }
+    let count_fn = g_row_count[tv];
+    var n = 0;
+    try {
+        n = count_fn();
+    } catch (Exception as e) {
+        printErr("appkit: the table row-count handler threw: " + e.message);
+        n = 0;
+    }
+    if (n < 0) {
+        n = 0;
+    }
+    return n;
+}
+
+## The text the Loup data source of `tv` gives for (`column`, `row`).
+func textOf(tv: int, column: string, row: int): string {
+    if (not g_cell.contains_key(tv)) {
+        return "";
+    }
+    let cell_fn = g_cell[tv];
+    var text = "";
+    try {
+        text = cell_fn(column, row);
+    } catch (Exception as e) {
+        printErr("appkit: the table cell handler threw: " + e.message);
+        text = "";
+    }
+    return text;
+}
+
+## `- (NSInteger)numberOfRowsInTableView:(NSTableView*)tv`.
+func impNumberOfRows(self_obj: int, cmd: int, tv: int): int {
+    let n = rowsOf(tv);
+    return n;
+}
+
+## `- (id)tableView:objectValueForTableColumn:row:` — an autoreleased NSString.
+## A check-box column's cell object is an NSNumber 1 / 0.
+func impObjectValue(self_obj: int, cmd: int, tv: int, col: int, row: int): int {
+    let text = textOf(tv, columnId(col), row);
+    if (g_check_cols.contains_key(col)) {
+        let on = isCheckedText(text);
+        let num = nsint(flag(on));
+        return num;
+    }
+    let ns = nsstr(text);
+    return ns;
+}
+
+## Whether a check-box column's cell text means "checked": "1", "true",
+## "yes", "on" or "x" (any case).
+func isCheckedText(text: string): bool {
+    let t = text.trim().toLowerCase();
+    let on = t == "1" or t == "true" or t == "yes" or t == "on" or t == "x";
+    return on;
+}
+
+## `- (void)tableView:setObjectValue:forTableColumn:row:` — a cell was edited.
+func impSetObjectValue(self_obj: int, cmd: int, tv: int, value: int, col: int, row: int): void {
+    if (g_check_cols.contains_key(col) and (msg(col, sel("isEditable")) & 255) == 0) {
+        # A read-only check-box column: AppKit flipped the cell anyway; show
+        # the data source's state again.
+        msgII(tv, sel("reloadDataForRowIndexes:columnIndexes:"),
+            msgI(cls("NSIndexSet"), sel("indexSetWithIndex:"), row),
+            msgI(cls("NSIndexSet"), sel("indexSetWithIndex:"), msgI(tv, sel("columnWithIdentifier:"), nsstr(columnId(col)))));
+        return;
+    }
+    if (g_check_cols.contains_key(col) and g_toggle.contains_key(tv)) {
+        let toggle_fn = g_toggle[tv];
+        var checked = false;
+        if (value != 0) {
+            checked = msg(value, sel("integerValue")) != 0;
+        }
+        let check_column = columnId(col);
+        runHandler(func(): void { toggle_fn(check_column, row, checked); }, "table check box");
+        return;
+    }
+    if (not g_edit.contains_key(tv)) {
+        return;
+    }
+    let edit_fn = g_edit[tv];
+    var text = "";
+    if (value != 0) {
+        text = str_of(msg(value, sel("description")));
+    }
+    let column = columnId(col);
+    runHandler(func(): void { edit_fn(column, row, text); }, "table edit");
+    return;
+}
+
+## `- (BOOL)tableView:shouldTrackCell:forTableColumn:row:` — NO for the boxes
+## of a read-only check-box column (a click does not flip them), YES (AppKit's
+## default) for every other cell.
+func impShouldTrackCell(self_obj: int, cmd: int, tv: int, cell: int, col: int, row: int): int {
+    if (col != 0 and g_check_cols.contains_key(col) and (msg(col, sel("isEditable")) & 255) == 0) {
+        return 0;
+    }
+    return 1;
+}
+
+## `- (void)tableViewSelectionDidChange:(NSNotification*)note`.
+func impSelectionDidChange(self_obj: int, cmd: int, note: int): void {
+    let tv = msg(note, sel("object"));
+    if (not g_select.contains_key(tv)) {
+        return;
+    }
+    let select_fn = g_select[tv];
+    let row = msg(tv, sel("selectedRow"));
+    runHandler(func(): void { select_fn(row); }, "table selection");
+    return;
+}
+
+## `- (void)loupTableDoubleClick:(NSTableView*)tv` — the table's double action.
+func impDoubleClick(self_obj: int, cmd: int, tv: int): void {
+    if (not g_double.contains_key(tv)) {
+        return;
+    }
+    let double_fn = g_double[tv];
+    var row = msg(tv, sel("clickedRow"));
+    if (row < 0) {
+        row = msg(tv, sel("selectedRow"));
+    }
+    runHandler(func(): void { double_fn(row); }, "table double-click");
+    return;
+}
+
+## `- (void)loupTableClick:(NSTableView*)tv` — the table's action, sent
+## when a click in the table ends (set by `onClick`).
+func impClick(self_obj: int, cmd: int, tv: int): void {
+    if (not g_click.contains_key(tv)) {
+        return;
+    }
+    let click_fn = g_click[tv];
+    var row = msg(tv, sel("clickedRow"));
+    if (row < 0 and g_test_click_table == tv) {
+        row = g_test_click_row;
+    }
+    runHandler(func(): void { click_fn(row); }, "table click");
+    return;
+}
+
+## `- (void)tableView:didClickTableColumn:` — a column header was clicked.
+## The `onHeaderClick` handler runs first, then (unless the column is not
+## sortable) the `onSort` one with the toggled direction.
+func impDidClickColumn(self_obj: int, cmd: int, tv: int, col: int): void {
+    let column = columnId(col);
+    if (g_header_click.contains_key(tv)) {
+        let header_fn = g_header_click[tv];
+        runHandler(func(): void { header_fn(column); }, "table header click");
+    }
+    if (g_sort.contains_key(tv) and not g_unsortable.contains_key(col)) {
+        let sort_fn = g_sort[tv];
+        var ascending = true;
+        if (g_sort_col.contains_key(tv) and g_sort_col[tv] == column) {
+            ascending = not g_sort_asc[tv];
+        }
+        showSortIndicator(tv, column, ascending);
+        runHandler(func(): void { sort_fn(column, ascending); }, "table sort");
+    }
+    return;
+}
+
+## Show the sort indicator of the column `identifier` of the table `tv` (and
+## highlight it), clear every other column's, and remember the sort state.
+## `identifier` "" (or an unknown one) clears them all.
+func showSortIndicator(tv: int, identifier: string, ascending: bool): void {
+    let cols = msg(tv, sel("tableColumns"));
+    let n = msg(cols, sel("count"));
+    var i = 0;
+    while (i < n) {
+        let c = msgI(cols, sel("objectAtIndex:"), i);
+        msgII(tv, sel("setIndicatorImage:inTableColumn:"), 0, c);
+        i = i + 1;
+    }
+    let col = msgI(tv, sel("tableColumnWithIdentifier:"), nsstr(identifier));
+    if (col == 0) {
+        msgI(tv, sel("setHighlightedTableColumn:"), 0);
+        g_sort_col[tv] = "";
+        g_sort_asc[tv] = true;
+        return;
+    }
+    var name = "NSDescendingSortIndicator";
+    if (ascending) {
+        name = "NSAscendingSortIndicator";
+    }
+    let image = msgI(cls("NSImage"), sel("imageNamed:"), nsstr(name));
+    msgII(tv, sel("setIndicatorImage:inTableColumn:"), image, col);
+    msgI(tv, sel("setHighlightedTableColumn:"), col);
+    g_sort_col[tv] = identifier;
+    g_sort_asc[tv] = ascending;
+    return;
+}
+
+## The Objective-C class every table's data source / delegate is (made once).
+func sourceClass(): int {
+    if (g_source_class == 0) {
+        load_appkit();
+        let c = objc_allocateClassPair(cls("NSObject"), "LoupTableSource", 0);
+        class_addMethod(c, sel("numberOfRowsInTableView:"), addressOf(impNumberOfRows), "q@:@");
+        class_addMethod(c, sel("tableView:objectValueForTableColumn:row:"),
+            addressOf(impObjectValue), "@@:@@q");
+        class_addMethod(c, sel("tableView:setObjectValue:forTableColumn:row:"),
+            addressOf(impSetObjectValue), "v@:@@@q");
+        class_addMethod(c, sel("tableViewSelectionDidChange:"), addressOf(impSelectionDidChange), "v@:@");
+        class_addMethod(c, sel("loupTableDoubleClick:"), addressOf(impDoubleClick), "v@:@");
+        class_addMethod(c, sel("loupTableClick:"), addressOf(impClick), "v@:@");
+        class_addMethod(c, sel("tableView:didClickTableColumn:"), addressOf(impDidClickColumn), "v@:@@");
+        class_addMethod(c, sel("tableView:shouldTrackCell:forTableColumn:row:"),
+            addressOf(impShouldTrackCell), "c@:@@@q");
+        objc_registerClassPair(c);
+        g_source_class = c;
+    }
+    return g_source_class;
+}
+
+## The single LoupTableSource instance.
+func source(): int {
+    if (g_source == 0) {
+        let c = sourceClass();
+        g_source = msg(msg(c, sel("alloc")), sel("init"));
+    }
+    return g_source;
+}
+
+func flag(b: bool): int {
+    var v = 0;
+    if (b) {
+        v = 1;
+    }
+    return v;
+}
+
+## A new NSScrollView (bezel border, vertical scroller) holding a new
+## NSTableView wired to the shared data source; returns the table.
+func makeTable(): int {
+    let src = source();
+    let table = make("NSTableView");
+    msgI(table, sel("setDataSource:"), src);
+    msgI(table, sel("setDelegate:"), src);
+    msgI(table, sel("setTarget:"), src);
+    msgI(table, sel("setDoubleAction:"), sel("loupTableDoubleClick:"));
+    msgI(table, sel("setColumnAutoresizingStyle:"), AUTORESIZE_UNIFORM);
+    g_editable[table] = false;
+    g_header_view[table] = msg(table, sel("headerView"));
+    return table;
+}
+
+func makeScroll(table: int): int {
+    let scroll = make("NSScrollView");
+    msgI(scroll, sel("setHasVerticalScroller:"), 1);
+    msgI(scroll, sel("setHasHorizontalScroller:"), 0);
+    msgI(scroll, sel("setAutohidesScrollers:"), 1);
+    msgI(scroll, sel("setBorderType:"), BEZEL_BORDER);
+    msgI(scroll, sel("setDocumentView:"), table);
+    return scroll;
+}
+
+# ── the table ──────────────────────────────────────────────────────────────
+
+## A table of text cells whose rows come from Loup closures. The table lives
+## in an NSScrollView: place and size `scroll` (not the table itself), e.g.
+## `win.add(table.scroll, 20.0, 20.0, 400.0, 300.0)`. `handle` is the
+## NSTableView.
+pub class TableView : View {
+    ## The NSScrollView around the table — the view to place and lay out.
+    pub let scroll: View;
+
+    ## A new, empty table (no columns, no rows) in a scroll view.
+    pub func constructor() {
+        let table = makeTable();
+        super(table);
+        this.scroll = View(makeScroll(table));
+    }
+
+    ## Add a column whose cells are asked for by `identifier` (the first
+    ## argument of the `setCell` closure); `title` is its header, `width` its
+    ## initial width in points.
+    pub func addColumn(identifier: string, title: string, width: float): void {
+        let col = msgI(msg(cls("NSTableColumn"), sel("alloc")), sel("initWithIdentifier:"), nsstr(identifier));
+        msgI(msg(col, sel("headerCell")), sel("setStringValue:"), nsstr(title));
+        msgD(col, sel("setWidth:"), width);
+        msgI(col, sel("setResizingMask:"), COLUMN_RESIZE);
+        msgI(col, sel("setEditable:"), flag(g_editable[this.handle]));
+        g_column_ids[col] = identifier;
+        msgI(this.handle, sel("addTableColumn:"), col);
+        return;
+    }
+
+    ## The number of columns.
+    pub func columnCount(): int {
+        let n = msg(this.handle, sel("numberOfColumns"));
+        return n;
+    }
+
+    ## Change the header title of the column `identifier`.
+    pub func setColumnTitle(identifier: string, title: string): void {
+        let col = this.column(identifier);
+        if (col != 0) {
+            msgI(msg(col, sel("headerCell")), sel("setStringValue:"), nsstr(title));
+            let header = msg(this.handle, sel("headerView"));
+            if (header != 0) {
+                msgI(header, sel("setNeedsDisplay:"), 1);
+            }
+        }
+        return;
+    }
+
+    ## The current width of the column `identifier` (0 when there is none).
+    pub func columnWidth(identifier: string): float {
+        let col = this.column(identifier);
+        if (col == 0) {
+            return 0.0;
+        }
+        let w = msgRetD(col, sel("width"));
+        return w;
+    }
+
+    ## The NSTableColumn named `identifier` (0 when there is none).
+    pub func column(identifier: string): int {
+        let col = msgI(this.handle, sel("tableColumnWithIdentifier:"), nsstr(identifier));
+        return col;
+    }
+
+    ## The data source's row count: called whenever the table (re)loads.
+    pub func setRowCount(count: fn(): int): void {
+        g_row_count[this.handle] = count;
+        return;
+    }
+
+    ## The data source's cells: `cell(column, row)` returns the text shown in
+    ## the column with identifier `column` at `row` (0-based).
+    pub func setCell(cell: fn(string, int): string): void {
+        g_cell[this.handle] = cell;
+        return;
+    }
+
+    ## Ask the data source again for the row count and every visible cell
+    ## (call after the data behind the closures changed).
+    pub func reload(): void {
+        msgV(this.handle, sel("reloadData"));
+        return;
+    }
+
+    ## The number of rows the table currently shows (as of the last reload).
+    pub func rowCount(): int {
+        let n = msg(this.handle, sel("numberOfRows"));
+        return n;
+    }
+
+    ## The text the table shows at (`column`, `row`), read back through
+    ## AppKit's prepared cell — i.e. what the data source delivered ("" when
+    ## the column or row does not exist). For a check-box column: "1" when
+    ## the box is checked, "0" when not.
+    pub func cellText(column: string, row: int): string {
+        let index = msgI(this.handle, sel("columnWithIdentifier:"), nsstr(column));
+        if (index < 0 or row < 0 or row >= this.rowCount()) {
+            return "";
+        }
+        let cell = msgII(this.handle, sel("preparedCellAtColumn:row:"), index, row);
+        if (g_check_cols.contains_key(this.column(column))) {
+            var state = "0";
+            if (msg(cell, sel("state")) != 0) {
+                state = "1";
+            }
+            return state;
+        }
+        let text = str_of(msg(cell, sel("stringValue")));
+        return text;
+    }
+
+    ## The selected row, -1 if none (with a multiple selection: the row most
+    ## recently added to it — use `selectedRows` for all of them).
+    pub func selectedRow(): int {
+        let r = msg(this.handle, sel("selectedRow"));
+        return r;
+    }
+
+    ## Select row `row` only (and scroll it into view); a negative `row`
+    ## clears the selection. Runs the `onSelect` handler.
+    pub func selectRow(row: int): void {
+        if (row < 0) {
+            this.deselectAll();
+            return;
+        }
+        let idx_set = msgI(cls("NSIndexSet"), sel("indexSetWithIndex:"), row);
+        msgII(this.handle, sel("selectRowIndexes:byExtendingSelection:"), idx_set, 0);
+        msgI(this.handle, sel("scrollRowToVisible:"), row);
+        return;
+    }
+
+    ## Every selected row, ascending.
+    pub func selectedRows(): list[int] {
+        var out: list[int] = [];
+        let idx_set = msg(this.handle, sel("selectedRowIndexes"));
+        let n = msg(idx_set, sel("count"));
+        var index = msg(idx_set, sel("firstIndex"));
+        var i = 0;
+        while (i < n) {
+            out.push(index);
+            index = msgI(idx_set, sel("indexGreaterThanIndex:"), index);
+            i = i + 1;
+        }
+        return out;
+    }
+
+    ## Select exactly `rows` (needs `setMultipleSelection(true)` for more than
+    ## one). Runs the `onSelect` handler.
+    pub func selectRows(rows: list[int]): void {
+        let idx_set = msg(cls("NSMutableIndexSet"), sel("indexSet"));
+        for (r in rows) {
+            msgI(idx_set, sel("addIndex:"), r);
+        }
+        msgII(this.handle, sel("selectRowIndexes:byExtendingSelection:"), idx_set, 0);
+        return;
+    }
+
+    ## Allow selecting several rows (⌘-click, ⇧-click).
+    pub func setMultipleSelection(allow: bool): void {
+        msgI(this.handle, sel("setAllowsMultipleSelection:"), flag(allow));
+        return;
+    }
+
+    ## Clear the selection.
+    pub func deselectAll(): void {
+        msgI(this.handle, sel("deselectAll:"), 0);
+        return;
+    }
+
+    ## Scroll so that `row` is visible.
+    pub func scrollToRow(row: int): void {
+        msgI(this.handle, sel("scrollRowToVisible:"), row);
+        return;
+    }
+
+    ## Run `handler(row)` whenever the selection changes (by the user or by
+    ## `selectRow` / `selectRows` / `deselectAll`); `row` is `selectedRow()`
+    ## at that moment (-1 when the selection is empty).
+    pub func onSelect(handler: fn(int): void): void {
+        g_select[this.handle] = handler;
+        return;
+    }
+
+    ## Run `handler(row)` when a row is double-clicked (the clicked row; the
+    ## selected row when the action is sent programmatically). Editable
+    ## columns start editing on double-click instead.
+    pub func onDoubleClick(handler: fn(int): void): void {
+        g_double[this.handle] = handler;
+        return;
+    }
+
+    ## Run `handler(row)` after every single click in the table (the table's
+    ## action, sent when the mouse button goes up): `row` is the clicked row,
+    ## -1 for a click below the last row. Unlike `onSelect` it also runs for a
+    ## click on the row that is already selected. A double-click runs it for
+    ## the first click, then `onDoubleClick`. `clickRow` sends it in a test.
+    pub func onClick(handler: fn(int): void): void {
+        g_click[this.handle] = handler;
+        msgI(this.handle, sel("setAction:"), sel("loupTableClick:"));
+        return;
+    }
+
+    ## A test helper: click `row` once, as the user does. It takes the steps
+    ## of NSTableView's own click handling: the table takes the keyboard
+    ## focus (ending a field's editing, as a click does); the click proposes
+    ## that row as the whole selection (with multiple selection too) and the
+    ## delegate's `tableView:selectionIndexesForProposedSelection:` or
+    ## `tableView:shouldSelectRow:` may change or refuse it; the new
+    ## selection runs `onSelect` when it differs from the old one; then the
+    ## table's action is sent to its target, so `onClick(row)` runs (also
+    ## for the row already selected). The row is scrolled into view. Works in
+    ## a quiet self-test. (A synthetic mouse-down is not used: NSTableView
+    ## ignores it in an app that was never activated, and a quiet self-test
+    ## never is. During the action AppKit's `clickedRow` stays -1;
+    ## `onClick` gets the row.) Throws ValueError for a row the table does
+    ## not show.
+    pub func clickRow(row: int): void {
+        this.requireRow(row, "clickRow");
+        let tv = this.handle;
+        let win = msg(tv, sel("window"));
+        if (win != 0) {
+            msgI(win, sel("makeFirstResponder:"), tv);
+        }
+        var proposed = msgI(cls("NSIndexSet"), sel("indexSetWithIndex:"), row);
+        let delegate = msg(tv, sel("delegate"));
+        let select_hook = sel("tableView:selectionIndexesForProposedSelection:");
+        let should_hook = sel("tableView:shouldSelectRow:");
+        if (delegate != 0 and (msgI(delegate, sel("respondsToSelector:"), select_hook) & 255) != 0) {
+            proposed = msgII(delegate, select_hook, tv, proposed);
+        } else if (delegate != 0 and (msgI(delegate, sel("respondsToSelector:"), should_hook) & 255) != 0) {
+            let allowed = msgII(delegate, should_hook, tv, row) & 255;
+            if (allowed == 0) {
+                proposed = msg(tv, sel("selectedRowIndexes"));
+            }
+        }
+        let current = msg(tv, sel("selectedRowIndexes"));
+        let same = msgI(proposed, sel("isEqualToIndexSet:"), current) & 255;
+        if (same == 0) {
+            msgII(tv, sel("selectRowIndexes:byExtendingSelection:"), proposed, 0);
+        }
+        msgI(tv, sel("scrollRowToVisible:"), row);
+        let action = msg(tv, sel("action"));
+        if (action != 0) {
+            g_test_click_table = tv;
+            g_test_click_row = row;
+            msgII(tv, sel("sendAction:to:"), action, msg(tv, sel("target")));
+            g_test_click_table = 0;
+            g_test_click_row = -1;
+        }
+        return;
+    }
+
+    ## Make every text column (present and future) editable or not (the
+    ## default: not). A double-click on an editable cell edits it. Check-box
+    ## columns are left alone (they stay clickable; `setColumnEditable` makes
+    ## one read-only).
+    pub func setEditable(editable: bool): void {
+        g_editable[this.handle] = editable;
+        let cols = msg(this.handle, sel("tableColumns"));
+        let n = msg(cols, sel("count"));
+        var i = 0;
+        while (i < n) {
+            let col = msgI(cols, sel("objectAtIndex:"), i);
+            if (not g_check_cols.contains_key(col)) {
+                msgI(col, sel("setEditable:"), flag(editable));
+            }
+            i = i + 1;
+        }
+        return;
+    }
+
+    ## Make the column `identifier` editable or not.
+    pub func setColumnEditable(identifier: string, editable: bool): void {
+        let col = this.column(identifier);
+        if (col != 0) {
+            msgI(col, sel("setEditable:"), flag(editable));
+        }
+        return;
+    }
+
+    ## Run `handler(column, row, newText)` when the user finishes editing a
+    ## cell. Store the new text in your data; the table shows whatever the
+    ## `setCell` closure returns afterwards.
+    pub func onEdit(handler: fn(string, int, string): void): void {
+        g_edit[this.handle] = handler;
+        return;
+    }
+
+    ## Start editing the cell (`column`, `row`) as a double-click would
+    ## (selects the row; the column must be editable).
+    pub func editCell(column: string, row: int): void {
+        let index = msgI(this.handle, sel("columnWithIdentifier:"), nsstr(column));
+        if (index < 0) {
+            return;
+        }
+        this.selectRow(row);
+        msgIIII(this.handle, sel("editColumn:row:withEvent:select:"), index, row, 0, 1);
+        return;
+    }
+
+    ## Run `handler(column)` when a column header is clicked (a sorting hook:
+    ## sort your data, `setSortIndicator`, `reload`).
+    pub func onHeaderClick(handler: fn(string): void): void {
+        g_header_click[this.handle] = handler;
+        return;
+    }
+
+    ## Show the ascending / descending sort triangle in the header of the
+    ## column `identifier` (and highlight it); every other column's indicator
+    ## is cleared. `identifier` "" clears them all. Also sets the sort state
+    ## `onSort` toggles from (`sortColumn`, `sortAscending`).
+    pub func setSortIndicator(identifier: string, ascending: bool): void {
+        showSortIndicator(this.handle, identifier, ascending);
+        return;
+    }
+
+    ## The column `identifier`'s sort indicator: "ascending", "descending" or
+    ## "" (none).
+    pub func sortIndicator(identifier: string): string {
+        let col = this.column(identifier);
+        if (col == 0) {
+            return "";
+        }
+        let image = msgI(this.handle, sel("indicatorImageInTableColumn:"), col);
+        if (image == 0) {
+            return "";
+        }
+        let up = msgI(cls("NSImage"), sel("imageNamed:"), nsstr("NSAscendingSortIndicator"));
+        if (image == up) {
+            return "ascending";
+        }
+        return "descending";
+    }
+
+    ## Draw every other row with the alternate background color.
+    pub func setAlternatingRows(alternate: bool): void {
+        msgI(this.handle, sel("setUsesAlternatingRowBackgroundColors:"), flag(alternate));
+        return;
+    }
+
+    ## Whether alternate rows are tinted.
+    pub func alternatingRows(): bool {
+        let v = msg(this.handle, sel("usesAlternatingRowBackgroundColors")) & 255;
+        return v != 0;
+    }
+
+    ## Show or hide the column headers.
+    pub func setHeaderVisible(visible: bool): void {
+        if (visible) {
+            msgI(this.handle, sel("setHeaderView:"), g_header_view[this.handle]);
+        } else {
+            msgI(this.handle, sel("setHeaderView:"), 0);
+        }
+        # The scroll view builds its header clip view (and the content inset
+        # that keeps row 0 below the header) when the document view is set:
+        # re-attach the table so a re-shown header does not cover row 0.
+        let top = msg(this.handle, sel("selectedRow"));
+        msgI(this.scroll.handle, sel("setDocumentView:"), this.handle);
+        msgV(this.scroll.handle, sel("tile"));
+        if (top >= 0) {
+            msgI(this.handle, sel("scrollRowToVisible:"), top);
+        }
+        return;
+    }
+
+    ## Whether the column headers are shown.
+    pub func headerVisible(): bool {
+        let h = msg(this.handle, sel("headerView"));
+        return h != 0;
+    }
+
+    ## Draw grid lines between rows and columns.
+    pub func setGridLines(show: bool): void {
+        var mask = 0;
+        if (show) {
+            mask = GRID_BOTH;
+        }
+        msgI(this.handle, sel("setGridStyleMask:"), mask);
+        return;
+    }
+
+    ## The NSTableColumn `identifier`; throws ValueError when there is none.
+    func requireColumn(identifier: string, what: string): int {
+        let col = this.column(identifier);
+        if (col == 0) {
+            throw ValueError("appkit.table: " + what + ": no column '" + identifier + "'");
+        }
+        return col;
+    }
+
+    ## Align the text of the column `identifier` — its cells and its header
+    ## — with an appkit.controls alignment name (TEXT_LEFT, TEXT_CENTER,
+    ## TEXT_RIGHT, TEXT_JUSTIFIED, TEXT_NATURAL; e.g. figures right-aligned).
+    ## Throws ValueError for an unknown column or name.
+    pub func setColumnAlignment(identifier: string, alignment: string): void {
+        let col = this.requireColumn(identifier, "setColumnAlignment");
+        let value = textAlignmentValue(alignment);
+        msgI(msg(col, sel("dataCell")), sel("setAlignment:"), value);
+        msgI(msg(col, sel("headerCell")), sel("setAlignment:"), value);
+        msgI(this.handle, sel("setNeedsDisplay:"), 1);
+        let header = msg(this.handle, sel("headerView"));
+        if (header != 0) {
+            msgI(header, sel("setNeedsDisplay:"), 1);
+        }
+        return;
+    }
+
+    ## The alignment name of the column `identifier`'s cells.
+    pub func columnAlignment(identifier: string): string {
+        let col = this.requireColumn(identifier, "columnAlignment");
+        let a = textAlignmentName(msg(msg(col, sel("dataCell")), sel("alignment")));
+        return a;
+    }
+
+    ## Draw the cells of the column `identifier` in `font` (an
+    ## appkit.controls Font, e.g. `monospacedDigitSystemFont(12.0,
+    ## WEIGHT_REGULAR)` for figures). A larger font needs `setRowHeight`.
+    pub func setColumnFont(identifier: string, font: Font): void {
+        let col = this.requireColumn(identifier, "setColumnFont");
+        msgI(msg(col, sel("dataCell")), sel("setFont:"), font.handle);
+        msgI(this.handle, sel("setNeedsDisplay:"), 1);
+        return;
+    }
+
+    ## The font of the column `identifier`'s cells.
+    pub func columnFont(identifier: string): Font {
+        let col = this.requireColumn(identifier, "columnFont");
+        let f = Font(msg(msg(col, sel("dataCell")), sel("font")));
+        return f;
+    }
+
+    ## Draw the cells of every column in `font` (a ListView's one column too).
+    pub func setCellFont(font: Font): void {
+        let cols = msg(this.handle, sel("tableColumns"));
+        let n = msg(cols, sel("count"));
+        var i = 0;
+        while (i < n) {
+            let col = msgI(cols, sel("objectAtIndex:"), i);
+            msgI(msg(col, sel("dataCell")), sel("setFont:"), font.handle);
+            i = i + 1;
+        }
+        msgI(this.handle, sel("setNeedsDisplay:"), 1);
+        return;
+    }
+
+    ## The header title of the column `identifier` (what the header draws).
+    ## Throws ValueError for an unknown column.
+    pub func columnTitle(identifier: string): string {
+        let col = this.requireColumn(identifier, "columnTitle");
+        let t = str_of(msg(msg(col, sel("headerCell")), sel("stringValue")));
+        return t;
+    }
+
+    ## Set the width of the column `identifier` (points; kept within its
+    ## minimum and maximum). Throws ValueError for an unknown column.
+    pub func setColumnWidth(identifier: string, width: float): void {
+        let col = this.requireColumn(identifier, "setColumnWidth");
+        msgD(col, sel("setWidth:"), width);
+        return;
+    }
+
+    ## Limit the width of the column `identifier` to [`min`, `max`] points,
+    ## for the user's drags and for autoresizing alike (`max` <= 0: no
+    ## maximum). Throws ValueError for an unknown column or `max` < `min`.
+    pub func setColumnWidthRange(identifier: string, min: float, max: float): void {
+        let col = this.requireColumn(identifier, "setColumnWidthRange");
+        var top = max;
+        if (top <= 0.0) {
+            top = UNLIMITED_WIDTH;
+        }
+        if (top < min) {
+            throw ValueError("appkit.table: setColumnWidthRange: max " + max.to_string() + " < min " + min.to_string());
+        }
+        msgD(col, sel("setMinWidth:"), min);
+        msgD(col, sel("setMaxWidth:"), top);
+        return;
+    }
+
+    ## The minimum width of the column `identifier`.
+    pub func columnMinWidth(identifier: string): float {
+        let col = this.requireColumn(identifier, "columnMinWidth");
+        let w = msgRetD(col, sel("minWidth"));
+        return w;
+    }
+
+    ## The maximum width of the column `identifier` (0 when it has none).
+    pub func columnMaxWidth(identifier: string): float {
+        let col = this.requireColumn(identifier, "columnMaxWidth");
+        var w = msgRetD(col, sel("maxWidth"));
+        if (w >= UNLIMITED_WIDTH) {
+            w = 0.0;
+        }
+        return w;
+    }
+
+    ## Who may resize the column `identifier`: COLUMN_FIXED, COLUMN_AUTORESIZES
+    ## (the table, by its autoresizing style), COLUMN_USER_RESIZES (the user
+    ## only) or COLUMN_RESIZABLE (both, the default) — e.g. a narrow fixed
+    ## check-box column while the title column takes the slack. Throws
+    ## ValueError for an unknown column or mode.
+    pub func setColumnResizing(identifier: string, mode: int): void {
+        let col = this.requireColumn(identifier, "setColumnResizing");
+        if (mode < COLUMN_FIXED or mode > COLUMN_RESIZABLE) {
+            throw ValueError("appkit.table: setColumnResizing: unknown mode " + mode.to_string());
+        }
+        msgI(col, sel("setResizingMask:"), mode);
+        return;
+    }
+
+    ## The COLUMN_* resizing mode of the column `identifier`.
+    pub func columnResizing(identifier: string): int {
+        let col = this.requireColumn(identifier, "columnResizing");
+        let m = msg(col, sel("resizingMask")) & COLUMN_RESIZE;
+        return m;
+    }
+
+    ## How a change of the table's width is shared between the columns:
+    ## AUTORESIZE_UNIFORM (the default), AUTORESIZE_NONE,
+    ## AUTORESIZE_SEQUENTIAL, AUTORESIZE_REVERSE_SEQUENTIAL, AUTORESIZE_LAST
+    ## (a ListView's) or AUTORESIZE_FIRST. Only columns whose resizing
+    ## includes COLUMN_AUTORESIZES take part. Throws ValueError for an unknown
+    ## style.
+    pub func setColumnAutoresizing(style: int): void {
+        if (style < AUTORESIZE_NONE or style > AUTORESIZE_FIRST) {
+            throw ValueError("appkit.table: setColumnAutoresizing: unknown style " + style.to_string());
+        }
+        msgI(this.handle, sel("setColumnAutoresizingStyle:"), style);
+        return;
+    }
+
+    ## The AUTORESIZE_* style.
+    pub func columnAutoresizing(): int {
+        let s = msg(this.handle, sel("columnAutoresizingStyle"));
+        return s;
+    }
+
+    ## Resize the columns (by the autoresizing style) so that together they
+    ## fill the visible width of the table exactly. Widths given to
+    ## `addColumn` are only a start: when they add up to less (or more) than
+    ## the scroll view's width, the table shows an empty strip (or scrolls)
+    ## until the window is resized. Call it once the table is in its window
+    ## (after `Window.setContent` / `add`): it lays the window out first.
+    pub func sizeColumnsToFit(): void {
+        this.layoutForFit();
+        msgV(this.handle, sel("sizeToFit"));
+        return;
+    }
+
+    ## Resize only the last column so that the columns fill the visible
+    ## width (a ListView does this on `setItems`). Lays the window out first,
+    ## like `sizeColumnsToFit`.
+    pub func sizeLastColumnToFit(): void {
+        this.layoutForFit();
+        msgV(this.handle, sel("sizeLastColumnToFit"));
+        return;
+    }
+
+    ## Lay out the table's window (or just its scroll view when it has no
+    ## window) so that the clip view has its final width.
+    func layoutForFit(): void {
+        let win = msg(this.handle, sel("window"));
+        if (win != 0) {
+            msgV(msg(win, sel("contentView")), sel("layoutSubtreeIfNeeded"));
+        } else {
+            msgV(this.scroll.handle, sel("layoutSubtreeIfNeeded"));
+        }
+        msgV(this.scroll.handle, sel("tile"));
+        return;
+    }
+
+    ## Add a column of check boxes (an NSButtonCell of the switch type, no
+    ## title, centered) with header `title`, `width` points wide and a fixed
+    ## width (`setColumnResizing` changes it). The `setCell` closure gives
+    ## each box's state as text: "1" (or "true", "yes", "on", "x") checked,
+    ## anything else unchecked; `cellText` reads "1" / "0" back. A click on a
+    ## box runs the `onToggle` handler (without one, `onEdit` with "1" /
+    ## "0"); store the new state, the table shows what `setCell` returns
+    ## next. The column stays clickable whatever `setEditable` says;
+    ## `setColumnEditable(identifier, false)` makes it read-only.
+    pub func addCheckBoxColumn(identifier: string, title: string, width: float): void {
+        this.addColumn(identifier, title, width);
+        let col = this.column(identifier);
+        let cell = make("NSButtonCell");
+        msgI(cell, sel("setButtonType:"), BUTTON_SWITCH);
+        msgI(cell, sel("setTitle:"), nsstr(""));
+        msgI(cell, sel("setImagePosition:"), IMAGE_ONLY);
+        msgI(cell, sel("setAlignment:"), textAlignmentValue(TEXT_CENTER));
+        msgI(col, sel("setDataCell:"), cell);
+        msgV(cell, sel("release"));
+        msgI(col, sel("setResizingMask:"), COLUMN_FIXED);
+        msgI(col, sel("setEditable:"), 1);
+        msgI(msg(col, sel("headerCell")), sel("setAlignment:"), textAlignmentValue(TEXT_CENTER));
+        g_check_cols[col] = true;
+        return;
+    }
+
+    ## Whether the column `identifier` is a check-box column.
+    pub func isCheckBoxColumn(identifier: string): bool {
+        let col = this.column(identifier);
+        let b = col != 0 and g_check_cols.contains_key(col);
+        return b;
+    }
+
+    ## Run `handler(column, row, checked)` when the user clicks a check box
+    ## (`checked`: the box's new state). Store it in your data.
+    pub func onToggle(handler: fn(string, int, bool): void): void {
+        g_toggle[this.handle] = handler;
+        return;
+    }
+
+    ## Whether the box at (`column`, `row`) is checked, as the table shows it.
+    ## Throws ValueError unless `column` is a check-box column and `row` a row.
+    pub func isChecked(column: string, row: int): bool {
+        this.requireCheckCell(column, row, "isChecked");
+        let on = this.cellText(column, row) == "1";
+        return on;
+    }
+
+    ## A test helper: click the check box at (`column`, `row`) as the user
+    ## would (NSTableView performClickOnCellAtColumn:row:, which flips the box
+    ## and sends the new state through the data source to `onToggle`). A
+    ## read-only check-box column ignores the click, as it ignores the
+    ## user's. Throws ValueError unless `column` is a check-box column and
+    ## `row` a row.
+    pub func clickCheckBox(column: string, row: int): void {
+        this.requireCheckCell(column, row, "clickCheckBox");
+        if ((msg(this.column(column), sel("isEditable")) & 255) == 0) {
+            return;
+        }
+        let index = msgI(this.handle, sel("columnWithIdentifier:"), nsstr(column));
+        msgII(this.handle, sel("performClickOnCellAtColumn:row:"), index, row);
+        return;
+    }
+
+    func requireCheckCell(column: string, row: int, what: string): void {
+        let col = this.requireColumn(column, what);
+        if (not g_check_cols.contains_key(col)) {
+            throw ValueError("appkit.table: " + what + ": '" + column + "' is not a check-box column");
+        }
+        this.requireRow(row, what);
+        return;
+    }
+
+    ## Throw ValueError unless `row` is a row the table shows.
+    func requireRow(row: int, what: string): void {
+        if (row < 0 or row >= this.rowCount()) {
+            throw ValueError("appkit.table: " + what + ": no row " + row.to_string() + " (the table has "
+                + this.rowCount().to_string() + ")");
+        }
+        return;
+    }
+
+    ## Run `handler(column, ascending)` when a column header is clicked, with
+    ## the direction toggled for you: a click on the sorted column flips it,
+    ## a click on another column sorts that one ascending. The sort indicator
+    ## is already shown when the handler runs; sort your data and `reload()`.
+    ## Runs after any `onHeaderClick` handler. `setSortIndicator` sets the
+    ## starting state; `setColumnSortable(identifier, false)` exempts a column.
+    pub func onSort(handler: fn(string, bool): void): void {
+        g_sort[this.handle] = handler;
+        return;
+    }
+
+    ## Whether header clicks on the column `identifier` sort (`onSort`; the
+    ## default: true). `onHeaderClick` runs either way.
+    pub func setColumnSortable(identifier: string, sortable: bool): void {
+        let col = this.requireColumn(identifier, "setColumnSortable");
+        if (sortable) {
+            g_unsortable.remove(col);
+        } else {
+            g_unsortable[col] = true;
+        }
+        return;
+    }
+
+    ## The sorted column's identifier ("" when none): set by
+    ## `setSortIndicator` and by `onSort` header clicks.
+    pub func sortColumn(): string {
+        var c = "";
+        if (g_sort_col.contains_key(this.handle)) {
+            c = g_sort_col[this.handle];
+        }
+        return c;
+    }
+
+    ## Whether the sort is ascending (true when nothing is sorted).
+    pub func sortAscending(): bool {
+        var a = true;
+        if (g_sort_asc.contains_key(this.handle)) {
+            a = g_sort_asc[this.handle];
+        }
+        return a;
+    }
+
+    ## A test helper: click the header of the column `identifier` as the user
+    ## would — the delegate's `tableView:didClickTableColumn:`, the message
+    ## AppKit sends, so `onHeaderClick` and `onSort` run. Throws ValueError
+    ## for an unknown column.
+    pub func clickHeader(identifier: string): void {
+        let col = this.requireColumn(identifier, "clickHeader");
+        msgII(msg(this.handle, sel("delegate")), sel("tableView:didClickTableColumn:"), this.handle, col);
+        return;
+    }
+
+    ## A test helper: double-click `row` — select it, then send the table's
+    ## double action as AppKit does, so `onDoubleClick` runs with `row`
+    ## (whatever the columns' editability: it never starts editing). Throws
+    ## ValueError for a row the table does not show.
+    pub func doubleClickRow(row: int): void {
+        this.requireRow(row, "doubleClickRow");
+        this.selectRow(row);
+        msgII(this.handle, sel("sendAction:to:"), msg(this.handle, sel("doubleAction")),
+            msg(this.handle, sel("target")));
+        return;
+    }
+
+    ## A test helper: edit the cell (`column`, `row`) as the user would and
+    ## commit `text` — `editCell`, then the field editor selects all, types
+    ## `text` and gets Return, so AppKit hands the value to the data source
+    ## and `onEdit(column, row, text)` runs, exactly as for a real edit. When
+    ## the table cannot start editing (it is not in a window), the value goes
+    ## to the same data-source method directly. Throws ValueError for an
+    ## unknown or read-only column, a check-box column (`clickCheckBox`) or a
+    ## row the table does not show.
+    pub func commitEdit(column: string, row: int, text: string): void {
+        let col = this.requireColumn(column, "commitEdit");
+        if (g_check_cols.contains_key(col)) {
+            throw ValueError("appkit.table: commitEdit: '" + column + "' is a check-box column (use clickCheckBox)");
+        }
+        if ((msg(col, sel("isEditable")) & 255) == 0) {
+            throw ValueError("appkit.table: commitEdit: column '" + column + "' is not editable");
+        }
+        this.requireRow(row, "commitEdit");
+        this.editCell(column, row);
+        let editor = msg(this.handle, sel("currentEditor"));
+        if (editor == 0) {
+            msgIIII(msg(this.handle, sel("dataSource")), sel("tableView:setObjectValue:forTableColumn:row:"),
+                this.handle, nsstr(text), col, row);
+            msgV(this.handle, sel("reloadData"));
+            return;
+        }
+        msgI(editor, sel("selectAll:"), 0);
+        msgI(editor, sel("insertText:"), nsstr(text));
+        msgI(editor, sel("insertNewline:"), 0);
+        if (msg(this.handle, sel("currentEditor")) != 0) {
+            let win = msg(this.handle, sel("window"));
+            msgI(win, sel("makeFirstResponder:"), this.handle);
+        }
+        return;
+    }
+
+    ## Whether a cell of the table is being edited (a field editor is open).
+    pub func isEditing(): bool {
+        let e = msg(this.handle, sel("currentEditor")) != 0;
+        return e;
+    }
+
+    ## The height of every row, in points.
+    pub func setRowHeight(height: float): void {
+        msgD(this.handle, sel("setRowHeight:"), height);
+        return;
+    }
+
+    ## The height of every row, in points.
+    pub func rowHeight(): float {
+        let h = msgRetD(this.handle, sel("rowHeight"));
+        return h;
+    }
+}
+
+# ── the list ───────────────────────────────────────────────────────────────
+
+## A simple list: a one-column table without a header whose rows are the
+## strings given to `setItems`. Place `scroll`, as for TableView; every
+## TableView method works (`onSelect`, `onDoubleClick`, `selectRow`, …).
+pub class ListView : TableView {
+    ## An empty list in a scroll view.
+    pub func constructor() {
+        super();
+        let col = msgI(msg(cls("NSTableColumn"), sel("alloc")), sel("initWithIdentifier:"), nsstr(LIST_COLUMN));
+        msgI(col, sel("setResizingMask:"), COLUMN_RESIZE);
+        msgI(col, sel("setEditable:"), 0);
+        g_column_ids[col] = LIST_COLUMN;
+        msgI(this.handle, sel("addTableColumn:"), col);
+        msgI(this.handle, sel("setColumnAutoresizingStyle:"), AUTORESIZE_LAST);
+        msgI(this.handle, sel("setHeaderView:"), 0);
+        let h = this.handle;
+        g_list_items[h] = [];
+        g_row_count[h] = func(): int {
+            let items = g_list_items[h];
+            let n = items.len();
+            return n;
+        };
+        g_cell[h] = func(column: string, row: int): string {
+            let items = g_list_items[h];
+            if (row < 0 or row >= items.len()) {
+                return "";
+            }
+            let text = items[row];
+            return text;
+        };
+    }
+
+    ## Replace the rows with `items` and reload.
+    pub func setItems(items: list[string]): void {
+        g_list_items[this.handle] = items;
+        msgV(this.handle, sel("reloadData"));
+        msg(this.handle, sel("sizeLastColumnToFit"));
+        return;
+    }
+
+    ## The rows as last given to `setItems`.
+    pub func items(): list[string] {
+        let items = g_list_items[this.handle];
+        return items;
+    }
+
+    ## The selected item's text ("" when nothing is selected).
+    pub func selectedItem(): string {
+        let items = g_list_items[this.handle];
+        let r = msg(this.handle, sel("selectedRow"));
+        if (r < 0 or r >= items.len()) {
+            return "";
+        }
+        let text = items[r];
+        return text;
+    }
+}

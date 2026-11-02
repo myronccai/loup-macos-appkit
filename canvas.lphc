@@ -1,0 +1,966 @@
+@mode(host.native)
+
+# appkit.canvas — custom drawing and mouse / keyboard input.
+#
+# A Canvas is an instance of `LoupCanvas`, an NSView subclass created once at
+# run time (objc_allocateClassPair) whose methods are Loup functions:
+#
+#   drawRect:              → the canvas's onDraw handler, given a Graphics
+#   isFlipped              → YES: the origin is the TOP-LEFT corner, y grows down
+#   acceptsFirstResponder  → YES: the canvas can take keyboard focus
+#   acceptsFirstMouse:     → YES: a click on an inactive window reaches it
+#   mouseDown: / mouseDragged: / mouseUp:  → onMouseDown / onMouseDrag / onMouseUp
+#   keyDown:               → onKey (the typed characters and the key code)
+#
+# Handlers live in module-level registries keyed by the view's Objective-C
+# pointer, so the Canvas proxy stays immutable (`handle` only), like every
+# appkit proxy. Each handler runs through app.runHandler: an exception is
+# reported on stderr and never unwinds through AppKit.
+#
+# Mouse locations arrive in window coordinates (`locationInWindow`). They are
+# converted to the canvas's own (flipped) coordinates with
+# `-[NSView convertPoint:fromView:]`, called through NSInvocation because that
+# method returns a struct, which Loup cannot receive directly. This is exact
+# for any nesting of views, flipped or not, scrolled or scaled.
+#
+# Drawing state (colors, line width, line cap / join / dash, the current
+# path) is per draw: it resets to black / 1 pt / AppKit's default cap and
+# join / solid / no path at the start of every drawRect:. Colors are sRGB
+# components (`setFillColor(r, g, b, a)`) or an appkit.controls `ColorRef`
+# (`applyFillColor(systemColor(COLOR_SYSTEM_BLUE))`, `applyStrokeColor`,
+# `clearWith`): a system color is resolved for the canvas's appearance (light
+# or dark) at each draw.
+#
+# Stroke style: `setLineCap(LINE_CAP_BUTT | LINE_CAP_ROUND | LINE_CAP_SQUARE)`
+# (how open ends look), `setLineJoin(LINE_JOIN_MITER | LINE_JOIN_ROUND |
+# LINE_JOIN_BEVEL)` (how corners look) and `setLineDash(pattern, phase)`
+# (alternating on / off lengths in points; `[]` is solid) apply to every
+# later stroke of the draw; `lineCap()`, `lineJoin()` and `lineDash()` read
+# them back. Until a draw sets a cap or join, strokes keep NSBezierPath's
+# class-wide default (`[NSBezierPath defaultLineCapStyle]`, butt and miter
+# unless the app changed it), which is what the getters then report.
+#
+# Tool tips per region: `Canvas.addToolTip(x, y, w, h, text)` gives a
+# rectangle of the canvas (canvas coordinates) its own tool tip
+# (`addToolTipRect:owner:userData:`) and returns its tag;
+# `removeToolTip(tag)` / `removeAllToolTips()` take them away;
+# `toolTipCount()` and `toolTipAt(x, y)` read back what is registered
+# (AppKit has no getter for tool-tip rectangles; these read the library's
+# record of them). `View.setToolTip` still sets one tip for the whole view.
+#
+# Reading back what the canvas drew: a Canvas is an appkit.app View, so
+# `canvas.render()` (a `Bitmap`), `canvas.colorAt(x, y)` (a `Pixel`, canvas
+# coordinates, y down) and `canvas.snapshot(path)` (a PNG) work on it. The
+# bitmap is tagged sRGB before the canvas draws into it, so its pixels are
+# exactly the sRGB values drawn, and the PNG carries the sRGB profile;
+# `appkit.app.loadBitmap(path, true)` reads such a PNG back.
+
+from appkit.objc import (cls, sel, nsstr, str_of, Rect, rect_of, point_of, nsarray, double_at,
+    msg, msgV, msgI, msgII, msgIS, msgD, msgDD, msgDDDD, msgDDDDII, msgIID, msgRetDI, objc_allocateClassPair,
+    objc_registerClassPair, class_addMethod, malloc, free, load_appkit);
+from appkit.app import (View, runHandler);
+from appkit.controls import (ColorRef);
+
+@symbol("objc_msgSend") extern native "objc" func msgDDI(recv: int, sel: int, x: float, y: float, a: int): int;
+@symbol("objc_msgSend") extern native "objc" func msgDDDDDD(recv: int, sel: int, a: float, b: float, c: float,
+    d: float, e: float, f: float): int;
+@symbol("objc_msgSend") extern native "objc" func msgMouseEvent(recv: int, sel: int, kind: int, x: float,
+    y: float, flags: int, ts: float, window_number: int, context: int, event_number: int,
+    click_count: int, pressure: float32): int;
+@symbol("objc_msgSend") extern native "objc" func msgKeyEvent(recv: int, sel: int, kind: int, x: float,
+    y: float, flags: int, ts: float, window_number: int, context: int, chars: int, chars_plain: int,
+    is_repeat: uint8, key_code: uint16): int;
+extern native "AppKit.framework" func NSRectFill(x: float, y: float, w: float, h: float): void;
+
+## NSLineCapStyle: flat ends at the end points (AppKit's default).
+pub const LINE_CAP_BUTT: int = 0;
+## NSLineCapStyle: half-circle ends around the end points.
+pub const LINE_CAP_ROUND: int = 1;
+## NSLineCapStyle: square ends reaching half the line width past the ends.
+pub const LINE_CAP_SQUARE: int = 2;
+## NSLineJoinStyle: sharp corners (AppKit's default; very sharp ones are
+## beveled past the miter limit).
+pub const LINE_JOIN_MITER: int = 0;
+## NSLineJoinStyle: rounded corners.
+pub const LINE_JOIN_ROUND: int = 1;
+## NSLineJoinStyle: corners cut off flat.
+pub const LINE_JOIN_BEVEL: int = 2;
+
+## NSEventTypeLeftMouseDown / LeftMouseUp / LeftMouseDragged / KeyDown.
+const EVENT_MOUSE_DOWN: int = 1;
+const EVENT_MOUSE_UP: int = 2;
+const EVENT_MOUSE_DRAGGED: int = 6;
+const EVENT_KEY_DOWN: int = 10;
+
+var g_canvas_class: int = 0;
+var g_draw: dict[int, fn(Graphics): void] = {};
+var g_draw_counts: dict[int, int] = {};
+var g_mouse_down: dict[int, fn(float, float): void] = {};
+var g_mouse_drag: dict[int, fn(float, float): void] = {};
+var g_mouse_up: dict[int, fn(float, float): void] = {};
+var g_key: dict[int, fn(string, int): void] = {};
+
+# Drawing state of the draw in progress (reset by every drawRect:).
+var g_fill_color: int = 0;
+var g_stroke_color: int = 0;
+var g_line_width: float = 1.0;
+var g_path: int = 0;
+## The line cap and join set in this draw (-1: NSBezierPath's default).
+var g_line_cap: int = -1;
+var g_line_join: int = -1;
+## The dash pattern set in this draw ([] solid) and its phase.
+var g_dash: list[float] = [];
+var g_dash_phase: float = 0.0;
+
+# Tool-tip rectangles added with Canvas.addToolTip, one entry per tip in
+# parallel lists: the tag AppKit gave it, the canvas, the retained NSString
+# owner, the text, and the rectangle (4 floats per tip).
+var g_tip_tags: list[int] = [];
+var g_tip_views: list[int] = [];
+var g_tip_owners: list[int] = [];
+var g_tip_texts: list[string] = [];
+var g_tip_rects: list[float] = [];
+
+# ── geometry helpers ───────────────────────────────────────────────────────
+
+## `[view convertPoint:(x, y) fromView:nil]` (window → view) or
+## `[view convertPoint:(x, y) toView:nil]` (view → window), called through an
+## NSInvocation so the NSPoint result can be read from memory.
+func convertPoint(view: int, x: float, y: float, to_window: bool): Rect {
+    var name = "convertPoint:fromView:";
+    if (to_window) {
+        name = "convertPoint:toView:";
+    }
+    let selector = sel(name);
+    let sig = msgI(view, sel("methodSignatureForSelector:"), selector);
+    let inv = msgI(cls("NSInvocation"), sel("invocationWithMethodSignature:"), sig);
+    msgI(inv, sel("setSelector:"), selector);
+    msgI(inv, sel("setTarget:"), view);
+
+    # The NSPoint argument: an NSValue writes the two doubles into memory.
+    let point_buf = malloc(16);
+    let boxed = msgDD(cls("NSValue"), sel("valueWithPoint:"), x, y);
+    msgII(boxed, sel("getValue:size:"), point_buf, 16);
+    let nil_buf = malloc(8);
+    Volatile[int].at(nil_buf).write(0);
+    msgII(inv, sel("setArgument:atIndex:"), point_buf, 2);
+    msgII(inv, sel("setArgument:atIndex:"), nil_buf, 3);
+    msgV(inv, sel("invoke"));
+
+    # The NSPoint result: boxed back into an NSValue and read with point_of.
+    let out_buf = malloc(16);
+    msgI(inv, sel("getReturnValue:"), out_buf);
+    let result = msgIS(cls("NSValue"), sel("valueWithBytes:objCType:"), out_buf, "{CGPoint=dd}");
+    free(point_buf);
+    free(nil_buf);
+    free(out_buf);
+    let r = point_of(result, "pointValue");
+    return r;
+}
+
+## An sRGB NSColor (autoreleased).
+func srgb(r: float, g: float, b: float, a: float): int {
+    let c = msgDDDD(cls("NSColor"), sel("colorWithSRGBRed:green:blue:alpha:"), r, g, b, a);
+    return c;
+}
+
+## Reset the per-draw state (black fill and stroke, 1 pt lines, no path).
+func resetDrawState(): void {
+    g_fill_color = srgb(0.0, 0.0, 0.0, 1.0);
+    g_stroke_color = srgb(0.0, 0.0, 0.0, 1.0);
+    g_line_width = 1.0;
+    g_path = 0;
+    g_line_cap = -1;
+    g_line_join = -1;
+    g_dash = [];
+    g_dash_phase = 0.0;
+    return;
+}
+
+## Give `path` the dash pattern of the draw: setLineDash:count:phase: takes
+## a C array of doubles, written into memory two at a time by an NSValue
+## holding them as a point (Loup has no float bit cast on the native lanes).
+func applyDash(path: int): void {
+    let n = g_dash.len();
+    let pairs = (n + 1) / 2;
+    let buf = malloc(16 * pairs);
+    var i = 0;
+    while (i < pairs) {
+        let a = g_dash[2 * i];
+        var b = 0.0;
+        if (2 * i + 1 < n) {
+            b = g_dash[2 * i + 1];
+        }
+        let boxed = msgDD(cls("NSValue"), sel("valueWithPoint:"), a, b);
+        msgII(boxed, sel("getValue:size:"), buf + 16 * i, 16);
+        i = i + 1;
+    }
+    msgIID(path, sel("setLineDash:count:phase:"), buf, n, g_dash_phase);
+    free(buf);
+    return;
+}
+
+## Fill `path` (an NSBezierPath) with the fill color.
+func fillPath(path: int): void {
+    msgV(g_fill_color, sel("setFill"));
+    msgV(path, sel("fill"));
+    return;
+}
+
+## Stroke `path` with the stroke color and line width.
+func strokePath(path: int): void {
+    msgV(g_stroke_color, sel("setStroke"));
+    msgD(path, sel("setLineWidth:"), g_line_width);
+    if (g_line_cap >= 0) {
+        msgI(path, sel("setLineCapStyle:"), g_line_cap);
+    }
+    if (g_line_join >= 0) {
+        msgI(path, sel("setLineJoinStyle:"), g_line_join);
+    }
+    if (g_dash.len() > 0) {
+        applyDash(path);
+    }
+    msgV(path, sel("stroke"));
+    return;
+}
+
+## An NSBezierPath through the points of `points` ([x0, y0, x1, y1, …]).
+func pathThrough(points: list[float], closed: bool): int {
+    let path = msg(cls("NSBezierPath"), sel("bezierPath"));
+    var i = 0;
+    while (i + 1 < points.len()) {
+        let px = points[i];
+        let py = points[i + 1];
+        if (i == 0) {
+            msgDD(path, sel("moveToPoint:"), px, py);
+        } else {
+            msgDD(path, sel("lineToPoint:"), px, py);
+        }
+        i = i + 2;
+    }
+    if (closed) {
+        msgV(path, sel("closePath"));
+    }
+    return path;
+}
+
+## The attributes dictionary for `text`: NSFontAttributeName ("NSFont") and
+## NSForegroundColorAttributeName ("NSColor").
+func textAttributes(size: float, r: float, g: float, b: float): int {
+    let font = msgD(cls("NSFont"), sel("systemFontOfSize:"), size);
+    let color = srgb(r, g, b, 1.0);
+    let values = nsarray([font, color]);
+    let keys = nsarray([nsstr("NSFont"), nsstr("NSColor")]);
+    let attrs = msgII(cls("NSDictionary"), sel("dictionaryWithObjects:forKeys:"), values, keys);
+    return attrs;
+}
+
+# ── Graphics ───────────────────────────────────────────────────────────────
+
+## The drawing surface handed to an `onDraw` handler. Coordinates are the
+## canvas's: origin at the TOP-LEFT, x to the right, y DOWN, in points.
+## Colors are sRGB components in 0…1. Use it only inside the handler (AppKit's
+## drawing context exists only during drawRect:).
+pub class Graphics {
+    ## The canvas being drawn (its NSView pointer).
+    pub let canvas: int;
+    ## The canvas's width in points.
+    pub let width: float;
+    ## The canvas's height in points.
+    pub let height: float;
+    ## The left edge of the area AppKit asked to repaint (drawRect:'s rect).
+    pub let dirtyX: float;
+    ## The top edge of the area to repaint (canvas coordinates, y down).
+    pub let dirtyY: float;
+    ## The width of the area to repaint.
+    pub let dirtyW: float;
+    ## The height of the area to repaint.
+    pub let dirtyH: float;
+
+    ## Made by the canvas for each draw (apps do not need to construct one):
+    ## the canvas's view pointer and size, then the dirty area.
+    pub func constructor(canvas: int, width: float, height: float, dirtyX: float, dirtyY: float,
+            dirtyW: float, dirtyH: float) {
+        this.canvas = canvas;
+        this.width = width;
+        this.height = height;
+        this.dirtyX = dirtyX;
+        this.dirtyY = dirtyY;
+        this.dirtyW = dirtyW;
+        this.dirtyH = dirtyH;
+    }
+
+    ## Set the color used by fillRect, fillOval, fill, fillPolygon, ….
+    pub func setFillColor(r: float, g: float, b: float, a: float): void {
+        g_fill_color = srgb(r, g, b, a);
+        return;
+    }
+
+    ## Set the color used by strokeRect, strokeOval, line, stroke, polyline, ….
+    pub func setStrokeColor(r: float, g: float, b: float, a: float): void {
+        g_stroke_color = srgb(r, g, b, a);
+        return;
+    }
+
+    ## Set the fill color to `color` (an appkit.controls ColorRef: a system
+    ## color such as `systemColor(COLOR_SYSTEM_BLUE)` is resolved for the
+    ## canvas's light or dark appearance as it draws).
+    pub func applyFillColor(color: ColorRef): void {
+        g_fill_color = color.color_handle;
+        return;
+    }
+
+    ## Set the stroke color to `color` (a ColorRef).
+    pub func applyStrokeColor(color: ColorRef): void {
+        g_stroke_color = color.color_handle;
+        return;
+    }
+
+    ## Fill the whole canvas with `color` (a ColorRef), copying it like
+    ## `clear` (e.g. `systemColor(COLOR_WINDOW_BACKGROUND)` for a background
+    ## that follows dark mode).
+    pub func clearWith(color: ColorRef): void {
+        msgV(color.color_handle, sel("setFill"));
+        NSRectFill(0.0, 0.0, this.width, this.height);
+        return;
+    }
+
+    ## Set the width, in points, of every later stroke (default 1).
+    pub func setLineWidth(w: float): void {
+        g_line_width = w;
+        return;
+    }
+
+    ## How the open ends of later strokes look: LINE_CAP_BUTT (flat, at the
+    ## end point), LINE_CAP_ROUND or LINE_CAP_SQUARE (both reach half the
+    ## line width past it). Throws ValueError for anything else.
+    pub func setLineCap(style: int): void {
+        if (style < LINE_CAP_BUTT or style > LINE_CAP_SQUARE) {
+            throw ValueError("Graphics.setLineCap: style must be LINE_CAP_BUTT, LINE_CAP_ROUND or LINE_CAP_SQUARE, not "
+                + style.to_string());
+        }
+        g_line_cap = style;
+        return;
+    }
+
+    ## The line cap of later strokes (NSBezierPath's default until set).
+    pub func lineCap(): int {
+        if (g_line_cap >= 0) {
+            return g_line_cap;
+        }
+        let d = msg(cls("NSBezierPath"), sel("defaultLineCapStyle"));
+        return d;
+    }
+
+    ## How the corners of later strokes look (polyline, strokeRect, paths):
+    ## LINE_JOIN_MITER, LINE_JOIN_ROUND or LINE_JOIN_BEVEL. Throws ValueError
+    ## for anything else.
+    pub func setLineJoin(style: int): void {
+        if (style < LINE_JOIN_MITER or style > LINE_JOIN_BEVEL) {
+            throw ValueError("Graphics.setLineJoin: style must be LINE_JOIN_MITER, LINE_JOIN_ROUND or LINE_JOIN_BEVEL, not "
+                + style.to_string());
+        }
+        g_line_join = style;
+        return;
+    }
+
+    ## The line join of later strokes (NSBezierPath's default until set).
+    pub func lineJoin(): int {
+        if (g_line_join >= 0) {
+            return g_line_join;
+        }
+        let d = msg(cls("NSBezierPath"), sel("defaultLineJoinStyle"));
+        return d;
+    }
+
+    ## Dash later strokes: `pattern` alternates painted and skipped lengths
+    ## in points ([6.0, 3.0]: 6 on, 3 off; an odd count repeats with the roles
+    ## swapped, as Core Graphics does), starting `phase` points into it. `[]`
+    ## draws solid lines again. With LINE_CAP_ROUND, a 0 length paints a dot.
+    ## Throws ValueError for a negative length or a pattern that adds up to 0.
+    pub func setLineDash(pattern: list[float], phase: float): void {
+        var total = 0.0;
+        for (v in pattern) {
+            if (v < 0.0) {
+                throw ValueError("Graphics.setLineDash: lengths must not be negative");
+            }
+            total = total + v;
+        }
+        if (pattern.len() > 0 and total <= 0.0) {
+            throw ValueError("Graphics.setLineDash: the pattern must add up to more than 0");
+        }
+        g_dash = pattern;
+        g_dash_phase = phase;
+        return;
+    }
+
+    ## The dash pattern of later strokes ([] for solid lines).
+    pub func lineDash(): list[float] {
+        let d = g_dash;
+        return d;
+    }
+
+    ## The phase of the dash pattern (see setLineDash).
+    pub func lineDashPhase(): float {
+        return g_dash_phase;
+    }
+
+    ## Fill the whole canvas with an opaque color (NSRectFill, which copies
+    ## the color rather than blending it).
+    pub func clear(r: float, g: float, b: float): void {
+        let c = srgb(r, g, b, 1.0);
+        msgV(c, sel("setFill"));
+        NSRectFill(0.0, 0.0, this.width, this.height);
+        return;
+    }
+
+    ## Fill a rectangle whose top-left corner is (x, y), blending the fill color.
+    pub func fillRect(x: float, y: float, w: float, h: float): void {
+        let path = msgDDDD(cls("NSBezierPath"), sel("bezierPathWithRect:"), x, y, w, h);
+        fillPath(path);
+        return;
+    }
+
+    ## Outline a rectangle whose top-left corner is (x, y).
+    pub func strokeRect(x: float, y: float, w: float, h: float): void {
+        let path = msgDDDD(cls("NSBezierPath"), sel("bezierPathWithRect:"), x, y, w, h);
+        strokePath(path);
+        return;
+    }
+
+    ## Fill a rectangle with corners rounded to `radius`.
+    pub func fillRoundedRect(x: float, y: float, w: float, h: float, radius: float): void {
+        let path = msgDDDDDD(cls("NSBezierPath"), sel("bezierPathWithRoundedRect:xRadius:yRadius:"),
+            x, y, w, h, radius, radius);
+        fillPath(path);
+        return;
+    }
+
+    ## Outline a rectangle with corners rounded to `radius`.
+    pub func strokeRoundedRect(x: float, y: float, w: float, h: float, radius: float): void {
+        let path = msgDDDDDD(cls("NSBezierPath"), sel("bezierPathWithRoundedRect:xRadius:yRadius:"),
+            x, y, w, h, radius, radius);
+        strokePath(path);
+        return;
+    }
+
+    ## Fill the ellipse inscribed in the rectangle (x, y, w, h).
+    pub func fillOval(x: float, y: float, w: float, h: float): void {
+        let path = msgDDDD(cls("NSBezierPath"), sel("bezierPathWithOvalInRect:"), x, y, w, h);
+        fillPath(path);
+        return;
+    }
+
+    ## Outline the ellipse inscribed in the rectangle (x, y, w, h).
+    pub func strokeOval(x: float, y: float, w: float, h: float): void {
+        let path = msgDDDD(cls("NSBezierPath"), sel("bezierPathWithOvalInRect:"), x, y, w, h);
+        strokePath(path);
+        return;
+    }
+
+    ## Stroke a straight line from (x1, y1) to (x2, y2).
+    pub func line(x1: float, y1: float, x2: float, y2: float): void {
+        let path = msg(cls("NSBezierPath"), sel("bezierPath"));
+        msgDD(path, sel("moveToPoint:"), x1, y1);
+        msgDD(path, sel("lineToPoint:"), x2, y2);
+        strokePath(path);
+        return;
+    }
+
+    ## Stroke connected segments through `points`, a flat list
+    ## [x0, y0, x1, y1, …] (an odd trailing value is ignored).
+    pub func polyline(points: list[float]): void {
+        let path = pathThrough(points, false);
+        strokePath(path);
+        return;
+    }
+
+    ## Fill the closed polygon through `points` ([x0, y0, x1, y1, …]).
+    pub func fillPolygon(points: list[float]): void {
+        let path = pathThrough(points, true);
+        fillPath(path);
+        return;
+    }
+
+    ## Start a new, empty current path (moveTo also starts one if needed).
+    pub func beginPath(): void {
+        g_path = msg(cls("NSBezierPath"), sel("bezierPath"));
+        return;
+    }
+
+    ## Start a new subpath of the current path at (x, y).
+    pub func moveTo(x: float, y: float): void {
+        if (g_path == 0) {
+            this.beginPath();
+        }
+        msgDD(g_path, sel("moveToPoint:"), x, y);
+        return;
+    }
+
+    ## Add a straight segment from the current point to (x, y). Without a
+    ## current point it acts as moveTo.
+    pub func lineTo(x: float, y: float): void {
+        if (g_path == 0) {
+            this.moveTo(x, y);
+            return;
+        }
+        let empty = msg(g_path, sel("isEmpty")) & 255;
+        if (empty != 0) {
+            msgDD(g_path, sel("moveToPoint:"), x, y);
+            return;
+        }
+        msgDD(g_path, sel("lineToPoint:"), x, y);
+        return;
+    }
+
+    ## Close the current subpath with a segment back to its start.
+    pub func closePath(): void {
+        if (g_path != 0) {
+            msgV(g_path, sel("closePath"));
+        }
+        return;
+    }
+
+    ## Fill the current path with the fill color (the path is kept, so it can
+    ## be stroked too).
+    pub func fill(): void {
+        if (g_path != 0) {
+            fillPath(g_path);
+        }
+        return;
+    }
+
+    ## Stroke the current path with the stroke color and line width.
+    pub func stroke(): void {
+        if (g_path != 0) {
+            strokePath(g_path);
+        }
+        return;
+    }
+
+    ## Draw `s` in the system font of `size` points and the opaque color
+    ## (r, g, b); (x, y) is the TOP-LEFT of the text's line box.
+    pub func text(x: float, y: float, s: string, size: float, r: float, g: float, b: float): void {
+        let attrs = textAttributes(size, r, g, b);
+        msgDDI(nsstr(s), sel("drawAtPoint:withAttributes:"), x, y, attrs);
+        return;
+    }
+
+    ## The width, in points, `s` takes when drawn by `text` at `size`.
+    pub func textWidth(s: string, size: float): float {
+        let attrs = textAttributes(size, 0.0, 0.0, 0.0);
+        # sizeWithAttributes: returns an NSSize; its width is the first double.
+        let w = msgRetDI(nsstr(s), sel("sizeWithAttributes:"), attrs);
+        return w;
+    }
+}
+
+# ── the LoupCanvas class ───────────────────────────────────────────────────
+
+## `- (void)drawRect:(NSRect)dirty` — the NSRect arrives as four doubles
+## after self and _cmd (an addressOf callback takes floating-point arguments
+## in the FP registers, Compilation §3-3.4.2) and is handed to the handler as
+## Graphics.dirtyX/Y/W/H.
+func impDrawRect(self_obj: int, cmd: int, dx: float, dy: float, dw: float, dh: float): void {
+    var count = 0;
+    if (g_draw_counts.contains_key(self_obj)) {
+        count = g_draw_counts[self_obj];
+    }
+    g_draw_counts[self_obj] = count + 1;
+    if (not g_draw.contains_key(self_obj)) {
+        return;
+    }
+    let handler = g_draw[self_obj];
+    let bounds = rect_of(self_obj, "bounds");
+    resetDrawState();
+    let g = Graphics(self_obj, bounds.w, bounds.h, dx, dy, dw, dh);
+    runHandler(func(): void { handler(g); }, "draw");
+    g_path = 0;
+    return;
+}
+
+## `- (BOOL)isFlipped` — YES: origin top-left.
+func impIsFlipped(self_obj: int, cmd: int): int {
+    return 1;
+}
+
+## `- (BOOL)acceptsFirstResponder` — YES: the canvas takes key events.
+func impAcceptsFirstResponder(self_obj: int, cmd: int): int {
+    return 1;
+}
+
+## `- (BOOL)acceptsFirstMouse:(NSEvent*)event` — YES.
+func impAcceptsFirstMouse(self_obj: int, cmd: int, event: int): int {
+    return 1;
+}
+
+## Run the mouse handler of `registry` for `view` at the event's location in
+## the view's (flipped) coordinates.
+func dispatchMouse(registry: dict[int, fn(float, float): void], view: int, event: int, what: string): void {
+    if (not registry.contains_key(view)) {
+        return;
+    }
+    let handler = registry[view];
+    let win_pt = point_of(event, "locationInWindow");
+    let p = convertPoint(view, win_pt.x, win_pt.y, false);
+    let px = p.x;
+    let py = p.y;
+    runHandler(func(): void { handler(px, py); }, what);
+    return;
+}
+
+## `- (void)mouseDown:(NSEvent*)event`.
+func impMouseDown(self_obj: int, cmd: int, event: int): void {
+    let win = msg(self_obj, sel("window"));
+    if (win != 0) {
+        msgI(win, sel("makeFirstResponder:"), self_obj);
+    }
+    dispatchMouse(g_mouse_down, self_obj, event, "mouse down");
+    return;
+}
+
+## `- (void)mouseDragged:(NSEvent*)event`.
+func impMouseDragged(self_obj: int, cmd: int, event: int): void {
+    dispatchMouse(g_mouse_drag, self_obj, event, "mouse drag");
+    return;
+}
+
+## `- (void)mouseUp:(NSEvent*)event`.
+func impMouseUp(self_obj: int, cmd: int, event: int): void {
+    dispatchMouse(g_mouse_up, self_obj, event, "mouse up");
+    return;
+}
+
+## `- (void)keyDown:(NSEvent*)event`. Without an onKey handler the event goes
+## to the next responder, as NSResponder's own keyDown: does.
+func impKeyDown(self_obj: int, cmd: int, event: int): void {
+    if (not g_key.contains_key(self_obj)) {
+        let next = msg(self_obj, sel("nextResponder"));
+        if (next != 0) {
+            msgI(next, sel("keyDown:"), event);
+        }
+        return;
+    }
+    let handler = g_key[self_obj];
+    let chars = str_of(msg(event, sel("characters")));
+    let code = msg(event, sel("keyCode")) & 65535;
+    runHandler(func(): void { handler(chars, code); }, "key");
+    return;
+}
+
+## The LoupCanvas class (an NSView subclass), created on first use.
+func canvasClass(): int {
+    if (g_canvas_class == 0) {
+        load_appkit();
+        let c = objc_allocateClassPair(cls("NSView"), "LoupCanvas", 0);
+        class_addMethod(c, sel("drawRect:"), addressOf(impDrawRect), "v@:{CGRect={CGPoint=dd}{CGSize=dd}}");
+        class_addMethod(c, sel("isFlipped"), addressOf(impIsFlipped), "c@:");
+        class_addMethod(c, sel("acceptsFirstResponder"), addressOf(impAcceptsFirstResponder), "c@:");
+        class_addMethod(c, sel("acceptsFirstMouse:"), addressOf(impAcceptsFirstMouse), "c@:@");
+        class_addMethod(c, sel("mouseDown:"), addressOf(impMouseDown), "v@:@");
+        class_addMethod(c, sel("mouseDragged:"), addressOf(impMouseDragged), "v@:@");
+        class_addMethod(c, sel("mouseUp:"), addressOf(impMouseUp), "v@:@");
+        class_addMethod(c, sel("keyDown:"), addressOf(impKeyDown), "v@:@");
+        objc_registerClassPair(c);
+        g_canvas_class = c;
+    }
+    return g_canvas_class;
+}
+
+## A new LoupCanvas view of `width` × `height` points (owned: +1).
+func newCanvasHandle(width: float, height: float): int {
+    let v = msgDDDD(msg(canvasClass(), sel("alloc")), sel("initWithFrame:"), 0.0, 0.0, width, height);
+    return v;
+}
+
+## Forget the tool tips of `view` with tag `tag` (-1: all of them) and
+## release their owners.
+func dropToolTips(view: int, tag: int): void {
+    var tags: list[int] = [];
+    var views: list[int] = [];
+    var owners: list[int] = [];
+    var texts: list[string] = [];
+    var rects: list[float] = [];
+    var i = 0;
+    while (i < g_tip_tags.len()) {
+        let mine = g_tip_views[i] == view and (tag < 0 or g_tip_tags[i] == tag);
+        if (mine) {
+            msgV(g_tip_owners[i], sel("release"));
+        } else {
+            tags.push(g_tip_tags[i]);
+            views.push(g_tip_views[i]);
+            owners.push(g_tip_owners[i]);
+            texts.push(g_tip_texts[i]);
+            var k = 0;
+            while (k < 4) {
+                rects.push(g_tip_rects[4 * i + k]);
+                k = k + 1;
+            }
+        }
+        i = i + 1;
+    }
+    g_tip_tags = tags;
+    g_tip_views = views;
+    g_tip_owners = owners;
+    g_tip_texts = texts;
+    g_tip_rects = rects;
+    return;
+}
+
+# ── Canvas ─────────────────────────────────────────────────────────────────
+
+## A view you draw yourself and that receives mouse and key events.
+## Its coordinates are FLIPPED: (0, 0) is the top-left corner and y grows
+## downwards — in drawing (Graphics) and in every mouse handler. (Its own
+## frame, set with setFrame / Window.add, is still in the superview's
+## bottom-left coordinates, like every view.)
+pub class Canvas : View {
+    ## A new canvas of `width` × `height` points (place it with Window.add or
+    ## setFrame, or put it in a layout).
+    pub func constructor(width: float, height: float) {
+        super(newCanvasHandle(width, height));
+    }
+
+    ## Draw the canvas with `handler`, called by AppKit whenever the canvas
+    ## needs painting (first display, resize, `redraw()`). Replaces any
+    ## earlier draw handler.
+    pub func onDraw(handler: fn(Graphics): void): void {
+        g_draw[this.handle] = handler;
+        msgI(this.handle, sel("setNeedsDisplay:"), 1);
+        return;
+    }
+
+    ## Run `handler(x, y)` when the left mouse button goes down on the canvas
+    ## (canvas coordinates, top-left origin). The click also gives the canvas
+    ## keyboard focus.
+    pub func onMouseDown(handler: fn(float, float): void): void {
+        g_mouse_down[this.handle] = handler;
+        return;
+    }
+
+    ## Run `handler(x, y)` as the mouse moves with the left button held down
+    ## (it keeps reporting outside the canvas, so x / y may be out of range).
+    pub func onMouseDrag(handler: fn(float, float): void): void {
+        g_mouse_drag[this.handle] = handler;
+        return;
+    }
+
+    ## Run `handler(x, y)` when the left mouse button is released.
+    pub func onMouseUp(handler: fn(float, float): void): void {
+        g_mouse_up[this.handle] = handler;
+        return;
+    }
+
+    ## Run `handler(chars, keyCode)` for each key pressed while the canvas has
+    ## keyboard focus: `chars` is the text the key produces ("" for most
+    ## function keys; arrows give private-use characters) and `keyCode` the
+    ## hardware key code (e.g. 36 Return, 49 Space, 51 Delete, 53 Escape,
+    ## 123–126 the arrows ← → ↓ ↑). Without a handler, key presses go on to
+    ## the next responder.
+    pub func onKey(handler: fn(string, int): void): void {
+        g_key[this.handle] = handler;
+        return;
+    }
+
+    ## Ask AppKit to repaint the canvas (onDraw runs on the next display pass).
+    pub override func redraw(): void {
+        msgI(this.handle, sel("setNeedsDisplay:"), 1);
+        return;
+    }
+
+    ## Ask AppKit to repaint only the rectangle (x, y, w, h) of the canvas
+    ## (top-left origin); onDraw then sees it as Graphics.dirtyX/Y/W/H and
+    ## drawing outside it is clipped. arm64 (it passes an NSRect by value).
+    pub func redrawRect(x: float, y: float, w: float, h: float): void {
+        msgDDDD(this.handle, sel("setNeedsDisplayInRect:"), x, y, w, h);
+        return;
+    }
+
+    ## Repaint now whatever redraw / redrawRect marked (displayIfNeeded):
+    ## onDraw runs before this returns if anything was pending.
+    pub func flush(): void {
+        msgV(this.handle, sel("displayIfNeeded"));
+        return;
+    }
+
+    ## Repaint the whole canvas now (onDraw runs before this returns, when
+    ## the canvas is in a window on screen).
+    pub func display(): void {
+        msgV(this.handle, sel("display"));
+        return;
+    }
+
+    ## Give the canvas keyboard focus (it must be in a window) so onKey sees
+    ## key presses. Returns whether the window accepted it.
+    pub func focus(): bool {
+        let win = msg(this.handle, sel("window"));
+        if (win == 0) {
+            return false;
+        }
+        let ok = msgI(win, sel("makeFirstResponder:"), this.handle) & 255;
+        return ok != 0;
+    }
+
+    ## Whether the canvas has keyboard focus.
+    pub func hasFocus(): bool {
+        let win = msg(this.handle, sel("window"));
+        if (win == 0) {
+            return false;
+        }
+        let first = msg(win, sel("firstResponder"));
+        return first == this.handle;
+    }
+
+    ## How many times AppKit has asked the canvas to draw (drawRect: calls).
+    pub func drawCount(): int {
+        if (g_draw_counts.contains_key(this.handle)) {
+            return g_draw_counts[this.handle];
+        }
+        return 0;
+    }
+
+    ## Convert a point in canvas coordinates (top-left origin) to the
+    ## window's coordinates (bottom-left origin of the window).
+    pub func toWindow(x: float, y: float): Rect {
+        let p = convertPoint(this.handle, x, y, true);
+        return p;
+    }
+
+    ## Convert a point in window coordinates to canvas coordinates.
+    pub func fromWindow(x: float, y: float): Rect {
+        let p = convertPoint(this.handle, x, y, false);
+        return p;
+    }
+
+    ## Give the rectangle (x, y, w, h) of the canvas (canvas coordinates,
+    ## top-left origin) its own tool tip `text`, shown when the pointer rests
+    ## there (`addToolTipRect:owner:userData:`). Returns the tip's tag for
+    ## removeToolTip. Throws ValueError for an empty rectangle. arm64 (an
+    ## NSRect argument).
+    pub func addToolTip(x: float, y: float, w: float, h: float, text: string): int {
+        if (w <= 0.0 or h <= 0.0) {
+            throw ValueError("Canvas.addToolTip: the rectangle must have a positive width and height");
+        }
+        # The tool tip asks its owner for the text (an NSString answers with
+        # itself); AppKit does not retain the owner, so the library does.
+        let owner = nsstr(text);
+        msgV(owner, sel("retain"));
+        let tag = msgDDDDII(this.handle, sel("addToolTipRect:owner:userData:"), x, y, w, h, owner, 0);
+        g_tip_tags.push(tag);
+        g_tip_views.push(this.handle);
+        g_tip_owners.push(owner);
+        g_tip_texts.push(text);
+        g_tip_rects.push(x);
+        g_tip_rects.push(y);
+        g_tip_rects.push(w);
+        g_tip_rects.push(h);
+        return tag;
+    }
+
+    ## Remove the tool-tip rectangle `tag` (from addToolTip). Throws
+    ## ValueError when this canvas has no such tip.
+    pub func removeToolTip(tag: int): void {
+        var found = false;
+        var i = 0;
+        while (i < g_tip_tags.len()) {
+            if (g_tip_tags[i] == tag and g_tip_views[i] == this.handle) {
+                found = true;
+            }
+            i = i + 1;
+        }
+        if (not found) {
+            throw ValueError("Canvas.removeToolTip: this canvas has no tool tip with tag " + tag.to_string());
+        }
+        msgI(this.handle, sel("removeToolTip:"), tag);
+        dropToolTips(this.handle, tag);
+        return;
+    }
+
+    ## Remove every tool-tip rectangle of the canvas (addToolTip's, and the
+    ## whole-view tip of setToolTip: AppKit's removeAllToolTips takes both).
+    pub func removeAllToolTips(): void {
+        msgV(this.handle, sel("removeAllToolTips"));
+        dropToolTips(this.handle, -1);
+        return;
+    }
+
+    ## How many addToolTip rectangles the canvas has.
+    pub func toolTipCount(): int {
+        var n = 0;
+        for (v in g_tip_views) {
+            if (v == this.handle) {
+                n = n + 1;
+            }
+        }
+        return n;
+    }
+
+    ## The text of the addToolTip rectangle under the canvas point (x, y)
+    ## ("" when there is none; the one added last when several overlap).
+    pub func toolTipAt(x: float, y: float): string {
+        var text = "";
+        var i = 0;
+        while (i < g_tip_tags.len()) {
+            if (g_tip_views[i] == this.handle) {
+                let rx = g_tip_rects[4 * i];
+                let ry = g_tip_rects[4 * i + 1];
+                let rw = g_tip_rects[4 * i + 2];
+                let rh = g_tip_rects[4 * i + 3];
+                if (x >= rx and x < rx + rw and y >= ry and y < ry + rh) {
+                    text = g_tip_texts[i];
+                }
+            }
+            i = i + 1;
+        }
+        return text;
+    }
+
+    ## Send the canvas a synthetic left-mouse event at canvas point (x, y):
+    ## `kind` is "down", "drag" or "up". The NSEvent goes through the real
+    ## mouseDown: / mouseDragged: / mouseUp: methods — for tests and demos.
+    pub func sendMouse(kind: string, x: float, y: float): void {
+        var event_type = EVENT_MOUSE_DOWN;
+        var selector = "mouseDown:";
+        if (kind == "drag") {
+            event_type = EVENT_MOUSE_DRAGGED;
+            selector = "mouseDragged:";
+        } else if (kind == "up") {
+            event_type = EVENT_MOUSE_UP;
+            selector = "mouseUp:";
+        } else if (kind != "down") {
+            throw ValueError("Canvas.sendMouse: kind must be \"down\", \"drag\" or \"up\", not \"" + kind + "\"");
+        }
+        let p = convertPoint(this.handle, x, y, true);
+        var win_number = 0;
+        let win = msg(this.handle, sel("window"));
+        if (win != 0) {
+            win_number = msg(win, sel("windowNumber"));
+        }
+        let event = msgMouseEvent(cls("NSEvent"),
+            sel("mouseEventWithType:location:modifierFlags:timestamp:windowNumber:context:eventNumber:clickCount:pressure:"),
+            event_type, p.x, p.y, 0, 0.0, win_number, 0, 0, 1, 1.0 as float32);
+        msgI(this.handle, sel(selector), event);
+        return;
+    }
+
+    ## Send the canvas a synthetic key press producing `chars` with hardware
+    ## key code `keyCode`, through the window (so it reaches the canvas only
+    ## when the canvas has focus — see focus()). For tests and demos.
+    pub func sendKey(chars: string, keyCode: int): void {
+        let win = msg(this.handle, sel("window"));
+        var win_number = 0;
+        if (win != 0) {
+            win_number = msg(win, sel("windowNumber"));
+        }
+        let event = msgKeyEvent(cls("NSEvent"),
+            sel("keyEventWithType:location:modifierFlags:timestamp:windowNumber:context:characters:charactersIgnoringModifiers:isARepeat:keyCode:"),
+            EVENT_KEY_DOWN, 0.0, 0.0, 0, 0.0, win_number, 0, nsstr(chars), nsstr(chars),
+            0 as uint8, keyCode as uint16);
+        if (win != 0) {
+            msgI(win, sel("sendEvent:"), event);
+        } else {
+            msgI(this.handle, sel("keyDown:"), event);
+        }
+        return;
+    }
+}

@@ -1,0 +1,589 @@
+@mode(host.native)
+
+# Probe for appkit.layout: a window built only from stacks, tabs, a grid, a
+# split view, scroll views, a box and separators holding raw labels and
+# buttons. `--self-test [png]` lays the window out, prints frames and the
+# values every API reports, resizes the window, drives the tabs and the split
+# view, snapshots each tab (`<png>`, `<png stem>-split.png`,
+# `<png stem>-text.png`), then quits.
+#
+# The views live in one `Ui` object kept in a module-level list, and the
+# self-test timer runs a plain module function that fetches it.
+
+from appkit.objc import (cls, sel, nsstr, Rect, msg, msgI, msgIII, msgDD);
+from appkit.app import (appInit, run, quit, after, isSelfTest, onAction, Window, View);
+from appkit.layout import (VStack, HStack, ScrollView, Box, TabView, SplitView, GridView,
+    Separator, Size, Insets, emptyCell, ALIGN_INHERIT, layoutNow, fittingSize, pinToEdges, fillWindow, setMinSize,
+    ALIGN_LEADING, ALIGN_CENTER, ALIGN_TRAILING, ALIGN_FILL, ALIGN_BASELINE,
+    DIST_GRAVITY, DIST_FILL, DIST_FILL_EQUALLY, DIST_FILL_PROPORTIONALLY, DIST_EQUAL_SPACING,
+    DIST_EQUAL_CENTERING, DIVIDER_THICK, DIVIDER_THIN, DIVIDER_PANE_SPLITTER);
+
+var g_tab_changes: list[int] = [];
+var g_clicks: int = 0;
+
+func label(text: string): View {
+    let v = View(msgI(cls("NSTextField"), sel("labelWithString:"), nsstr(text)));
+    return v;
+}
+
+func button(title: string): View {
+    let v = View(msgIII(cls("NSButton"), sel("buttonWithTitle:target:action:"), nsstr(title), 0, 0));
+    return v;
+}
+
+## Whole points print without a fraction; others with one decimal place.
+func num(f: float): string {
+    let tenths = ((f * 10.0) as int);
+    var s = (tenths / 10).to_string();
+    if (tenths % 10 != 0) {
+        var frac = tenths % 10;
+        if (frac < 0) { frac = 0 - frac; }
+        s = s + "." + frac.to_string();
+    }
+    return s;
+}
+
+func rect(r: Rect): string {
+    let s = "(" + num(r.x) + ", " + num(r.y) + ", " + num(r.w) + " x " + num(r.h) + ")";
+    return s;
+}
+
+## Print the frame of the view `v` (any View subclass: `ui.grid`, a stack, …).
+func show(name: string, v: View): void {
+    println(name + ": " + rect(v.frame()));
+    return;
+}
+
+func same(a: int, b: int): string {
+    let s = (a == b).to_string();
+    return s;
+}
+
+func pngPath(base: string, suffix: string): string {
+    if (suffix == "") {
+        return base;
+    }
+    var stem = base;
+    if (base.endsWith(".png")) {
+        stem = base.substring(0, base.len() - 4);
+    }
+    let p = stem + "-" + suffix + ".png";
+    return p;
+}
+
+## The probe window and every view the self-test inspects.
+class Ui {
+    pub let win: Window;
+    pub let root: VStack;
+    pub let header: HStack;
+    pub let title: View;
+    pub let header_spacer: View;
+    pub let action: View;
+    pub let top_line: Separator;
+    pub let grid: GridView;
+    pub let name_label: View;
+    pub let mode_label: View;
+    pub let wide: View;
+    pub let swap: View;
+    pub let split: SplitView;
+    pub let rows: VStack;
+    pub let list_scroll: ScrollView;
+    pub let text_view: View;
+    pub let text_scroll: ScrollView;
+    pub let tabs: TabView;
+    pub let tab_indexes: list[int];
+    pub let options: HStack;
+    pub let box: Box;
+    pub let footer: HStack;
+    pub let status: View;
+    pub let bar: Separator;
+    pub let ok: View;
+
+    pub func constructor() {
+        let win = Window("Layout Probe", 560.0, 440.0);
+
+        # Root column: header row, separator, tabs (expanding), box, footer.
+        let root = VStack();
+        root.setInsets(12.0, 12.0, 12.0, 12.0);
+        root.setSpacing(8.0);
+        root.setAlignment(ALIGN_FILL);
+
+        let header = HStack();
+        header.setAlignment(ALIGN_BASELINE);
+        let title = label("Layout probe — stacks, tabs, grid, split");
+        let action = button("Action");
+        onAction(action.handle, func(): void { global g_clicks; g_clicks = g_clicks + 1; });
+        header.add(title);
+        let header_spacer = header.addSpacer();
+        header.add(action);
+        root.add(header);
+        let top_line = root.addSeparator();
+
+        # Tab 1: a form grid.
+        # Column settings before the first row (the columns do not exist
+        # yet: the grid keeps them and applies them in addRow).
+        let grid = GridView();
+        grid.setColumnAlignment(0, ALIGN_TRAILING);
+        grid.setColumnAlignment(1, ALIGN_LEADING);
+        grid.setColumnWidth(1, 160.0);
+        let name_label = label("Name:");
+        let mode_label = label("Execution mode:");
+        grid.addRow([name_label, label("Loup")]);
+        grid.addRow([mode_label, label("host.native")]);
+        let wide = button("A merged, two-column button");
+        grid.addRow([wide, emptyCell()]);
+        grid.mergeCells(2, 0, 2);
+        let swap = button("Swap");
+        grid.addRow([label("Per cell:"), swap]);
+        grid.setCellXAlignment(1, 3, ALIGN_TRAILING);
+        grid.setRowAlignment(0, ALIGN_BASELINE);
+        grid.setRowAlignment(2, ALIGN_CENTER);
+        grid.setRowSpacing(6.0);
+        grid.setColumnSpacing(10.0);
+        let grid_page = VStack();
+        grid_page.setAlignment(ALIGN_LEADING);
+        grid_page.add(grid);
+        grid_page.addSpacer();
+
+        # Tab 2: a split view, a stack beside a scrolling list.
+        let split = SplitView(true);
+        let left = VStack();
+        left.setAlignment(ALIGN_LEADING);
+        left.setInsets(8.0, 8.0, 8.0, 8.0);
+        left.addAll([label("Left pane"), button("L1"), button("L2")]);
+        left.addSpacer();
+        let rows = VStack();
+        rows.setAlignment(ALIGN_LEADING);
+        rows.setInsets(4.0, 8.0, 4.0, 8.0);
+        rows.setSpacing(4.0);
+        var i = 0;
+        while (i < 30) {
+            rows.add(label("List row " + i.to_string()));
+            i = i + 1;
+        }
+        let list_scroll = ScrollView(rows);
+        list_scroll.setBorder(false);
+        split.addPane(left);
+        split.addPane(list_scroll);
+        split.setHoldingPriority(0, 260.0);
+
+        # Tab 3: a text view in a scroll view.
+        let text_view = View(msg(msg(cls("NSTextView"), sel("alloc")), sel("init")));
+        var text = "";
+        var line = 0;
+        while (line < 40) {
+            text = text + "Line " + line.to_string() + " of a long text that wraps to the visible width of the scroll view. ";
+            line = line + 1;
+        }
+        msgI(text_view.handle, sel("setString:"), nsstr(text));
+        let text_scroll = ScrollView(text_view);
+
+        let tabs = TabView();
+        let t0 = tabs.addTab("Grid", grid_page);
+        let t1 = tabs.addTab("Split", split);
+        let t2 = tabs.addTab("Text", text_scroll);
+        tabs.onChange(func(index: int): void {
+            global g_tab_changes;
+            g_tab_changes.push(index);
+        });
+        setMinSize(tabs, 0.0, 160.0);
+        root.addExpanding(tabs);
+
+        # A box around three equal buttons.
+        let options = HStack();
+        options.setDistribution(DIST_FILL_EQUALLY);
+        options.addAll([button("One"), button("Two"), button("Three")]);
+        let box = Box("Group", options);
+        root.add(box);
+
+        # Footer: status, a vertical separator, more status, spacer, OK.
+        let footer = HStack();
+        let status = label("status");
+        footer.add(status);
+        let bar = footer.addSeparator();
+        footer.add(label("ready"));
+        footer.addSpacer();
+        let ok = button("OK");
+        footer.add(ok);
+        footer.setSpacingAfter(status, 16.0);
+        root.add(footer);
+
+        win.setContent(root);
+
+        this.win = win;
+        this.root = root;
+        this.header = header;
+        this.title = title;
+        this.header_spacer = header_spacer;
+        this.action = action;
+        this.top_line = top_line;
+        this.grid = grid;
+        this.name_label = name_label;
+        this.mode_label = mode_label;
+        this.wide = wide;
+        this.swap = swap;
+        this.split = split;
+        this.rows = rows;
+        this.list_scroll = list_scroll;
+        this.text_view = text_view;
+        this.text_scroll = text_scroll;
+        this.tabs = tabs;
+        this.tab_indexes = [t0, t1, t2];
+        this.options = options;
+        this.box = box;
+        this.footer = footer;
+        this.status = status;
+        this.bar = bar;
+        this.ok = ok;
+    }
+}
+
+func testStacks(ui: Ui): void {
+    let root = ui.root;
+    let header = ui.header;
+    println("-- stacks");
+    println("content is root: " + same(ui.win.content().handle, root.handle));
+    println("root count: " + root.count().to_string() + " vertical: " + root.isVertical().to_string());
+    println("root spacing: " + num(root.spacing()) + " alignment: " + root.alignment().to_string()
+        + " distribution: " + root.distribution().to_string());
+    let ins = root.insets();
+    println("root insets: " + num(ins.top) + " " + num(ins.left) + " " + num(ins.bottom) + " " + num(ins.right));
+    println("header count: " + header.count().to_string() + " vertical: " + header.isVertical().to_string()
+        + " alignment: " + header.alignment().to_string());
+    println("header child 2 is action: " + same(header.child(2).handle, ui.action.handle));
+    println("constants: " + ALIGN_LEADING.to_string() + " " + ALIGN_CENTER.to_string() + " "
+        + ALIGN_TRAILING.to_string() + " " + ALIGN_FILL.to_string() + " " + ALIGN_BASELINE.to_string()
+        + " / " + DIST_GRAVITY.to_string() + " " + DIST_FILL.to_string() + " "
+        + DIST_FILL_EQUALLY.to_string() + " " + DIST_FILL_PROPORTIONALLY.to_string() + " "
+        + DIST_EQUAL_SPACING.to_string() + " " + DIST_EQUAL_CENTERING.to_string());
+    show("root", root);
+    show("header", header);
+    show("title", ui.title);
+    show("header spacer", ui.header_spacer);
+    show("action", ui.action);
+    show("top line", ui.top_line);
+    println("top line vertical: " + ui.top_line.isVertical().to_string());
+    show("tabs", ui.tabs);
+    show("box", ui.box);
+    show("options", ui.options);
+    show("option 0", ui.options.child(0));
+    show("option 2", ui.options.child(2));
+    println("options distribution: " + ui.options.distribution().to_string());
+    show("footer", ui.footer);
+    show("status", ui.status);
+    show("bar", ui.bar);
+    println("bar vertical: " + ui.bar.isVertical().to_string());
+    show("ok", ui.ok);
+    let fit = fittingSize(root);
+    println("root fitting: " + num(fit.w) + " x " + num(fit.h));
+    return;
+}
+
+func testBoxAndGrid(ui: Ui): void {
+    println("-- box");
+    println("box title: " + ui.box.title());
+    ui.box.setTitle("Options");
+    println("box title now: " + ui.box.title());
+    println("box content is options: " + same(ui.box.content().handle, ui.options.handle));
+    println("-- grid");
+    let grid = ui.grid;
+    println("grid rows: " + grid.rowCount().to_string() + " columns: " + grid.columnCount().to_string());
+    println("grid spacing: " + num(grid.rowSpacing()) + " / " + num(grid.columnSpacing()));
+    println("grid cell(0,1) is mode label: " + same(grid.cell(0, 1).handle, ui.mode_label.handle));
+    println("grid cell(0,0) is name label: " + same(grid.cell(0, 0).handle, ui.name_label.handle));
+    show("grid", grid);
+    show("name label", ui.name_label);
+    show("mode label", ui.mode_label);
+    show("wide button", ui.wide);
+    show("swap button", ui.swap);
+    testGridApis(ui);
+    return;
+}
+
+## Run `step` and print its ValueError message (or "no error").
+func expectValueError(name: string, step: fn(): void): void {
+    var r = "no error";
+    try {
+        step();
+    } catch (ValueError as e) {
+        r = "ValueError (" + e.message + ")";
+    }
+    println(name + ": " + r);
+    return;
+}
+
+func pair(xs: list[int]): string {
+    let s = "(" + xs[0].to_string() + ", " + xs[1].to_string() + ")";
+    return s;
+}
+
+## Grid settings read back: column settings made before the first row, a
+## per-cell placement, a merged block, and the range checks.
+func testGridApis(ui: Ui): void {
+    let grid = ui.grid;
+    println("column alignments (set before addRow): " + grid.columnAlignment(0).to_string() + " "
+        + grid.columnAlignment(1).to_string() + " width 1: " + num(grid.columnWidth(1))
+        + " width 0: " + num(grid.columnWidth(0)));
+    println("swap cell x alignment: " + grid.cellXAlignment(1, 3).to_string() + " (label cell: "
+        + grid.cellXAlignment(0, 3).to_string() + ")");
+    let swap = ui.swap.frame();
+    let loup = grid.cell(1, 0).frame();
+    let gf = grid.frame();
+    println("swap at the right edge of its column: " + same((swap.x + swap.w) as int, gf.w as int)
+        + ", right of 'Loup' (leading): " + (swap.x > loup.x + 50.0).to_string());
+    println("row alignments: " + grid.rowAlignment(0).to_string() + " " + grid.rowAlignment(2).to_string() + " "
+        + grid.rowAlignment(1).to_string());
+    println("merged head of (1, 2): " + pair(grid.mergeHead(1, 2)) + " of (1, 1): " + pair(grid.mergeHead(1, 1)));
+    expectValueError("cell(5, 0)", func(): void { grid.cell(5, 0); });
+    expectValueError("setRowAlignment(9)", func(): void { grid.setRowAlignment(9, ALIGN_CENTER); });
+    expectValueError("setCellXAlignment(0, 0, 42)", func(): void { grid.setCellXAlignment(0, 0, 42); });
+    expectValueError("mergeCells(0, 1, 2)", func(): void { grid.mergeCells(0, 1, 2); });
+    expectValueError("setColumnWidth(-1)", func(): void { grid.setColumnWidth(-1, 10.0); });
+
+    # A grid off the window: settings before any row, a 2 x 2 merged block,
+    # per-cell vertical placement.
+    let g = GridView();
+    g.setColumnAlignment(2, ALIGN_CENTER);
+    g.setColumnWidth(2, 50.0);
+    g.setColumnAlignment(0, ALIGN_FILL);
+    println("new grid columns: " + g.columnCount().to_string() + " pending alignment 2: "
+        + g.columnAlignment(2).to_string() + " width 2: " + num(g.columnWidth(2)) + " column 3: "
+        + g.columnAlignment(3).to_string());
+    g.addRow([label("a"), label("b")]);
+    println("after a 2-cell row: columns " + g.columnCount().to_string() + " alignment 0: "
+        + g.columnAlignment(0).to_string() + " pending 2: " + g.columnAlignment(2).to_string());
+    g.addRow([label("block"), emptyCell(), label("c")]);
+    g.addRow([emptyCell(), emptyCell(), label("d")]);
+    println("after a 3-cell row: columns " + g.columnCount().to_string() + " alignment 2: "
+        + g.columnAlignment(2).to_string() + " width 2: " + num(g.columnWidth(2)));
+    g.mergeCellRange(0, 1, 2, 2);
+    println("block heads: (1, 2) -> " + pair(g.mergeHead(1, 2)) + ", (2, 2) -> " + pair(g.mergeHead(2, 2)));
+    expectValueError("mergeCellRange(1, 1, 3, 1)", func(): void { g.mergeCellRange(1, 1, 3, 1); });
+    expectValueError("mergeCellRange(0, 0, 0, 1)", func(): void { g.mergeCellRange(0, 0, 0, 1); });
+    g.setCellYAlignment(2, 1, ALIGN_TRAILING);
+    g.setCellYAlignment(2, 2, ALIGN_BASELINE);
+    println("cell y alignments: " + g.cellYAlignment(2, 1).to_string() + " " + g.cellYAlignment(2, 2).to_string()
+        + " " + g.cellYAlignment(1, 0).to_string());
+    g.setCellYAlignment(2, 1, ALIGN_INHERIT);
+    g.setCellXAlignment(1, 0, ALIGN_CENTER);
+    println("reset: " + g.cellYAlignment(2, 1).to_string() + " x " + g.cellXAlignment(1, 0).to_string()
+        + " ALIGN_INHERIT = " + ALIGN_INHERIT.to_string());
+    return;
+}
+
+## A plain view of a fixed size.
+func block(w: float, h: float): View {
+    let v = View(msg(msg(cls("NSView"), sel("alloc")), sel("init")));
+    v.setWidth(w);
+    v.setHeight(h);
+    return v;
+}
+
+## fittingSize of stacks includes the cross-axis insets on both sides,
+## whatever the alignment.
+func testStackFitting(): void {
+    println("-- stack fitting");
+    let natural = 100.0;
+    for (a in [ALIGN_LEADING, ALIGN_CENTER, ALIGN_TRAILING, ALIGN_FILL]) {
+        let s = VStack();
+        s.setInsets(10.0, 20.0, 10.0, 30.0);
+        s.setAlignment(a);
+        let l = block(natural, 20.0);
+        s.add(l);
+        let w = fittingSize(s).w;
+        # Centered: the label stays centered, so both sides get the larger inset.
+        var expected = natural + 50.0;
+        if (a == ALIGN_CENTER) {
+            expected = natural + 60.0;
+        }
+        s.setInsets(10.0, 5.0, 10.0, 5.0);
+        let narrow = fittingSize(s).w;
+        s.remove(l);
+        s.add(block(40.0, 20.0));
+        let after_remove = fittingSize(s).w;
+        println("vstack alignment " + a.to_string() + ": width " + num(w) + " = child + insets: "
+            + same(w as int, expected as int) + ", after setInsets(5, 5): " + same(narrow as int, (natural + 10.0) as int)
+            + ", after remove: " + (after_remove < narrow).to_string());
+    }
+    let row = HStack();
+    row.setInsets(6.0, 0.0, 9.0, 0.0);
+    row.setAlignment(ALIGN_LEADING);
+    row.add(block(30.0, 20.0));
+    let h = fittingSize(row).h;
+    println("hstack top-aligned height " + num(h) + " = child + top + bottom: " + same(h as int, 35));
+    return;
+}
+
+func testTabsSplitScroll(ui: Ui, base: string): void {
+    let tabs = ui.tabs;
+    let content = ui.win.content();
+    println("-- tabs");
+    let ti = ui.tab_indexes;
+    println("tab indexes: " + ti[0].to_string() + " " + ti[1].to_string() + " " + ti[2].to_string());
+    println("tab count: " + tabs.count().to_string() + " selected: " + tabs.selectedIndex().to_string());
+    println("tab titles: " + tabs.tabTitle(0) + ", " + tabs.tabTitle(1) + ", " + tabs.tabTitle(2));
+    if (base != "") { ui.win.snapshot(pngPath(base, "")); }
+
+    tabs.select(1);
+    layoutNow(content);
+    println("selected after select(1): " + tabs.selectedIndex().to_string());
+    println("-- split");
+    let split = ui.split;
+    println("panes: " + split.paneCount().to_string() + " vertical: " + split.isVertical().to_string());
+    println("holding priority 0: " + num(split.holdingPriority(0)) + " 1: " + num(split.holdingPriority(1)));
+    split.setDividerStyle(DIVIDER_THICK);
+    println("thick divider: " + num(split.dividerThickness()));
+    split.setDividerStyle(DIVIDER_PANE_SPLITTER);
+    println("pane splitter divider: " + num(split.dividerThickness()));
+    split.setDividerStyle(DIVIDER_THIN);
+    println("thin divider: " + num(split.dividerThickness()));
+    split.setDividerPosition(0, 180.0);
+    layoutNow(content);
+    println("divider 0 at: " + num(split.dividerPosition(0)));
+    show("split", split);
+    show("pane 0", split.pane(0));
+    show("pane 1", split.pane(1));
+
+    println("-- scroll");
+    let list_scroll = ui.list_scroll;
+    println("list document is rows: " + same(list_scroll.document().handle, ui.rows.handle));
+    show("rows", ui.rows);
+    show("list row 0", ui.rows.child(0));
+    println("list visible: " + rect(list_scroll.visibleRect()));
+    list_scroll.scrollTo(0.0, 200.0);
+    println("list visible after scrollTo(0, 200): " + rect(list_scroll.visibleRect()));
+    if (base != "") { ui.win.snapshot(pngPath(base, "split")); }
+    list_scroll.scrollToTop();
+    println("list visible after scrollToTop: " + rect(list_scroll.visibleRect()));
+
+    tabs.select(2);
+    layoutNow(content);
+    let text_scroll = ui.text_scroll;
+    println("text document is text view: " + same(text_scroll.document().handle, ui.text_view.handle));
+    show("text scroll", text_scroll);
+    show("text view", ui.text_view);
+    println("text visible: " + rect(text_scroll.visibleRect()));
+    text_scroll.scrollTo(0.0, 120.0);
+    println("text visible after scrollTo(0, 120): " + rect(text_scroll.visibleRect()));
+    text_scroll.setScrollers(true, false);
+    text_scroll.setFitWidth(true);
+    if (base != "") { ui.win.snapshot(pngPath(base, "text")); }
+    text_scroll.scrollToTop();
+    let n = g_tab_changes.len();
+    println("tab changes: " + n.to_string() + " last: " + g_tab_changes[n - 1].to_string());
+    return;
+}
+
+func testResizeAndAlignment(ui: Ui): void {
+    let content = ui.win.content();
+    let root = ui.root;
+    println("-- resize");
+    ui.tabs.select(0);
+    msgDD(ui.win.handle, sel("setContentSize:"), 720.0, 540.0);
+    layoutNow(content);
+    show("root", root);
+    show("tabs", ui.tabs);
+    show("action", ui.action);
+    show("box", ui.box);
+    show("option 2", ui.options.child(2));
+    show("ok", ui.ok);
+    msgDD(ui.win.handle, sel("setContentSize:"), 560.0, 440.0);
+    layoutNow(content);
+    show("tabs back", ui.tabs);
+
+    println("-- alignment changes");
+    root.setAlignment(ALIGN_CENTER);
+    layoutNow(content);
+    show("header centered", ui.header);
+    show("top line centered", ui.top_line);
+    root.setAlignment(ALIGN_TRAILING);
+    layoutNow(content);
+    show("header trailing", ui.header);
+    root.setAlignment(ALIGN_LEADING);
+    layoutNow(content);
+    show("header leading", ui.header);
+    root.setAlignment(ALIGN_FILL);
+    root.setInsets(20.0, 30.0, 20.0, 30.0);
+    layoutNow(content);
+    show("header fill, insets 30", ui.header);
+    show("top line, insets 30", ui.top_line);
+    root.setInsets(12.0, 12.0, 12.0, 12.0);
+    ui.header.setDistribution(DIST_EQUAL_SPACING);
+    layoutNow(content);
+    show("title equal spacing", ui.title);
+    ui.header.setDistribution(DIST_FILL);
+    layoutNow(content);
+    show("header spacer, fill", ui.header_spacer);
+    ui.header.setDistribution(DIST_FILL_PROPORTIONALLY);
+    ui.header.setDistribution(DIST_EQUAL_CENTERING);
+    println("header distribution: " + ui.header.distribution().to_string());
+    ui.header.setDistribution(DIST_GRAVITY);
+    let extra = label("removable");
+    ui.footer.add(extra);
+    println("footer count: " + ui.footer.count().to_string());
+    ui.footer.remove(extra);
+    println("footer count after remove: " + ui.footer.count().to_string());
+    layoutNow(content);
+    show("ok after remove", ui.ok);
+    return;
+}
+
+func testFillWindow(): void {
+    println("-- fillWindow / pinToEdges");
+    let win2 = Window("Second", 300.0, 200.0);
+    let col = VStack();
+    col.setAlignment(ALIGN_FILL);
+    col.add(label("filled"));
+    col.addSpacer();
+    fillWindow(win2, col, 10.0);
+    let holder = View(msg(msg(cls("NSView"), sel("alloc")), sel("init")));
+    let pinned = label("pinned");
+    col.add(holder);
+    holder.setHeight(30.0);
+    pinToEdges(pinned, holder, 5.0);
+    layoutNow(win2.content());
+    show("col", col);
+    show("holder", holder);
+    show("pinned", pinned);
+    msgDD(win2.handle, sel("setContentSize:"), 400.0, 260.0);
+    layoutNow(win2.content());
+    show("col after resize", col);
+    win2.close();
+    return;
+}
+
+func selfTest(ui: Ui): void {
+    layoutNow(ui.win.content());
+    let argv = runtime.args();
+    let base = if (argv.len() > 1) { argv[1] } else { "" };
+    testStacks(ui);
+    testBoxAndGrid(ui);
+    testTabsSplitScroll(ui, base);
+    testResizeAndAlignment(ui);
+    testFillWindow();
+    testStackFitting();
+    msgI(ui.action.handle, sel("performClick:"), 0);
+    println("action clicks: " + g_clicks.to_string());
+    println("window title: " + ui.win.title());
+    quit();
+    return;
+}
+
+var g_ui: list[Ui] = [];
+
+## The timer handler (see the note at the top).
+func runSelfTest(): void {
+    let ui = g_ui[0];
+    selfTest(ui);
+    return;
+}
+
+pub func main(): void {
+    appInit("Layout Probe");
+    let ui = Ui();
+    g_ui.push(ui);
+    if (isSelfTest()) {
+        after(0.4, runSelfTest);
+    }
+    run(ui.win);
+}

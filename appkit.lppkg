@@ -1,0 +1,13 @@
+name = "appkit"
+version = "0.1.0"
+description = "A Loup proxy layer over AppKit: windows, controls, layout, tables, drawing, dialogs, menus and timers (macOS, host.native)."
+
+[build]
+# The library has no program of its own. `entry` names the module directory
+# (this one), which is how a dependent finds `appkit.<module>` whatever this
+# folder is called (the `.temp/loup-deps/appkit` view link, core §1-13.3).
+entry = "app.lphc"
+mode = "host.native"
+
+[delivery.native]
+framework = ["AppKit"]

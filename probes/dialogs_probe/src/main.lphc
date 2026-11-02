@@ -1,0 +1,299 @@
+@mode(host.native)
+
+# Probe for appkit.dialogs: a window with one button per dialog / service and
+# a result line. `--self-test [png]` queues canned answers (no modal panel is
+# ever shown), clicks every button, round-trips the real clipboard (saving
+# and restoring what was on it), prints the observed values, snapshots the
+# window and quits. It also writes and reads text files with
+# readTextFile / writeTextFile, including every kind of failure (reported as
+# values, never thrown).
+
+from appkit.objc import (cls, sel, nsstr, str_of, msg, msgI, msgII, msgIII, msgIIII, malloc, free);
+from appkit.app import (appInit, run, quit, after, isSelfTest, onAction, Window, View);
+from appkit.dialogs import (alert, confirm, info, prompt, openFile, openFolder, saveFile, saveFileWithTypes,
+    copyText, pasteText, clipboardHasText, saveClipboard, restoreClipboard, ClipboardContents,
+    beep, hasSound, playSound, soundCopiesPlaying, openURL, revealInFinder, setTestAnswers, testAnswersLeft, testLog,
+    readTextFile, writeTextFile, TextRead, ALERT_FIRST_BUTTON, PANEL_OK, PASTEBOARD_TEXT);
+
+var g_last: string = "";
+var g_status: int = 0;
+var g_field: int = 0;
+
+## Show `text` as the latest result (and keep it for the self-test).
+func show(text: string): void {
+    g_last = text;
+    msgI(g_status, sel("setStringValue:"), nsstr("Result: " + text));
+    return;
+}
+
+## A push button titled `title` that runs `handler`, placed in grid cell
+## (`col`, `row`) of `win`.
+func addButton(win: Window, title: string, col: int, row: int, handler: fn(): void): View {
+    let b = View(msgIII(cls("NSButton"), sel("buttonWithTitle:target:action:"), nsstr(title), 0, 0));
+    let x = 20.0 + 150.0 * (col as float);
+    let y = 200.0 - 40.0 * (row as float);
+    win.add(b, x, y, 140.0, 32.0);
+    onAction(b.handle, handler);
+    return b;
+}
+
+## The text in the probe's field.
+func fieldText(): string {
+    let t = str_of(msg(g_field, sel("stringValue")));
+    return t;
+}
+
+## The probe's scratch folder: .temp beside the executable (created).
+func scratchDir(): string {
+    let exe = str_of(msg(msg(cls("NSBundle"), sel("mainBundle")), sel("executablePath")));
+    let parts = exe.split("/");
+    var dir_parts: list[string] = [];
+    var i = 0;
+    while (i + 1 < parts.len()) {
+        dir_parts.push(parts[i]);
+        i = i + 1;
+    }
+    let dir = dir_parts.join("/") + "/.temp";
+    let fm = msg(cls("NSFileManager"), sel("defaultManager"));
+    msgIIII(fm, sel("createDirectoryAtPath:withIntermediateDirectories:attributes:error:"), nsstr(dir), 1, 0, 0);
+    return dir;
+}
+
+func describeRead(r: TextRead): string {
+    if (r.succeeded) {
+        let s = "ok [" + r.contents.replace("\n", "\\n") + "] failure [" + r.failure + "]";
+        return s;
+    }
+    let s = "failed, contents [" + r.contents + "], failure: " + r.failure;
+    return s;
+}
+
+## readTextFile / writeTextFile: a round trip and every kind of failure.
+func testFiles(): void {
+    let dir = scratchDir();
+    let path = dir + "/notes.txt";
+    let text = "line 1\nnaïve café ✓ 😀\n";
+    let written = writeTextFile(path, text);
+    println("writeTextFile: [" + written + "]");
+    let back = readTextFile(path);
+    println("readTextFile: " + describeRead(back));
+    println("round trip exact: " + (back.contents == text).to_string());
+    println("overwrite: [" + writeTextFile(path, "") + "], read back: " + describeRead(readTextFile(path)));
+    println("missing file: " + describeRead(readTextFile(dir + "/no-such-file.txt")));
+    println("a folder: " + readTextFile(dir).succeeded.to_string());
+    let bad_dir = writeTextFile(dir + "/no/such/folder/x.txt", "x");
+    println("write into a missing folder: failure reported " + (bad_dir != "").to_string() + ": " + bad_dir);
+    # Two bytes that are not UTF-8 (0xC3 0x28), written with NSData.
+    let bytes = malloc(8);
+    Volatile[int].at(bytes).write(10435);
+    let data = msgII(cls("NSData"), sel("dataWithBytes:length:"), bytes, 2);
+    free(bytes);
+    let latin = dir + "/latin1.txt";
+    msgII(data, sel("writeToFile:atomically:"), nsstr(latin), 1);
+    let not_utf8 = readTextFile(latin);
+    println("not UTF-8: succeeded " + not_utf8.succeeded.to_string() + ", failure reported "
+        + (not_utf8.failure != "").to_string());
+    let fm = msg(cls("NSFileManager"), sel("defaultManager"));
+    msgII(fm, sel("removeItemAtPath:error:"), nsstr(path), 0);
+    msgII(fm, sel("removeItemAtPath:error:"), nsstr(latin), 0);
+    return;
+}
+
+func click(b: View): void {
+    msgI(b.handle, sel("performClick:"), 0);
+    return;
+}
+
+pub func main(): void {
+    appInit("Dialogs Probe");
+    let win = Window("Dialogs Probe", 480.0, 330.0);
+
+    let status = View(msgI(cls("NSTextField"), sel("labelWithString:"), nsstr("Result: —")));
+    win.add(status, 20.0, 290.0, 440.0, 22.0);
+    g_status = status.handle;
+
+    let field = View(msgI(cls("NSTextField"), sel("textFieldWithString:"), nsstr("Hello, clipboard ✓")));
+    win.add(field, 20.0, 252.0, 440.0, 24.0);
+    g_field = field.handle;
+
+    let b_alert = addButton(win, "Alert…", 0, 0, func(): void {
+        let i = alert("Save changes?", "Your edits will be lost otherwise.", ["Save", "Don't Save", "Cancel"]);
+        show("alert -> " + i.to_string());
+    });
+    let b_confirm = addButton(win, "Confirm…", 1, 0, func(): void {
+        let yes = confirm("Delete the item?", "This cannot be undone.");
+        show("confirm -> " + yes.to_string());
+    });
+    let b_info = addButton(win, "Info…", 2, 0, func(): void {
+        info("Done", "The export finished.");
+        show("info dismissed");
+    });
+    let b_prompt = addButton(win, "Prompt…", 0, 1, func(): void {
+        let name = prompt("Your name", "Type a name:", fieldText());
+        show("prompt -> \"" + name + "\"");
+    });
+    let b_open = addButton(win, "Open File…", 1, 1, func(): void {
+        let path = openFile(["txt", "md"]);
+        show("openFile -> \"" + path + "\"");
+    });
+    let b_folder = addButton(win, "Open Folder…", 2, 1, func(): void {
+        let path = openFolder();
+        show("openFolder -> \"" + path + "\"");
+    });
+    let b_save = addButton(win, "Save As…", 0, 2, func(): void {
+        let path = saveFile("report.csv");
+        show("saveFile -> \"" + path + "\"");
+    });
+    let b_copy = addButton(win, "Copy Field", 1, 2, func(): void {
+        let ok = copyText(fieldText());
+        show("copyText -> " + ok.to_string());
+    });
+    let b_paste = addButton(win, "Paste to Field", 2, 2, func(): void {
+        let text = pasteText();
+        msgI(g_field, sel("setStringValue:"), nsstr(text));
+        show("pasteText -> \"" + text + "\"");
+    });
+    let b_beep = addButton(win, "Beep", 0, 3, func(): void {
+        beep();
+        show("beep");
+    });
+    let b_sound = addButton(win, "Play “Tink”", 1, 3, func(): void {
+        let ok = playSound("Tink");
+        show("playSound(Tink) -> " + ok.to_string());
+    });
+    let b_url = addButton(win, "Open URL…", 2, 3, func(): void {
+        let ok = openURL("https://example.com/");
+        show("openURL -> " + ok.to_string());
+    });
+    let b_reveal = addButton(win, "Reveal in Finder", 0, 4, func(): void {
+        let ok = revealInFinder("/Applications");
+        show("revealInFinder -> " + ok.to_string());
+    });
+
+    if (isSelfTest()) {
+        after(0.5, func(): void {
+            println("constants: " + ALERT_FIRST_BUTTON.to_string() + " " + PANEL_OK.to_string() + " " + PASTEBOARD_TEXT);
+            setTestAnswers(["1", "yes", "no", "ok", "Ada", "", "/tmp/notes.txt", "",
+                "/tmp/projects", "/tmp/report.csv", "yes", "no"]);
+            println("answers queued: " + testAnswersLeft().to_string());
+            click(b_alert);
+            println(g_last);
+            click(b_confirm);
+            println(g_last);
+            click(b_confirm);
+            println(g_last);
+            click(b_info);
+            println(g_last);
+            click(b_prompt);
+            println(g_last);
+            click(b_prompt);
+            println(g_last);
+            click(b_open);
+            println(g_last);
+            click(b_open);
+            println(g_last);
+            click(b_folder);
+            println(g_last);
+            click(b_save);
+            println(g_last);
+            click(b_url);
+            println(g_last);
+            click(b_reveal);
+            println(g_last);
+            println("answers left: " + testAnswersLeft().to_string());
+            for (line in testLog()) {
+                println("log: " + line);
+            }
+
+            # direct calls, including the empty-buttons alert and bad answers
+            setTestAnswers(["0", "maybe", "7", "-1", "-2"]);
+            println("alert no buttons -> " + alert("Note", "", []).to_string());
+            try {
+                confirm("Sure?", "");
+                println("confirm maybe: no error");
+            } catch (Exception as e) {
+                println("confirm maybe: " + e.message);
+            }
+            try {
+                alert("Pick", "", ["A", "B"]);
+                println("alert 7: no error");
+            } catch (Exception as e) {
+                println("alert 7: " + e.message);
+            }
+            println("alert canned -1 (ended without a button press) -> "
+                + alert("Pick", "", ["A", "B"]).to_string());
+            try {
+                alert("Pick", "", ["A", "B"]);
+                println("alert -2: no error");
+            } catch (Exception as e) {
+                println("alert -2: " + e.message);
+            }
+
+            # saveFileWithTypes: the canned path is completed as the panel
+            # completes a typed name.
+            setTestAnswers(["/tmp/drawing", "/tmp/Shot.PNG", "/tmp/photo", "/tmp/photo.jpeg", "/tmp/notes.txt",
+                "/tmp/.profile", "", "/tmp/readme", "/tmp/plain"]);
+            println("saveFileWithTypes png: " + saveFileWithTypes("Sketch.png", ["png"]));
+            println("saveFileWithTypes png, typed .PNG: " + saveFileWithTypes("Sketch.png", ["png"]));
+            println("saveFileWithTypes jpg: " + saveFileWithTypes("Photo", ["jpg"]));
+            println("saveFileWithTypes jpg, typed .jpeg: " + saveFileWithTypes("Photo", ["jpg"]));
+            println("saveFileWithTypes png, typed .txt: " + saveFileWithTypes("Sketch.png", ["png"]));
+            println("saveFileWithTypes png, typed .profile: " + saveFileWithTypes("", ["png"]));
+            println("saveFileWithTypes cancelled: [" + saveFileWithTypes("Sketch.png", ["png"]) + "]");
+            println("saveFileWithTypes txt, md: " + saveFileWithTypes("Notes", ["txt", "md"]));
+            println("saveFileWithTypes []: " + saveFileWithTypes("Plain", []));
+            for (line in testLog()) {
+                println("log: " + line);
+            }
+            setTestAnswers([]);
+            println("canned off, left: " + testAnswersLeft().to_string() + ", log: " + testLog().len().to_string());
+
+            # the real clipboard: save it, round-trip text, put it back
+            let before = pasteText();
+            let saved = saveClipboard();
+            println("saved items >= 0: " + (saved.count() >= 0).to_string());
+            click(b_copy);
+            println(g_last);
+            println("pasteText: " + pasteText());
+            println("clipboardHasText: " + clipboardHasText().to_string());
+            msgI(g_field, sel("setStringValue:"), nsstr("(cleared)"));
+            click(b_paste);
+            println(g_last);
+            println("field after paste: " + fieldText());
+            println("copyText(multi-line ü): " + copyText("line 1\nline 2 ü").to_string());
+            println("paste multi-line: " + pasteText().replace("\n", "\\n"));
+            restoreClipboard(saved);
+            println("clipboard restored: " + (pasteText() == before).to_string());
+            try {
+                restoreClipboard(saved);
+                println("restore twice: no error");
+            } catch (Exception as e) {
+                println("restore twice: " + e.message);
+            }
+            try {
+                saved.count();
+                println("count after restore: no error");
+            } catch (Exception as e) {
+                println("count after restore: " + e.message);
+            }
+            println("clipboard still restored: " + (pasteText() == before).to_string());
+
+            # sounds (the beep and "Tink" are audible)
+            click(b_beep);
+            println(g_last);
+            println("hasSound(Tink): " + hasSound("Tink").to_string());
+            println("hasSound(NoSuchSound): " + hasSound("NoSuchSound").to_string());
+            println("playSound(NoSuchSound): " + playSound("NoSuchSound").to_string());
+            click(b_sound);
+            println(g_last);
+            click(b_sound);
+            println(g_last + " (pressed again at once)");
+            println("sound copies playing: " + soundCopiesPlaying().to_string());
+
+            testFiles();
+            if (runtime.args().len() > 1) { win.snapshot(runtime.args()[1]); }
+            quit();
+        });
+    }
+    run(win);
+}

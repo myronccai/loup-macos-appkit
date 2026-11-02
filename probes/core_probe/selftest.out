@@ -1,0 +1,133 @@
+clicks: 2
+label: héllo ✓
+field: typed text
+field now: changed ✓
+button frame: 20 60 100 32
+content: 360 x 330
+menu hits: 1
+ticks > 3: true
+title: Core Probe
+-- menus
+bar: Core Probe, File, Edit, Extras, Window, Tools
+itemWithTitle Edit found: true
+menuBarIndex File / Window / Nope: 1 / 4 / -1
+app menu: Core Probe, last item Quit Core Probe
+edit menu: Edit: Undo Redo | Cut Copy Paste Select All; Redo key Z
+window menu item 1: Close
+menuBar is the main menu: true
+menuBarMenu Nope: ValueError
+tools index of Check: 2, of Nope: -1
+disabled after update: enabled false
+perform disabled: false, hits 0
+re-enabled: enabled true, perform true, hits 1
+checked: true
+checked after setChecked(false): false
+perform Do Thing: true, hits 2
+keys: Save s/1048576, Plain p/0, Ctrl l/262144, Opt o/524288, Shift Cmd K/1048576
+mask constants: none 0, shift 131072, cmd 1048576, shift-cmd 1179648
+-- keys
+cmd-b (button): true, clicks +1
+cmd-s (Save): true, saves 1
+p (Plain): true, plain 1
+ctrl-l (Ctrl): true, ctrl 1
+opt-o (Opt): true, opt 1
+shift-cmd-K (Shift Cmd): true, shift-cmd 1
+ctrl-x (nothing): false
+File menu cmd-s: true, saves 2
+Tools menu cmd-s (not there): false
+-- standard actions
+first responder is the window: true
+key window: false (a quiet self-test has none)
+Edit > Copy: true, copies 1
+cmd-c: true, copies 2
+sendAction copy: true, copies 3
+sendAction paste: (nobody) false
+Copy disabled: perform false, copies 3
+Copy enabled: perform true, copies 4
+onStandardAction loupAction: ValueError
+-- windows
+resizable: true
+after setResizable(false): false, style 7
+after setResizable(true): true, style 15
+second setContentSize: 300 x 150
+second fitToContent: 240 x 120
+second shouldClose: false, asks 1
+second cmd-w (refused): true, visible true, asks 2
+second performClose (refused): false, asks 3
+Window > Close (allowed): true, visible false, asks 4, onClose 1
+main shouldClose (no hook): true
+shouldQuit (refused): false, asks 1
+shouldQuit (allowed): true, asks 2
+isDarkMode agrees with the appearance: true
+-- rendering
+swatch size: 100 x 60, pixels match the scale: true, flipped false
+bottom (10, 10): #2A9D8F
+top (10, 50): #E63946
+pixel (0, 0) top-left: #E63946 alpha 255
+colorAt outside: ValueError
+View.colorAt (90, 5): #2A9D8F
+snapshot written: true
+snapshot color space is sRGB: true
+snapshot bottom-left pixel: #2A9D8F, top-left: #E63946
+window render taller than the content: true, hole at the tab strip: false
+-- hidden items and shifted keys
+hidden item: hidden true, key works hidden true
+cmd-j (hidden item): true, hits 1
+cmd-j (hidden, key off): false, hits 1
+cmd-j (shown): true, hits 2, hidden false
+shift-cmd-y (item y + shift-cmd): true, hits 1
+shift-cmd-Y: true, hits 2
+cmd-Y (upper case adds shift): true, hits 3
+cmd-y (no shift): false, hits 3
+shift-cmd-k (item K + cmd): true, shift-cmd 2
+File menu shift-cmd-y: true, hits 4
+shift-cmd-1 (item 1 + shift-cmd): true, bang 1
+cmd-1 (no shift): false, bang 1
+-- window state
+visible: true
+after hide: visible false
+after show: visible true
+minSize unset: 0 x 0
+minSize: 200 x 150
+edited: false
+after setDocumentEdited(true): true
+after setDocumentEdited(false): false
+executable: core-probe, executableDir + name is the path: true
+represented file: ""
+after setRepresentedFilename: is the executable true
+cleared: ""
+-- appearance
+appearance: ""
+dark: dark, window dark true, content dark true
+light: light, window dark false, content dark false
+none: "", window follows the app true, content too true
+setAppearance blue: ValueError
+translucent label text drawn once (alpha about 128): true
+-- focus
+focus field: true, field has it true, table false
+focus table: true, table has it true, field false
+focus label (refuses): false, table false
+after clearFocus: table false, field false
+-- undo
+registerUndo before onUndo: RuntimeError
+canUndo at first: false
+registered: canUndo true, name Draw Line
+Edit > Undo: true "Undo Draw Line", undos 1, canRedo true, redo name Draw Line
+Edit > Redo: true "Redo Draw Line", redos 1, undo name Draw Line
+two more steps: undo true -> next Fill, undo true -> next Draw Line, undos 3
+shift-cmd-z (lower-case z): true, redos 2, undo name Fill
+cmd-z: true, undos 4
+cmd-z: true, undos 5, canUndo false
+Edit > Undo with nothing to undo: false "Undo", undos 5
+after clearUndo: canUndo false, canRedo false
+-- failing veto hooks
+throwing should-close: performClose false, visible true
+throwing should-quit: shouldQuit false
+errors reported: 2
+not throwing: shouldClose true, shouldQuit true
+-- timers and clock
+uptimeMs agrees with uptimeSeconds: true
+in common modes: every false, runInCommonModes true
+while a menu tracks: common-modes timer fired true, default timer fired false
+stopped: valid false, in common modes false
+the clock moved on: true

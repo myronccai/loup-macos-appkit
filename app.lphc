@@ -1,0 +1,2482 @@
+@mode(host.native)
+
+# appkit.app — the application, windows, views, menus, timers and the event
+# dispatch every other appkit module builds on.
+#
+# Objective-C calls back into Loup through ONE Objective-C class, `LoupTarget`,
+# created at run time. Its methods are Loup functions (`addressOf(f)`,
+# Compilation §3-3.4.2), and each looks up the Loup closure registered for the
+# object that sent the event (`onAction(button, …)`, a timer, a window). The
+# single instance is every control's target, the app delegate, and every
+# window's delegate. Other modules add their own methods to the class
+# (`targetClass()` + `class_addMethod`) before they first need them.
+#
+# Handlers are closures `fn(): void` kept in module-level registries keyed by
+# the Objective-C object, so proxy classes stay immutable (`handle` only).
+# A handler that throws is reported on stderr; the exception never unwinds
+# through AppKit. In a `--self-test` run (`isSelfTest`) the process then ends
+# with exit status 1 — a failing self-test step must not leave the app running
+# until the gate's deadline kills it. (Outside a self-test the app carries on.)
+#
+# ── Menus ──
+# `appInit` builds the app menu, Edit and Window. `appMenu()`, `editMenu()`,
+# `windowMenu()` hand those out as `Menu` proxies, `menuBarMenu(title)` any
+# menu in the bar, `menuBar()` the bar itself, and `menuOf(handle)` wraps any
+# NSMenu. `addMenu(menu)` appends a menu; its menu-bar item carries the
+# menu's title, so `[[NSApp mainMenu] itemWithTitle:@"Edit"]` finds it.
+# `insertMenu(menu, index)` puts a menu at a position (1 = right after the app
+# menu, where File goes) and `addMenuBefore(menu, "Window")` before a named
+# one. Key equivalents take a modifier mask — `MOD_NONE`, `MOD_COMMAND`,
+# `MOD_SHIFT_COMMAND`, `MOD_CONTROL`, `MOD_OPTION`, `MOD_SHIFT` (add them to
+# combine): `Menu.addItemWithModifiers(title, key, modifiers, handler)` or
+# `MenuItem.setKeyEquivalent(key, modifiers)`. `Menu.addItem(title, key, …)`
+# keeps its ⌘ default.
+#
+# `MenuItem.setHidden(true)` hides an item; with
+# `setAllowsKeyEquivalentWhenHidden(true)` its shortcut still works — a second
+# key for an action (keypad Enter as well as Return) is a hidden item:
+# `Menu.addHiddenItem(title, key, modifiers, handler)` makes one.
+#
+# `MenuItem.setEnabled(false)` sticks: LoupTarget answers `validateMenuItem:`
+# with the state set last, so NSMenu's autoenabling (which used to re-enable
+# every item with a target on the next menu update) keeps it. That covers the
+# items made by `addItem` and the standard actions answered by
+# `onStandardAction`; a standard item answered by another responder (a text
+# field's Copy) is enabled by that responder, unless
+# `Menu.setAutoenablesItems(false)` turns autoenabling off for its menu.
+#
+# ── Responder-chain actions ──
+# `onStandardAction("copy:", handler)` makes LoupTarget — the app delegate,
+# the last link of every responder chain — answer a standard action, so
+# Edit ▸ Copy works in a window with no text view (a focused text field still
+# takes it first, as it should). `setStandardActionEnabled(action, enabled)`
+# greys the menu items that send it. NOT for Undo / Redo: NSWindow answers
+# `undo:` / `redo:` itself (with its own undo manager), so while any window
+# is shown an `onStandardAction("undo:")` handler never runs — use the
+# window's undo hook below.
+#
+# ── Undo ──
+# Every window has an undo manager (AppKit's: text fields and text views in
+# the window record their typing in it, and Edit ▸ Undo / Redo, ⌘Z / ⇧⌘Z
+# act on it). An app with its own undo stack hooks into it:
+# `Window.onUndo(undoHandler, redoHandler)` once, then
+# `Window.registerUndo("Draw Line")` after each change it can take back. Each
+# call is one undo step (it closes the event's open step first, so steps
+# registered in one handler — a self-test — still undo one at a time).
+# Edit ▸ Undo then runs `undoHandler` (and the step moves to Redo), Redo runs
+# `redoHandler`; AppKit enables the items and titles them "Undo Draw Line" —
+# so find them by index or keep the MenuItem, as `itemWithTitle("Undo")` no
+# longer matches. App steps and typing interleave in one history, as in any
+# document app. `canUndo()` / `canRedo()`, `undoActionName()` /
+# `redoActionName()` read it back, `undo()` / `redo()` act as the menu items,
+# and `clearUndo()` drops the app's steps (after loading or clearing a
+# document). Do not call `registerUndo` from the handlers (it is ignored
+# there: the library records the opposite step itself).
+#
+# ── Windows ──
+# A Window is titled, closable, miniaturizable and resizable;
+# `setResizable(false)` / `isResizable()` make and report a fixed-size one.
+# `setContentSize(w, h)` sizes the content area, `fitToContent()` sizes it to
+# the content view's Auto Layout `fittingSize`, `center()` centers it, and
+# `clearFocus()` takes the keyboard focus from every view (no field selection
+# in a snapshot). `focus(view)` gives the keyboard focus to any view that
+# accepts it — a table, a canvas, a field (`makeFirstResponder:`, as a click
+# on it would: a field being edited ends its editing) — and `hasFocus(view)`
+# says whether the focus is in a view (or the field editor editing it).
+# `minSize()` reads back `setMinSize`. `isVisible()`, `hide()` (order out
+# without closing; `show()` brings it back). A document window:
+# `setDocumentEdited(true)` puts the unsaved-changes dot in the close button
+# (`isDocumentEdited()`), `setRepresentedFilename(path)` the file's icon in
+# the title bar (`representedFilename()`).
+#
+# ── Appearance ──
+# `isDarkMode()` says whether the app is drawn in Dark Mode.
+# `Window.setAppearance("dark")` (or "light"; "" follows the system again)
+# draws one window in that appearance, `Window.appearance()` reads the
+# setting back, and `Window.isDark()` / `View.isDark()` say whether a window
+# or a view is drawn dark — what a view that picks its own colors (a Canvas
+# palette) must ask, since a window's appearance does not change the app's.
+#
+# ── Closing and quitting ──
+# `Window.onShouldClose(fn(): bool)` (`windowShouldClose:`: the close button,
+# ⌘W, Window ▸ Close) and `onShouldQuit(fn(): bool)`
+# (`applicationShouldTerminate:`: ⌘Q, Quit in the Dock, log out) veto with
+# `false`. A handler that throws REFUSES the close or quit (the exception is
+# reported on stderr): a failing save inside an unsaved-changes check must
+# not lose the document. (Earlier versions allowed it.) A handler that
+# always throws therefore keeps the window open — Force Quit still ends the
+# app. `Window.onClose` still runs after the fact
+# (`windowWillClose:`). These two methods are added to LoupTarget only when an
+# app first registers the hook, so apps that add their own
+# `windowShouldClose:` / `applicationShouldTerminate:` with `class_addMethod`
+# keep working (an app must not do both: the hook then throws).
+#
+# ── Test helpers (they work in a quiet self-test) ──
+# A quiet self-test's window is never key: AppKit gives an app that was never
+# activated no key window, and `makeKeyWindow` does not change that. So an
+# action sent to nil (Window ▸ Close = `performClose:`, Edit ▸ Undo,
+# Copy, …) would find no responder. The helpers below then send it along the
+# responder chain of the window `run` (or `Window.show`) showed last — first
+# responder, its next responders up to the window, the window's delegate,
+# NSApp, NSApp's delegate — exactly where it would have gone had that window
+# been key. With a key window they leave everything to AppKit.
+#   `MenuItem.perform()`   choose the item as a click would (`[menu update]`,
+#                          then `performActionForItemAtIndex:`); false when it
+#                          is disabled or nothing answers it.
+#   `Menu.sendKey(chars, modifiers)`, `Window.sendKey(chars, modifiers)`
+#                          a key-down NSEvent through `performKeyEquivalent:`
+#                          (Window: the window's — its buttons' key
+#                          equivalents — then the menu bar's); true when taken.
+#                          The key is built as the keyboard would send it
+#                          (from the key's code on the ANSI layout, when the
+#                          current layout types the same character there),
+#                          so AppKit matches it by its own rule for real key
+#                          presses: ⇧ + a key equals the shifted key — an
+#                          item set as ("c", MOD_SHIFT_COMMAND) or as
+#                          ("C", MOD_COMMAND) takes both ("c",
+#                          MOD_SHIFT_COMMAND) and ("C", MOD_SHIFT_COMMAND),
+#                          and ⇧⌘1 takes ("!", MOD_COMMAND) too; an
+#                          upper-case letter adds ⇧ itself. A bare key (no
+#                          modifier) and other keys (Return, keypad Enter,
+#                          "+") go as the characters given.
+#   `Window.sendAction("selectAll:")` an action along the window's chain.
+#   `Window.performClose()` / `Window.shouldClose()` / `shouldQuit()`
+#                          the close button and ⌘Q without the beep AppKit
+#                          makes on a refusal, or only the question.
+#   `setHandlerErrorsFatal(false)` lets a self-test check what an app does
+#                          when a handler throws (the error is still printed;
+#                          `handlerErrorCount()` counts them) instead of
+#                          ending with status 1.
+# The quiet window cannot be made key: an app that was never activated has
+# no key window (`makeKeyWindow` is ignored, although the window answers
+# `canBecomeKeyWindow` YES); only activating the app or a non-activating
+# panel would give it one, and both take the keyboard focus from the app the
+# user is typing in. (In some passing desktop states — seen while a browser
+# sign-in had the focus — AppKit does make the window key. The app is still
+# not active, so it gets none of the user's keystrokes, but self-tests that
+# print key-window state or press Return can then differ: re-run them.)
+#
+# ── Views: layout priorities and focus ──
+# Every proxy is a `View`. `setHugging(h, v)` (how strongly it resists growing
+# past its natural size) and `setCompressionResistance(h, v)` (resists
+# shrinking below it) set the Auto Layout priorities per axis — `PRIORITY_*`
+# constants or any 1..1000 — and `hugging(vertical)` /
+# `compressionResistance(vertical)` read them back. Controls hug at 250 and
+# resist at 750; a text field beside a view that `Stack.addExpanding`
+# stretches, in a stack squeezed below its natural height, gives way unless it
+# resists at PRIORITY_REQUIRED. `setFocusable(false)` makes a control refuse
+# the keyboard focus (refusesFirstResponder: no focus ring when clicked; a
+# read-only list keeps the focus where it was); `isFocusable()` reads it.
+#
+# ── Rendering ──
+# `View.render()` draws a view into a `Bitmap` (an NSBitmapImageRep at the
+# screen's scale, tagged sRGB BEFORE the view draws into it, so its samples
+# are the sRGB values drawn — whatever display the window is on — and a PNG
+# carries the sRGB profile, not the monitor's). `Bitmap.colorAt(x, y)` reads a
+# `Pixel` (r, g, b, a in 0..255) at a point in the view's own coordinates (a
+# flipped view — a Canvas — counts y down from the top), `pixelAt(px, py)` at
+# a pixel (top-left origin), `writePng(path)` saves it. `View.snapshot(path)`
+# and `View.colorAt(x, y)` render and do one of those. `Window.snapshot(path)`
+# and `Window.render()` draw the whole window, title bar included, the same
+# way.
+# Before drawing, a render lays the view out and commits pending Core
+# Animation changes (`[CATransaction flush]`) — without that a view switched
+# in during the same handler (a table on a newly selected tab) drew blank and
+# whitened the window. It also stands in for a compositing filter the cached
+# drawing of a whole window gets wrong: NSTabView (macOS 26) cuts the gap in
+# its border for the tab strip with a `destOut` layer, which in a window
+# render cut a transparent hole through the window instead (shown as a blank
+# white capsule over the tabs); during a render that layer is hidden and its
+# parent masked by the same shape instead.
+# A label (macOS 26 NSTextField) draws its text through a private
+# `NSTextFieldSimpleLabel` subview, and a cached render drew it twice — that
+# subview and the field's own cell — so translucent text (COLOR_SECONDARY_LABEL
+# is white at 55% in Dark Mode) came out at 80%, near-white, and every label's
+# edges heavier. During a render those subviews are hidden, so the text is
+# drawn once, at the color the screen shows.
+# What a render cannot show: anything the window server composites (window
+# shadows, vibrancy / glass blur of what is behind the window); arm64 only
+# (NSRect arguments).
+#
+# `loadBitmap(path, flipped)` reads an exported PNG back into a Bitmap, and
+# `Bitmap.isSrgb()` says whether a bitmap (a render, or a PNG read back) is
+# in the sRGB color space.
+#
+# ── Timers and the clock ──
+# `after(seconds, f)` and `every(seconds, f)` run on the event loop in its
+# default mode, which pauses while a menu is open or a window is resized;
+# `Timer.runInCommonModes()` keeps a timer firing then too (a running
+# display). `uptimeSeconds()` / `uptimeMs()` read a monotonic clock (the
+# time since the Mac started; a change of the wall-clock time never moves
+# it).
+#
+# ── Files ──
+# `executablePath()` is the running program's path, `executableDir()` its
+# directory (a self-test's scratch files go beside the binary).
+
+from appkit.objc import (cls, sel, make, nsstr, nsstrings, str_of, Rect, rect_of, point_of, msg, msgV,
+    msgI, msgII, msgIII, msgS, msgD, msgDD, msgDDDD, msgDDDDI, msgIID, msgDIIII, msgRetD,
+    objc_allocateClassPair, objc_registerClassPair, class_addMethod, load_appkit);
+
+## `+[NSEvent keyEventWithType:location:modifierFlags:timestamp:windowNumber:
+## context:characters:charactersIgnoringModifiers:isARepeat:keyCode:]`.
+@symbol("objc_msgSend") extern native "objc" func msgNewKeyEvent(recv: int, sel: int, kind: int, x: float,
+    y: float, flags: int, ts: float, window_number: int, context: int, chars: int, chars_plain: int,
+    is_repeat: uint8, key_code: uint16): int;
+extern native "CoreGraphics.framework" func CGPathCreateMutable(): int;
+extern native "CoreGraphics.framework" func CGPathAddRect(path: int, transform: int, x: float, y: float,
+    w: float, h: float): void;
+extern native "CoreGraphics.framework" func CGPathAddRoundedRect(path: int, transform: int, x: float,
+    y: float, w: float, h: float, corner_w: float, corner_h: float): void;
+extern native "CoreGraphics.framework" func CGPathRelease(path: int): void;
+## A key-down event as the keyboard sends it (its characters come from the
+## current keyboard layout); `src` 0 is no event source.
+extern native "CoreGraphics.framework" func CGEventCreateKeyboardEvent(src: int, key_code: uint16,
+    key_down: bool): int;
+extern native "CoreGraphics.framework" func CGEventSetFlags(event: int, flags: uint64): void;
+extern native "CoreFoundation.framework" func CFRelease(obj: int): void;
+## `setContentHuggingPriority:forOrientation:` and its getter (NSLayoutPriority
+## is a 32-bit float).
+@symbol("objc_msgSend") extern native "objc" func msgPriority(recv: int, sel: int, p: float32, axis: int): int;
+@symbol("objc_msgSend") extern native "objc" func msgRetPriority(recv: int, sel: int, axis: int): float32;
+
+## NSApplicationActivationPolicyRegular — a Dock icon and a menu bar.
+const ACTIVATION_REGULAR: int = 0;
+## NSApplicationActivationPolicyAccessory — no Dock icon, no menu bar (the
+## policy of a `--self-test` run, which must not disturb the user's screen).
+const ACTIVATION_ACCESSORY: int = 1;
+## NSWindowStyleMask: titled | closable | miniaturizable | resizable.
+const WINDOW_STYLE: int = 15;
+## NSWindowStyleMaskResizable.
+const STYLE_RESIZABLE: int = 8;
+## NSBitmapImageFileTypePNG.
+const PNG: int = 4;
+## NSEventTypeKeyDown.
+const EVENT_KEY_DOWN: int = 10;
+## NSTerminateCancel / NSTerminateNow (applicationShouldTerminate: replies).
+const TERMINATE_CANCEL: int = 0;
+const TERMINATE_NOW: int = 1;
+## NSControlStateValueOn.
+const STATE_ON: int = 1;
+## The run-loop mode set that includes menu tracking and live resize
+## (NSRunLoopCommonModes is this string).
+const RUN_LOOP_COMMON_MODES: string = "kCFRunLoopCommonModes";
+## NSAppearance names.
+const APPEARANCE_AQUA: string = "NSAppearanceNameAqua";
+const APPEARANCE_DARK_AQUA: string = "NSAppearanceNameDarkAqua";
+
+## Key-equivalent modifier masks (NSEventModifierFlags); add them to combine.
+## No modifier: the bare key (Return, "=", "c").
+pub const MOD_NONE: int = 0;
+## ⇧ Shift.
+pub const MOD_SHIFT: int = 131072;
+## ⌃ Control.
+pub const MOD_CONTROL: int = 262144;
+## ⌥ Option.
+pub const MOD_OPTION: int = 524288;
+## ⌘ Command (what `Menu.addItem` uses).
+pub const MOD_COMMAND: int = 1048576;
+## ⇧⌘ Shift-Command.
+pub const MOD_SHIFT_COMMAND: int = 1179648;
+## Every modifier bit a key equivalent can carry (⇧ ⌃ ⌥ ⌘).
+const MOD_KEYS: int = 1966080;
+
+## Auto Layout priorities for View.setHugging / setCompressionResistance
+## (NSLayoutPriority). Required: never broken.
+pub const PRIORITY_REQUIRED: float = 1000.0;
+## The default compression resistance of controls (and a "strong" hug).
+pub const PRIORITY_HIGH: float = 750.0;
+## The default content hugging of most controls.
+pub const PRIORITY_LOW: float = 250.0;
+## The priority `fittingSize` compresses at: anything lower gives way to it.
+pub const PRIORITY_FITTING: float = 50.0;
+## NSLayoutConstraintOrientationHorizontal / Vertical.
+const AXIS_HORIZONTAL: int = 0;
+const AXIS_VERTICAL: int = 1;
+
+var g_app: int = 0;
+var g_target_class: int = 0;
+var g_target: int = 0;
+var g_quit_on_last_close: int = 1;
+var g_menubar: int = 0;
+var g_app_menu: int = 0;
+var g_edit_menu: int = 0;
+var g_window_menu: int = 0;
+## The NSMenu the next `Menu` constructor wraps instead of making one (menuOf).
+var g_wrap_menu: int = 0;
+## The window `Window.show` showed last: the stand-in key window of the test
+## helpers while the app has no key window.
+var g_key_window: int = 0;
+var g_actions: dict[int, fn(): void] = {};
+var g_timers: dict[int, fn(): void] = {};
+var g_repeating: dict[int, bool] = {};
+var g_window_close: dict[int, fn(): void] = {};
+var g_text_change: dict[int, fn(): void] = {};
+var g_should_close: dict[int, fn(): bool] = {};
+## The quit hook, under key 0.
+var g_should_quit: dict[int, fn(): bool] = {};
+var g_should_close_added: bool = false;
+var g_should_quit_added: bool = false;
+## Menu items set disabled with MenuItem.setEnabled(false).
+var g_item_disabled: dict[int, bool] = {};
+## Standard actions (by selector) LoupTarget answers, and those set disabled.
+var g_std_actions: dict[int, fn(): void] = {};
+var g_std_disabled: dict[int, bool] = {};
+## Timers added to the common run-loop modes (Timer.runInCommonModes).
+var g_common_timers: dict[int, bool] = {};
+## Window undo hooks (Window.onUndo), by window.
+var g_undo: dict[int, fn(): void] = {};
+var g_redo: dict[int, fn(): void] = {};
+## Whether a handler's exception ends a self-test (setHandlerErrorsFatal),
+## and how many handler exceptions were reported.
+var g_errors_fatal: bool = true;
+var g_error_count: int = 0;
+
+# ── dispatch ────────────────────────────────────────────────────────────────
+
+## Report a handler's exception on stderr; in a self-test, end the process
+## with status 1.
+func reportHandlerError(what: string, message: string): void {
+    g_error_count = g_error_count + 1;
+    printErr("appkit: the " + what + " handler threw: " + message);
+    if (isSelfTest() and g_errors_fatal) {
+        printErr("appkit: self-test failed — exiting with status 1");
+        exit(1);
+    }
+    return;
+}
+
+## Run `handler`, reporting (never propagating) an exception. In a
+## `--self-test` run an exception ends the process with exit status 1.
+pub func runHandler(handler: fn(): void, what: string): void {
+    try {
+        handler();
+    } catch (Exception as e) {
+        reportHandlerError(what, e.message);
+    }
+    return;
+}
+
+## Run a veto `handler` (may the window close / the app quit?); an
+## exception is reported like runHandler's and answers false: the close or
+## quit is refused.
+func runVetoHandler(handler: fn(): bool, what: string): bool {
+    var answer = false;
+    try {
+        answer = handler();
+    } catch (Exception as e) {
+        reportHandlerError(what, e.message);
+        printErr("appkit: so the " + what + " answer is no (refused)");
+        answer = false;
+    }
+    return answer;
+}
+
+## Whether a handler that throws in a `--self-test` run ends the process
+## with exit status 1 (`true`, the default). A self-test that checks what
+## the app does after a failing handler (a veto hook that throws refuses)
+## turns it off around that check; the exception is still printed on stderr
+## and counted (handlerErrorCount). Outside a self-test it changes nothing.
+pub func setHandlerErrorsFatal(fatal: bool): void {
+    g_errors_fatal = fatal;
+    return;
+}
+
+## How many handler exceptions the library has reported so far.
+pub func handlerErrorCount(): int {
+    return g_error_count;
+}
+
+## `- (void)loupAction:(id)sender` — a control or menu item was used.
+func impAction(self_obj: int, cmd: int, sender: int): void {
+    if (g_actions.contains_key(sender)) {
+        runHandler(g_actions[sender], "action");
+    }
+    return;
+}
+
+## `- (void)loupTimer:(NSTimer*)timer` — a timer fired.
+func impTimer(self_obj: int, cmd: int, timer: int): void {
+    if (not g_timers.contains_key(timer)) {
+        return;
+    }
+    let handler = g_timers[timer];
+    if (not g_repeating.contains_key(timer)) {
+        g_timers.remove(timer);
+    }
+    runHandler(handler, "timer");
+    return;
+}
+
+## `- (BOOL)applicationShouldTerminateAfterLastWindowClosed:(NSApplication*)app`.
+func impShouldTerminate(self_obj: int, cmd: int, app: int): int {
+    return g_quit_on_last_close;
+}
+
+## `- (void)windowWillClose:(NSNotification*)note`.
+func impWindowWillClose(self_obj: int, cmd: int, note: int): void {
+    let win = msg(note, sel("object"));
+    if (g_window_close.contains_key(win)) {
+        runHandler(g_window_close[win], "window close");
+    }
+    return;
+}
+
+## `- (void)controlTextDidChange:(NSNotification*)note` — a text field's text
+## was edited (every keystroke).
+func impTextDidChange(self_obj: int, cmd: int, note: int): void {
+    let field = msg(note, sel("object"));
+    if (g_text_change.contains_key(field)) {
+        runHandler(g_text_change[field], "text change");
+    }
+    return;
+}
+
+## `- (BOOL)validateMenuItem:(NSMenuItem*)item` — NSMenu asks before it shows
+## a menu, matches a key equivalent or performs an item whose target is
+## LoupTarget: the state MenuItem.setEnabled / setStandardActionEnabled set.
+func impValidateMenuItem(self_obj: int, cmd: int, item: int): int {
+    if (g_item_disabled.contains_key(item)) {
+        return 0;
+    }
+    let action = msg(item, sel("action"));
+    if (g_std_disabled.contains_key(action)) {
+        return 0;
+    }
+    return 1;
+}
+
+## `- (void)<action>:(id)sender` for every action registered with
+## onStandardAction (`cmd` is the selector).
+func impStandardAction(self_obj: int, cmd: int, sender: int): void {
+    if (g_std_actions.contains_key(cmd)) {
+        runHandler(g_std_actions[cmd], "standard action");
+    }
+    return;
+}
+
+## `- (BOOL)windowShouldClose:(NSWindow*)sender` (added by Window.onShouldClose).
+func impWindowShouldClose(self_obj: int, cmd: int, win: int): int {
+    if (not g_should_close.contains_key(win)) {
+        return 1;
+    }
+    if (runVetoHandler(g_should_close[win], "window should-close")) {
+        return 1;
+    }
+    return 0;
+}
+
+## `- (NSApplicationTerminateReply)applicationShouldTerminate:(NSApplication*)app`
+## (added by onShouldQuit).
+func impAppShouldTerminate(self_obj: int, cmd: int, app: int): int {
+    if (not g_should_quit.contains_key(0)) {
+        return TERMINATE_NOW;
+    }
+    if (runVetoHandler(g_should_quit[0], "should-quit")) {
+        return TERMINATE_NOW;
+    }
+    return TERMINATE_CANCEL;
+}
+
+## `- (void)loupUndoStep:(NSArray*)step` — the window's undo manager undoes
+## or redoes a step Window.registerUndo recorded; `step` is [window, name].
+## Records the opposite step (Redo after an Undo, and back), then runs the
+## window's undo or redo handler.
+func impUndoStep(self_obj: int, cmd: int, step: int): void {
+    let win = msgI(step, sel("objectAtIndex:"), 0);
+    let name = msgI(step, sel("objectAtIndex:"), 1);
+    let um = msg(win, sel("undoManager"));
+    let undoing = (msg(um, sel("isUndoing")) & 255) != 0;
+    msgIII(um, sel("registerUndoWithTarget:selector:object:"), target(), sel("loupUndoStep:"), step);
+    msgI(um, sel("setActionName:"), name);
+    if (undoing) {
+        if (g_undo.contains_key(win)) {
+            runHandler(g_undo[win], "undo");
+        }
+    } else {
+        if (g_redo.contains_key(win)) {
+            runHandler(g_redo[win], "redo");
+        }
+    }
+    return;
+}
+
+## The Objective-C class every event goes through (created on first use).
+pub func targetClass(): int {
+    if (g_target_class == 0) {
+        load_appkit();
+        let c = objc_allocateClassPair(cls("NSObject"), "LoupTarget", 0);
+        class_addMethod(c, sel("loupAction:"), addressOf(impAction), "v@:@");
+        class_addMethod(c, sel("loupTimer:"), addressOf(impTimer), "v@:@");
+        class_addMethod(c, sel("applicationShouldTerminateAfterLastWindowClosed:"),
+            addressOf(impShouldTerminate), "c@:@");
+        class_addMethod(c, sel("windowWillClose:"), addressOf(impWindowWillClose), "v@:@");
+        class_addMethod(c, sel("controlTextDidChange:"), addressOf(impTextDidChange), "v@:@");
+        class_addMethod(c, sel("validateMenuItem:"), addressOf(impValidateMenuItem), "c@:@");
+        class_addMethod(c, sel("loupUndoStep:"), addressOf(impUndoStep), "v@:@");
+        objc_registerClassPair(c);
+        g_target_class = c;
+    }
+    return g_target_class;
+}
+
+## The single LoupTarget instance (target, app delegate, window delegate).
+pub func target(): int {
+    if (g_target == 0) {
+        g_target = msg(msg(targetClass(), sel("alloc")), sel("init"));
+    }
+    return g_target;
+}
+
+## Run `handler` when the control or menu item `obj` is used (its action).
+## Replaces any earlier handler for `obj`.
+pub func onAction(obj: int, handler: fn(): void): void {
+    msgI(obj, sel("setTarget:"), target());
+    msgI(obj, sel("setAction:"), sel("loupAction:"));
+    g_actions[obj] = handler;
+    return;
+}
+
+## Run `handler` on every edit of the text field `field`.
+pub func onTextChange(field: int, handler: fn(): void): void {
+    msgI(field, sel("setDelegate:"), target());
+    g_text_change[field] = handler;
+    return;
+}
+
+## Whether `obj` answers the selector `selector` (a SEL).
+func respondsTo(obj: int, selector: int): bool {
+    if (obj == 0) {
+        return false;
+    }
+    let r = msgI(obj, sel("respondsToSelector:"), selector) & 255;
+    return r != 0;
+}
+
+## Make LoupTarget — the app delegate, the last link of every responder
+## chain — answer the standard action `action` (e.g. "copy:", "paste:",
+## "selectAll:") by running `handler`. A responder earlier in the chain (a
+## focused text field) still takes the action first — and every NSWindow
+## answers "undo:" and "redo:" itself, so a handler for those runs only
+## while no window is shown: use Window.onUndo / registerUndo. Replaces any
+## earlier handler for `action`. Throws ValueError when LoupTarget already
+## has a method of that name (one of the library's, or one an app added with
+## class_addMethod).
+pub func onStandardAction(action: string, handler: fn(): void): void {
+    let s = sel(action);
+    if (not g_std_actions.contains_key(s)) {
+        let added = class_addMethod(targetClass(), s, addressOf(impStandardAction), "v@:@");
+        if (not added) {
+            throw ValueError("onStandardAction: LoupTarget already has a method '" + action
+                + "' (a library method, or one the app added with class_addMethod)");
+        }
+    }
+    g_std_actions[s] = handler;
+    return;
+}
+
+## Enable or disable (grey out) the menu items that send the standard action
+## `action` while LoupTarget answers it (see onStandardAction).
+pub func setStandardActionEnabled(action: string, enabled: bool): void {
+    let s = sel(action);
+    if (enabled) {
+        g_std_disabled.remove(s);
+    } else {
+        g_std_disabled[s] = true;
+    }
+    return;
+}
+
+# ── the application ────────────────────────────────────────────────────────
+
+## The shared NSApplication (created by `appInit`).
+pub func nsApp(): int {
+    return g_app;
+}
+
+## Create the application with the standard menus: the app menu (About, Hide,
+## Quit ⌘Q), Edit (Undo, Redo, Cut, Copy, Paste, Select All — text fields
+## need it for their shortcuts) and Window (Minimize, Close). `appMenu()`,
+## `editMenu()` and `windowMenu()` hand them out. Call once, first.
+pub func appInit(name: string): void {
+    load_appkit();
+    g_app = msg(cls("NSApplication"), sel("sharedApplication"));
+    if (isQuietSelfTest()) {
+        msgI(g_app, sel("setActivationPolicy:"), ACTIVATION_ACCESSORY);
+    } else {
+        msgI(g_app, sel("setActivationPolicy:"), ACTIVATION_REGULAR);
+    }
+    msgI(g_app, sel("setDelegate:"), target());
+
+    g_menubar = make("NSMenu");
+    let app_menu = Menu(name);
+    app_menu.addStandard("About " + name, "orderFrontStandardAboutPanel:", "");
+    app_menu.addSeparator();
+    app_menu.addStandard("Hide " + name, "hide:", "h");
+    app_menu.addStandard("Quit " + name, "terminate:", "q");
+    addMenu(app_menu);
+    g_app_menu = app_menu.handle;
+
+    let edit = Menu("Edit");
+    edit.addStandard("Undo", "undo:", "z");
+    edit.addStandard("Redo", "redo:", "Z");
+    edit.addSeparator();
+    edit.addStandard("Cut", "cut:", "x");
+    edit.addStandard("Copy", "copy:", "c");
+    edit.addStandard("Paste", "paste:", "v");
+    edit.addStandard("Select All", "selectAll:", "a");
+    addMenu(edit);
+    g_edit_menu = edit.handle;
+
+    let window_menu = Menu("Window");
+    window_menu.addStandard("Minimize", "performMiniaturize:", "m");
+    window_menu.addStandard("Close", "performClose:", "w");
+    addMenu(window_menu);
+    msgI(g_app, sel("setWindowsMenu:"), window_menu.handle);
+    g_window_menu = window_menu.handle;
+
+    msgI(g_app, sel("setMainMenu:"), g_menubar);
+    return;
+}
+
+## Whether closing the last window quits the app (the default: true).
+pub func setQuitOnLastWindowClose(quit: bool): void {
+    if (quit) { g_quit_on_last_close = 1; } else { g_quit_on_last_close = 0; }
+    return;
+}
+
+## Show `win`, bring the app to the front and run the event loop. Returns only
+## when the loop stops; `quit()` ends the process.
+pub func run(win: Window): void {
+    win.show();
+    # A self-test never takes the focus from the app the user is in.
+    if (not isQuietSelfTest()) {
+        msgI(g_app, sel("activateIgnoringOtherApps:"), 1);
+    }
+    msgV(g_app, sel("run"));
+    return;
+}
+
+## Quit the application (as ⌘Q does: an onShouldQuit handler can refuse).
+pub func quit(): void {
+    msgI(g_app, sel("terminate:"), 0);
+    return;
+}
+
+## Run `handler` when the app is asked to quit (⌘Q, Quit in the Dock, logging
+## out, `quit()`): `false` cancels the quit. Replaces any earlier handler.
+## Call after appInit. Throws RuntimeError when the app added its own
+## `applicationShouldTerminate:` to LoupTarget.
+pub func onShouldQuit(handler: fn(): bool): void {
+    if (g_app == 0) {
+        throw RuntimeError("onShouldQuit: call appInit first");
+    }
+    if (not g_should_quit_added) {
+        let added = class_addMethod(targetClass(), sel("applicationShouldTerminate:"),
+            addressOf(impAppShouldTerminate), "Q@:@");
+        if (not added) {
+            throw RuntimeError("onShouldQuit: LoupTarget already has applicationShouldTerminate: (added by the app with class_addMethod)");
+        }
+        g_should_quit_added = true;
+        # NSApplication looks at what its delegate answers when it is set.
+        msgI(g_app, sel("setDelegate:"), 0);
+        msgI(g_app, sel("setDelegate:"), target());
+    }
+    g_should_quit[0] = handler;
+    return;
+}
+
+## Ask whether the app may quit, as ⌘Q would, without quitting: the app
+## delegate's `applicationShouldTerminate:` answer (an onShouldQuit handler,
+## or an app's own method); true when there is none.
+pub func shouldQuit(): bool {
+    let delegate = msg(g_app, sel("delegate"));
+    if (not respondsTo(delegate, sel("applicationShouldTerminate:"))) {
+        return true;
+    }
+    let reply = msgI(delegate, sel("applicationShouldTerminate:"), g_app);
+    let ok = reply == TERMINATE_NOW;
+    return ok;
+}
+
+## Whether the app is drawn in Dark Mode (its effective appearance is the
+## dark Aqua one) — for views that pick their own colors.
+pub func isDarkMode(): bool {
+    var app = g_app;
+    if (app == 0) {
+        app = msg(cls("NSApplication"), sel("sharedApplication"));
+    }
+    let dark = isDarkAppearance(msg(app, sel("effectiveAppearance")));
+    return dark;
+}
+
+## Whether the NSAppearance `appearance` is a dark one (its best match among
+## Aqua and Dark Aqua is Dark Aqua).
+func isDarkAppearance(appearance: int): bool {
+    if (appearance == 0) {
+        return false;
+    }
+    let candidates = nsstrings([APPEARANCE_AQUA, APPEARANCE_DARK_AQUA]);
+    let best = msgI(appearance, sel("bestMatchFromAppearancesWithNames:"), candidates);
+    let dark = best != 0 and str_of(best) == APPEARANCE_DARK_AQUA;
+    return dark;
+}
+
+## A monotonic clock: seconds since the Mac started (NSProcessInfo
+## `systemUptime`). Changes of the wall-clock time never move it; use it to
+## time things (a stopwatch).
+pub func uptimeSeconds(): float {
+    let info = msg(cls("NSProcessInfo"), sel("processInfo"));
+    let seconds = msgRetD(info, sel("systemUptime"));
+    return seconds;
+}
+
+## The monotonic clock (uptimeSeconds) in whole milliseconds.
+pub func uptimeMs(): int {
+    let ms = (uptimeSeconds() * 1000.0) as int;
+    return ms;
+}
+
+## The running program's path (`[[NSBundle mainBundle] executablePath]`).
+pub func executablePath(): string {
+    let path = str_of(msg(msg(cls("NSBundle"), sel("mainBundle")), sel("executablePath")));
+    return path;
+}
+
+## The directory holding the running program — where a self-test can put
+## its scratch files (the app's directory when it is run from there).
+pub func executableDir(): string {
+    let ns = msg(msg(cls("NSBundle"), sel("mainBundle")), sel("executablePath"));
+    let dir = str_of(msg(ns, sel("stringByDeletingLastPathComponent")));
+    return dir;
+}
+
+## Whether the program was started with `--self-test` (see `after`).
+pub func isSelfTest(): bool {
+    let argv = runtime.args();
+    for (a in argv) {
+        if (a == "--self-test") {
+            return true;
+        }
+    }
+    return false;
+}
+
+## Whether this is a self-test that stays off the user's screen: `--self-test`
+## without LOUP_APPKIT_VISIBLE=1. Such a run has no Dock icon, never activates
+## (takes no focus), and its windows are transparent and let clicks through;
+## they still lay out and draw, so `Window.snapshot` and every read of a frame
+## or a control's state work as in a visible run.
+pub func isQuietSelfTest(): bool {
+    if (not isSelfTest()) {
+        return false;
+    }
+    let visible = env("LOUP_APPKIT_VISIBLE");
+    if (visible != None and visible.unwrap() == "1") {
+        return false;
+    }
+    return true;
+}
+
+# ── timers ─────────────────────────────────────────────────────────────────
+
+## A running timer; `stop()` cancels it.
+pub class Timer {
+    pub let handle: int;
+
+    pub func constructor(handle: int) {
+        this.handle = handle;
+    }
+
+    ## Cancel the timer (it never fires again).
+    pub func stop(): void {
+        msgV(this.handle, sel("invalidate"));
+        g_timers.remove(this.handle);
+        g_repeating.remove(this.handle);
+        g_common_timers.remove(this.handle);
+        return;
+    }
+
+    ## Keep the timer firing while a menu is open or a window is being
+    ## resized (it is added to the run loop's common modes, which include
+    ## event tracking). `after` and `every` timers otherwise wait until the
+    ## tracking ends.
+    pub func runInCommonModes(): void {
+        let run_loop = msg(cls("NSRunLoop"), sel("mainRunLoop"));
+        msgII(run_loop, sel("addTimer:forMode:"), this.handle, nsstr(RUN_LOOP_COMMON_MODES));
+        g_common_timers[this.handle] = true;
+        return;
+    }
+
+    ## Whether runInCommonModes was called (and the timer not stopped).
+    pub func isInCommonModes(): bool {
+        let on = g_common_timers.contains_key(this.handle);
+        return on;
+    }
+
+    ## Whether the timer can still fire (false once a one-shot timer fired or
+    ## any timer was stopped).
+    pub func isValid(): bool {
+        let v = (msg(this.handle, sel("isValid")) & 255) != 0;
+        return v;
+    }
+}
+
+func schedule(seconds: float, repeats: bool, handler: fn(): void): Timer {
+    var rep = 0;
+    if (repeats) { rep = 1; }
+    let t = msgDIIII(cls("NSTimer"), sel("scheduledTimerWithTimeInterval:target:selector:userInfo:repeats:"),
+        seconds, target(), sel("loupTimer:"), 0, rep);
+    g_timers[t] = handler;
+    if (repeats) { g_repeating[t] = true; }
+    let timer = Timer(t);
+    return timer;
+}
+
+## Run `handler` once, `seconds` after now (on the event loop).
+pub func after(seconds: float, handler: fn(): void): Timer {
+    let t = schedule(seconds, false, handler);
+    return t;
+}
+
+## Run `handler` every `seconds` until the returned timer is stopped.
+pub func every(seconds: float, handler: fn(): void): Timer {
+    let t = schedule(seconds, true, handler);
+    return t;
+}
+
+# ── rendering ───────────────────────────────────────────────────────────────
+
+## One pixel of a rendered view: sRGB components and alpha, each 0..255.
+pub struct Pixel {
+    pub r: int;
+    pub g: int;
+    pub b: int;
+    pub a: int;
+}
+
+## `p` written "#RRGGBB" (upper-case hex digits; alpha left out).
+pub func pixelHex(p: Pixel): string {
+    let s = "#" + hexByte(p.r) + hexByte(p.g) + hexByte(p.b);
+    return s;
+}
+
+func hexByte(n: int): string {
+    let digits = ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "A", "B", "C", "D", "E", "F"];
+    let hi = n / 16;
+    let lo = n % 16;
+    let s = digits[hi] + digits[lo];
+    return s;
+}
+
+## A color component 0.0..1.0 as 0..255 (rounded).
+func unit255(v: float): int {
+    var n = ((v * 255.0) + 0.5) as int;
+    if (n < 0) { n = 0; }
+    if (n > 255) { n = 255; }
+    return n;
+}
+
+## The whole-number part of `v` (v ≥ 0): a pixel index.
+func pixelIndex(v: float): int {
+    let n = v as int;
+    return n;
+}
+
+## The `destOut` layers under `layer` (NSTabView's cut-out for its tab
+## strip, which cached drawing paints as a white capsule) whose parent has no
+## mask, as [cutout, parent, cutout, parent, …].
+func findCutouts(layer: int): list[int] {
+    var out: list[int] = [];
+    if (layer == 0) {
+        return out;
+    }
+    let subs = msg(layer, sel("sublayers"));
+    if (subs == 0) {
+        return out;
+    }
+    let n = msg(subs, sel("count"));
+    var i = 0;
+    while (i < n) {
+        let sub = msgI(subs, sel("objectAtIndex:"), i);
+        let filter = str_of(msg(msg(sub, sel("compositingFilter")), sel("description")));
+        let hidden = msg(sub, sel("isHidden")) & 255;
+        if (filter == "destOut" and hidden == 0 and msg(layer, sel("mask")) == 0) {
+            out.push(sub);
+            out.push(layer);
+        } else {
+            let inner = findCutouts(sub);
+            for (x in inner) {
+                out.push(x);
+            }
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+## Hide every cut-out layer under `layer` (findCutouts) and mask its parent
+## by the same shape instead — the parent's bounds minus a rounded rectangle
+## where the cut-out is, filled even-odd. Returns [cutout, parent, mask, …]
+## for endCutouts.
+func beginCutouts(layer: int): list[int] {
+    var undo: list[int] = [];
+    let found = findCutouts(layer);
+    var i = 0;
+    while (i + 1 < found.len()) {
+        let sub = found[i];
+        let parent = found[i + 1];
+        let f = rect_of(sub, "frame");
+        let b = rect_of(parent, "bounds");
+        var radius = f.h / 2.0;
+        if (f.w < f.h) { radius = f.w / 2.0; }
+        let path = CGPathCreateMutable();
+        CGPathAddRect(path, 0, b.x, b.y, b.w, b.h);
+        CGPathAddRoundedRect(path, 0, f.x, f.y, f.w, f.h, radius, radius);
+        let mask = make("CAShapeLayer");
+        msgDDDD(mask, sel("setFrame:"), b.x, b.y, b.w, b.h);
+        msgI(mask, sel("setPath:"), path);
+        msgI(mask, sel("setFillRule:"), nsstr("even-odd"));
+        CGPathRelease(path);
+        msgI(sub, sel("setHidden:"), 1);
+        msgI(parent, sel("setMask:"), mask);
+        undo.push(sub);
+        undo.push(parent);
+        undo.push(mask);
+        i = i + 2;
+    }
+    return undo;
+}
+
+## Undo beginCutouts.
+func endCutouts(undo: list[int]): void {
+    var i = 0;
+    while (i + 2 < undo.len()) {
+        let sub = undo[i];
+        let parent = undo[i + 1];
+        let mask = undo[i + 2];
+        msgI(parent, sel("setMask:"), 0);
+        msgI(sub, sel("setHidden:"), 0);
+        msgV(mask, sel("release"));
+        i = i + 3;
+    }
+    return;
+}
+
+## The visible `NSTextFieldSimpleLabel` subviews of the text fields in
+## `view`'s tree. A macOS 26 label draws its text through such a private
+## subview; a cached render draws the field's cell as well, so the text came
+## out twice (translucent colors near-opaque).
+func findSimpleLabels(view: int): list[int] {
+    var out: list[int] = [];
+    let subs = msg(view, sel("subviews"));
+    if (subs == 0) {
+        return out;
+    }
+    let is_field = (msgI(view, sel("isKindOfClass:"), cls("NSTextField")) & 255) != 0;
+    let n = msg(subs, sel("count"));
+    var i = 0;
+    while (i < n) {
+        let sub = msgI(subs, sel("objectAtIndex:"), i);
+        let hidden = (msg(sub, sel("isHidden")) & 255) != 0;
+        if (is_field and not hidden) {
+            let name = str_of(msg(msg(sub, sel("class")), sel("description")));
+            if (name.contains("NSTextFieldSimpleLabel")) {
+                out.push(sub);
+            }
+        }
+        if (not hidden) {
+            let inner = findSimpleLabels(sub);
+            for (x in inner) {
+                out.push(x);
+            }
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+## Hide `views` (setHidden: 1) or show them again.
+func setViewsHidden(views: list[int], hidden: bool): void {
+    var h = 0;
+    if (hidden) {
+        h = 1;
+    }
+    for (v in views) {
+        msgI(v, sel("setHidden:"), h);
+    }
+    return;
+}
+
+## Draw `view` (its bounds) into a new sRGB NSBitmapImageRep at the screen's
+## scale (autoreleased). Lays the view out and commits pending Core Animation
+## changes first.
+func renderRep(view: int): int {
+    msgV(view, sel("layoutSubtreeIfNeeded"));
+    msgV(cls("CATransaction"), sel("flush"));
+    let b = rect_of(view, "bounds");
+    let display_rep = msgDDDD(view, sel("bitmapImageRepForCachingDisplayInRect:"), b.x, b.y, b.w, b.h);
+    if (display_rep == 0) {
+        throw RuntimeError("appkit: cannot render a view of size " + b.w.to_string() + " x "
+            + b.h.to_string() + " (bitmapImageRepForCachingDisplayInRect: gave nil)");
+    }
+    # Tag the bitmap sRGB before the view draws into it: drawing then goes
+    # into sRGB, and the samples are the sRGB values that were drawn.
+    let srgb = msg(cls("NSColorSpace"), sel("sRGBColorSpace"));
+    let rep = msgI(display_rep, sel("bitmapImageRepByRetaggingWithColorSpace:"), srgb);
+    if (rep == 0) {
+        throw RuntimeError("appkit: cannot retag the view's bitmap as sRGB");
+    }
+    msgV(cls("CATransaction"), sel("begin"));
+    msgI(cls("CATransaction"), sel("setDisableActions:"), 1);
+    let undo = beginCutouts(msg(view, sel("layer")));
+    let labels = findSimpleLabels(view);
+    setViewsHidden(labels, true);
+    msgDDDDI(view, sel("cacheDisplayInRect:toBitmapImageRep:"), b.x, b.y, b.w, b.h, rep);
+    setViewsHidden(labels, false);
+    endCutouts(undo);
+    msgV(cls("CATransaction"), sel("commit"));
+    return rep;
+}
+
+## Write the bitmap rep `rep` to `path` as a PNG; whether it was written.
+func writeRepPng(rep: int, path: string): bool {
+    let data = msgII(rep, sel("representationUsingType:properties:"), PNG,
+        msg(cls("NSDictionary"), sel("dictionary")));
+    if (data == 0) {
+        return false;
+    }
+    let written = msgII(data, sel("writeToFile:atomically:"), nsstr(path), 1) & 255;
+    return written != 0;
+}
+
+## What a view drew, in memory: an sRGB bitmap at the screen's scale (see
+## `View.render`). `rep` is the NSBitmapImageRep; `flipped` says whether
+## the rendered view counts y down from its top (colorAt follows it). Holds
+## its rep until `release()`. (The rep field is not called `handle`: older
+## native toolchains resolved a field read on a captured object by the
+## field's name across the whole program, and one more type with a `handle`
+## field broke such reads of every proxy's `handle`; fixed since, see the
+## collection's Agents.md.)
+pub class Bitmap {
+    pub let rep: int;
+    pub let flipped: bool;
+
+    ## Wrap the NSBitmapImageRep `rep` (retained by the caller; see
+    ## release). `flipped`: whether colorAt counts y down from the top.
+    pub func constructor(rep: int, flipped: bool) {
+        this.rep = rep;
+        this.flipped = flipped;
+    }
+
+    ## The rendered view's size in points (in `x`, `y`).
+    pub func pointSize(): Rect {
+        let p = point_of(this.rep, "size");
+        return p;
+    }
+
+    ## The width in pixels.
+    pub func width(): int {
+        let n = msg(this.rep, sel("pixelsWide"));
+        return n;
+    }
+
+    ## The height in pixels.
+    pub func height(): int {
+        let n = msg(this.rep, sel("pixelsHigh"));
+        return n;
+    }
+
+    ## Pixels per point (2.0 on a Retina display).
+    pub func scale(): float {
+        let size = this.pointSize();
+        if (size.x <= 0.0) {
+            return 1.0;
+        }
+        let s = (this.width() as float) / size.x;
+        return s;
+    }
+
+    ## The pixel at column `px`, row `py` (row 0 at the top). Throws
+    ## ValueError outside the bitmap.
+    pub func pixelAt(px: int, py: int): Pixel {
+        if (px < 0 or py < 0 or px >= this.width() or py >= this.height()) {
+            throw ValueError("Bitmap.pixelAt: (" + px.to_string() + ", " + py.to_string()
+                + ") is outside the " + this.width().to_string() + " x " + this.height().to_string() + " bitmap");
+        }
+        # The sample is a color in the bitmap's (sRGB) space: its components
+        # are read as they are (converting would go through another space).
+        let color = msgII(this.rep, sel("colorAtX:y:"), px, py);
+        let p = Pixel(r = unit255(msgRetD(color, sel("redComponent"))),
+            g = unit255(msgRetD(color, sel("greenComponent"))),
+            b = unit255(msgRetD(color, sel("blueComponent"))),
+            a = unit255(msgRetD(color, sel("alphaComponent"))));
+        return p;
+    }
+
+    ## The pixel under the point (x, y) of the rendered view, in the view's
+    ## own coordinates: from the top-left corner for a flipped view (a
+    ## Canvas), from the bottom-left otherwise. Throws ValueError outside it.
+    pub func colorAt(x: float, y: float): Pixel {
+        let size = this.pointSize();
+        if (x < 0.0 or y < 0.0 or x >= size.x or y >= size.y) {
+            throw ValueError("Bitmap.colorAt: (" + x.to_string() + ", " + y.to_string()
+                + ") is outside the " + size.x.to_string() + " x " + size.y.to_string() + " view");
+        }
+        let s = this.scale();
+        var row_points = y;
+        if (not this.flipped) {
+            row_points = size.y - y;
+        }
+        var px = pixelIndex(x * s);
+        var py = pixelIndex(row_points * s);
+        if (py >= this.height()) { py = this.height() - 1; }
+        if (px >= this.width()) { px = this.width() - 1; }
+        let p = this.pixelAt(px, py);
+        return p;
+    }
+
+    ## Write the bitmap to `path` as a PNG (sRGB profile). Throws
+    ## RuntimeError when it cannot be written.
+    pub func writePng(path: string): void {
+        if (not writeRepPng(this.rep, path)) {
+            throw RuntimeError("Bitmap.writePng: could not write " + path);
+        }
+        return;
+    }
+
+    ## Whether the bitmap is in the sRGB color space (a render always is; a
+    ## PNG read back with loadBitmap is when it carries the sRGB profile).
+    pub func isSrgb(): bool {
+        let space = msg(this.rep, sel("colorSpace"));
+        if (space == 0) {
+            return false;
+        }
+        let srgb = msg(cls("NSColorSpace"), sel("sRGBColorSpace"));
+        let same = (msgI(space, sel("isEqual:"), srgb) & 255) != 0;
+        if (same) {
+            return true;
+        }
+        let profile = msg(space, sel("ICCProfileData"));
+        if (profile == 0) {
+            return false;
+        }
+        let same_profile = (msgI(profile, sel("isEqual:"), msg(srgb, sel("ICCProfileData"))) & 255) != 0;
+        return same_profile;
+    }
+
+    ## Let the bitmap go (the proxy must not be used afterwards).
+    pub func release(): void {
+        msgV(this.rep, sel("release"));
+        return;
+    }
+}
+
+## Read the image file at `path` (a PNG written by `View.snapshot`,
+## `Bitmap.writePng`, or any bitmap image) into a Bitmap, to check what was
+## exported. `flipped`: whether `colorAt` counts y down from the top (true
+## for a snapshot of a Canvas, to use canvas coordinates); `pixelAt` always
+## counts rows from the top. Its size in points comes from the file's
+## resolution (a 2x snapshot reads back at the view's size). Throws
+## RuntimeError when the file cannot be read as a bitmap image. Release it
+## with `release()`.
+pub func loadBitmap(path: string, flipped: bool): Bitmap {
+    let rep = msgI(cls("NSBitmapImageRep"), sel("imageRepWithContentsOfFile:"), nsstr(path));
+    if (rep == 0) {
+        throw RuntimeError("loadBitmap: cannot read " + path + " as a bitmap image");
+    }
+    let is_bitmap = msgI(rep, sel("isKindOfClass:"), cls("NSBitmapImageRep")) & 255;
+    if (is_bitmap == 0) {
+        throw RuntimeError("loadBitmap: " + path + " is not a bitmap image");
+    }
+    msgV(rep, sel("retain"));
+    let bitmap = Bitmap(rep, flipped);
+    return bitmap;
+}
+
+# ── views ──────────────────────────────────────────────────────────────────
+
+## Any NSView. Every control proxy (appkit.controls) wraps one; `handle` is
+## the Objective-C object.
+pub class View {
+    pub let handle: int;
+
+    pub func constructor(handle: int) {
+        this.handle = handle;
+    }
+
+    ## Position (x, y) — from the bottom-left of the superview — and size.
+    pub func setFrame(x: float, y: float, w: float, h: float): void {
+        msgDD(this.handle, sel("setFrameOrigin:"), x, y);
+        msgDD(this.handle, sel("setFrameSize:"), w, h);
+        return;
+    }
+
+    pub func setSize(w: float, h: float): void {
+        msgDD(this.handle, sel("setFrameSize:"), w, h);
+        return;
+    }
+
+    ## The view's frame in its superview's coordinates.
+    pub func frame(): Rect {
+        let r = rect_of(this.handle, "frame");
+        return r;
+    }
+
+    pub func addSubview(child: View): void {
+        msgI(this.handle, sel("addSubview:"), child.handle);
+        return;
+    }
+
+    pub func setHidden(hidden: bool): void {
+        var h = 0;
+        if (hidden) { h = 1; }
+        msgI(this.handle, sel("setHidden:"), h);
+        return;
+    }
+
+    pub func isHidden(): bool {
+        let h = msg(this.handle, sel("isHidden")) & 255;
+        return h != 0;
+    }
+
+    pub func setToolTip(text: string): void {
+        msgI(this.handle, sel("setToolTip:"), nsstr(text));
+        return;
+    }
+
+    ## Fix the view's width (Auto Layout constraint), e.g. inside a stack.
+    pub func setWidth(w: float): void {
+        let anchor = msg(this.handle, sel("widthAnchor"));
+        let c = msgD(anchor, sel("constraintEqualToConstant:"), w);
+        msgI(c, sel("setActive:"), 1);
+        return;
+    }
+
+    ## Fix the view's height (Auto Layout constraint).
+    pub func setHeight(h: float): void {
+        let anchor = msg(this.handle, sel("heightAnchor"));
+        let c = msgD(anchor, sel("constraintEqualToConstant:"), h);
+        msgI(c, sel("setActive:"), 1);
+        return;
+    }
+
+    ## How strongly the view resists growing beyond its natural (intrinsic)
+    ## size, per axis (PRIORITY_* or any 1..1000; controls default to 250).
+    ## Raise it to keep a view at its natural size next to one that expands.
+    pub func setHugging(horizontal: float, vertical: float): void {
+        let s = sel("setContentHuggingPriority:forOrientation:");
+        msgPriority(this.handle, s, horizontal as float32, AXIS_HORIZONTAL);
+        msgPriority(this.handle, s, vertical as float32, AXIS_VERTICAL);
+        return;
+    }
+
+    ## The content hugging priority along one axis (`vertical` false: the
+    ## horizontal one).
+    pub func hugging(vertical: bool): float {
+        var axis = AXIS_HORIZONTAL;
+        if (vertical) {
+            axis = AXIS_VERTICAL;
+        }
+        let p = msgRetPriority(this.handle, sel("contentHuggingPriorityForOrientation:"), axis) as float;
+        return p;
+    }
+
+    ## How strongly the view resists shrinking below its natural size, per
+    ## axis (controls default to PRIORITY_HIGH, 750). Raise it (e.g. to
+    ## PRIORITY_REQUIRED) so a text field beside a view that expands keeps
+    ## its full height and width.
+    pub func setCompressionResistance(horizontal: float, vertical: float): void {
+        let s = sel("setContentCompressionResistancePriority:forOrientation:");
+        msgPriority(this.handle, s, horizontal as float32, AXIS_HORIZONTAL);
+        msgPriority(this.handle, s, vertical as float32, AXIS_VERTICAL);
+        return;
+    }
+
+    ## The compression resistance priority along one axis.
+    pub func compressionResistance(vertical: bool): float {
+        var axis = AXIS_HORIZONTAL;
+        if (vertical) {
+            axis = AXIS_VERTICAL;
+        }
+        let p = msgRetPriority(this.handle, sel("contentCompressionResistancePriorityForOrientation:"), axis) as float;
+        return p;
+    }
+
+    ## Whether a click (or Tab) may give the view the keyboard focus. With
+    ## false a control never becomes first responder — no focus ring, a
+    ## read-only list keeps the focus where it was (refusesFirstResponder);
+    ## it still works with the mouse. Throws ValueError for a view that is
+    ## not an NSControl (only controls can refuse).
+    pub func setFocusable(focusable: bool): void {
+        if (not respondsTo(this.handle, sel("setRefusesFirstResponder:"))) {
+            throw ValueError("View.setFocusable: this view is not a control (it has no refusesFirstResponder)");
+        }
+        var refuses = 1;
+        if (focusable) {
+            refuses = 0;
+        }
+        msgI(this.handle, sel("setRefusesFirstResponder:"), refuses);
+        return;
+    }
+
+    ## Whether the view can take the keyboard focus: not refusing it (a
+    ## control) and answering acceptsFirstResponder (a label does not).
+    pub func isFocusable(): bool {
+        if (respondsTo(this.handle, sel("refusesFirstResponder"))) {
+            let refuses = (msg(this.handle, sel("refusesFirstResponder")) & 255) != 0;
+            if (refuses) {
+                return false;
+            }
+        }
+        let accepts = (msg(this.handle, sel("acceptsFirstResponder")) & 255) != 0;
+        return accepts;
+    }
+
+    ## Whether the view is drawn in a dark appearance: Dark Mode, or a dark
+    ## appearance set on its window (Window.setAppearance) or an ancestor —
+    ## what a view that picks its own colors must ask (isDarkMode reads only
+    ## the app's appearance).
+    pub func isDark(): bool {
+        let dark = isDarkAppearance(msg(this.handle, sel("effectiveAppearance")));
+        return dark;
+    }
+
+    ## Ask AppKit to redraw the view.
+    pub func redraw(): void {
+        msgI(this.handle, sel("setNeedsDisplay:"), 1);
+        return;
+    }
+
+    ## Draw the view as it looks now into a Bitmap (sRGB, the screen's scale;
+    ## see the module header). Works off screen, in a quiet self-test. Throws
+    ## RuntimeError for a view with no size. arm64 only.
+    pub func render(): Bitmap {
+        let rep = renderRep(this.handle);
+        msgV(rep, sel("retain"));
+        let flipped = (msg(this.handle, sel("isFlipped")) & 255) != 0;
+        let bitmap = Bitmap(rep, flipped);
+        return bitmap;
+    }
+
+    ## Write a PNG (sRGB) of the view to `path`. Throws RuntimeError when it
+    ## cannot be rendered or written.
+    pub func snapshot(path: string): void {
+        let rep = renderRep(this.handle);
+        if (not writeRepPng(rep, path)) {
+            throw RuntimeError("View.snapshot: could not write " + path);
+        }
+        return;
+    }
+
+    ## The pixel the view shows at its point (x, y) — its own coordinates (see
+    ## Bitmap.colorAt) — read from a fresh render. To read many pixels,
+    ## `render()` once and ask the Bitmap.
+    pub func colorAt(x: float, y: float): Pixel {
+        let bitmap = this.render();
+        let p = bitmap.colorAt(x, y);
+        bitmap.release();
+        return p;
+    }
+}
+
+# ── the test helpers' responder chain ──────────────────────────────────────
+
+## Whether `win` is on screen (ordered in; a quiet self-test's transparent
+## window counts).
+func isVisibleWindow(win: int): bool {
+    if (win == 0) {
+        return false;
+    }
+    let v = msg(win, sel("isVisible")) & 255;
+    return v != 0;
+}
+
+## The window the test helpers send nil-targeted actions to when the app has
+## no key window (the one shown last), or 0 when AppKit has a key window.
+func standInKeyWindow(): int {
+    if (g_app == 0 or msg(g_app, sel("keyWindow")) != 0) {
+        return 0;
+    }
+    if (not isVisibleWindow(g_key_window)) {
+        return 0;
+    }
+    return g_key_window;
+}
+
+## The object that would get the action `action` if `win` were the key window:
+## the first responder and its next responders (up to the window), the
+## window's delegate, NSApp, NSApp's delegate — AppKit's order. 0: nobody.
+func chainTarget(win: int, action: int): int {
+    var r = msg(win, sel("firstResponder"));
+    while (r != 0) {
+        if (respondsTo(r, action)) {
+            return r;
+        }
+        r = msg(r, sel("nextResponder"));
+    }
+    if (respondsTo(win, action)) {
+        return win;
+    }
+    let win_delegate = msg(win, sel("delegate"));
+    if (respondsTo(win_delegate, action)) {
+        return win_delegate;
+    }
+    if (respondsTo(g_app, action)) {
+        return g_app;
+    }
+    let app_delegate = msg(g_app, sel("delegate"));
+    if (respondsTo(app_delegate, action)) {
+        return app_delegate;
+    }
+    return 0;
+}
+
+## Ask `win`'s delegate whether it may close (true when it has no say).
+func askShouldClose(win: int): bool {
+    let delegate = msg(win, sel("delegate"));
+    if (not respondsTo(delegate, sel("windowShouldClose:"))) {
+        return true;
+    }
+    let ok = (msgI(delegate, sel("windowShouldClose:"), win) & 255) != 0;
+    return ok;
+}
+
+## The NSAppearance for an appearance name: "light", "dark", or "" (nil:
+## follow the app). Throws ValueError for any other name.
+func appearanceNamed(name: string): int {
+    if (name == "") {
+        return 0;
+    }
+    var full = "";
+    if (name == "light") {
+        full = APPEARANCE_AQUA;
+    } else if (name == "dark") {
+        full = APPEARANCE_DARK_AQUA;
+    } else {
+        throw ValueError("setAppearance: \"" + name + "\" is not \"light\", \"dark\" or \"\"");
+    }
+    let appearance = msgI(cls("NSAppearance"), sel("appearanceNamed:"), nsstr(full));
+    return appearance;
+}
+
+## Close the open automatic undo group of the undo manager `um` (the
+## current event's), as the end of the event would: what is registered next
+## starts a new undo step. Uses the undo manager's own end-of-event step
+## (`_processEndOfEventNotification:`, a private method, only when it answers
+## it), else ends the group and opens the next one itself.
+func closeUndoGroup(um: int): void {
+    if (msg(um, sel("groupingLevel")) == 0) {
+        return;
+    }
+    if ((msg(um, sel("groupsByEvent")) & 255) == 0) {
+        return;
+    }
+    let end_of_event = sel("_processEndOfEventNotification:");
+    if (respondsTo(um, end_of_event)) {
+        msgI(um, end_of_event, 0);
+        return;
+    }
+    if (msg(um, sel("groupingLevel")) == 1) {
+        msgV(um, sel("endUndoGrouping"));
+        msgV(um, sel("beginUndoGrouping"));
+    }
+    return;
+}
+
+## Close `win` if its delegate allows (the close button without the beep).
+func closeIfAllowed(win: int): bool {
+    if (not askShouldClose(win)) {
+        return false;
+    }
+    msgV(win, sel("close"));
+    return true;
+}
+
+## Send `action` from `sender` (a menu item, or 0) along `win`'s responder
+## chain as if `win` were key. A menu item is validated first
+## (`validateMenuItem:` of the responder that would get it). Whether a
+## responder took it.
+func sendAlongChain(win: int, action: int, sender: int): bool {
+    let t = chainTarget(win, action);
+    if (t == 0) {
+        return false;
+    }
+    if (sender != 0 and respondsTo(t, sel("validateMenuItem:"))) {
+        if ((msgI(t, sel("validateMenuItem:"), sender) & 255) == 0) {
+            return false;
+        }
+    }
+    if (t == win and action == sel("performClose:")) {
+        # -performClose: beeps when the close is refused; keep tests silent.
+        closeIfAllowed(win);
+        return true;
+    }
+    msgIII(g_app, sel("sendAction:to:from:"), action, t, sender);
+    return true;
+}
+
+## Choose `item` of `menu` the way a click on it does. `menu` was updated
+## (validated) already. Whether an action was sent.
+func chooseItem(menu: int, item: int): bool {
+    let action = msg(item, sel("action"));
+    let stand_in = standInKeyWindow();
+    if (msg(item, sel("target")) == 0 and action != 0 and stand_in != 0) {
+        let sent = sendAlongChain(stand_in, action, item);
+        return sent;
+    }
+    if (action == 0 or (msg(item, sel("isEnabled")) & 255) == 0) {
+        return false;
+    }
+    let index = msgI(menu, sel("indexOfItem:"), item);
+    msgI(menu, sel("performActionForItemAtIndex:"), index);
+    return true;
+}
+
+## `key` and `modifiers` as a key equivalent compares: an upper-case letter
+## means ⇧ + the lower-case letter.
+func normalKey(key: string): string {
+    let lower = key.toLowerCase();
+    return lower;
+}
+
+func normalModifiers(key: string, modifiers: int): int {
+    var m = modifiers & MOD_KEYS;
+    if (key.toLowerCase() != key and (m & MOD_SHIFT) == 0) {
+        m = m + MOD_SHIFT;
+    }
+    return m;
+}
+
+## The first item with an action in `menu` (or its submenus) whose key
+## equivalent is `key` with `modifiers` (0: none).
+func findKeyItem(menu: int, key: string, modifiers: int): int {
+    let want_key = normalKey(key);
+    let want_mods = normalModifiers(key, modifiers);
+    let n = msg(menu, sel("numberOfItems"));
+    var i = 0;
+    while (i < n) {
+        let item = msgI(menu, sel("itemAtIndex:"), i);
+        let sub = msg(item, sel("submenu"));
+        if (sub != 0) {
+            let found = findKeyItem(sub, key, modifiers);
+            if (found != 0) {
+                return found;
+            }
+        } else {
+            let k = str_of(msg(item, sel("keyEquivalent")));
+            let mask = msg(item, sel("keyEquivalentModifierMask"));
+            let hidden = (msg(item, sel("isHidden")) & 255) != 0
+                and (msg(item, sel("allowsKeyEquivalentWhenHidden")) & 255) == 0;
+            if (k != "" and normalKey(k) == want_key and normalModifiers(k, mask) == want_mods
+                    and msg(item, sel("action")) != 0 and not hidden) {
+                return item;
+            }
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+## The virtual key code (ANSI layout) of the key typing `key` unshifted —
+## a lower-case letter, a digit or unshifted punctuation — or -1.
+func ansiKeyCode(key: string): int {
+    let keys = ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o", "p", "q", "r",
+        "s", "t", "u", "v", "w", "x", "y", "z", "0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "-", "=",
+        "[", "]", ";", "'", ",", ".", "/", "\\", "`"];
+    let codes = [0, 11, 8, 2, 14, 3, 5, 4, 34, 38, 40, 37, 46, 45, 31, 35, 12, 15, 1, 17, 32, 9, 13, 7, 16,
+        6, 29, 18, 19, 20, 21, 23, 22, 26, 28, 25, 27, 24, 33, 30, 41, 39, 43, 47, 44, 42, 50];
+    var i = 0;
+    while (i < keys.len()) {
+        if (keys[i] == key) {
+            return codes[i];
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+## The key-down event a real key press of key code `code` with `flags` held
+## makes (Quartz fills in the characters from the current keyboard layout).
+func layoutKeyEvent(code: int, flags: int): int {
+    let cg = CGEventCreateKeyboardEvent(0, code as uint16, true);
+    if (cg == 0) {
+        return 0;
+    }
+    CGEventSetFlags(cg, flags as uint64);
+    let event = msgI(cls("NSEvent"), sel("eventWithCGEvent:"), cg);
+    CFRelease(cg);
+    return event;
+}
+
+## The key-down event typing `chars` with `modifiers` as the keyboard would
+## send it, or 0 when `chars` is not one key of the ANSI layout that the
+## current layout types the same, or when no modifier is held (then keyEvent
+## builds it from the characters: the menu bar ignores a Quartz-made key
+## with no modifier, while a bare key has no ⇧ rule to follow). An
+## upper-case letter is its key with ⇧.
+func keyboardEvent(chars: string, modifiers: int): int {
+    let lower = chars.toLowerCase();
+    let code = ansiKeyCode(lower);
+    if (code < 0) {
+        return 0;
+    }
+    var flags = modifiers & MOD_KEYS;
+    if (lower != chars and (flags & MOD_SHIFT) == 0) {
+        flags = flags + MOD_SHIFT;
+    }
+    if (flags == 0) {
+        return 0;
+    }
+    let plain = layoutKeyEvent(code, 0);
+    if (plain == 0 or str_of(msg(plain, sel("characters"))) != lower) {
+        return 0;
+    }
+    let event = layoutKeyEvent(code, flags);
+    return event;
+}
+
+## A key-down event typing `chars` with `modifiers` held, for window `win`:
+## the keyboard's own event when `chars` is one key (keyboardEvent), else
+## one carrying `chars` as typed.
+func keyEvent(chars: string, modifiers: int, win: int): int {
+    let real = keyboardEvent(chars, modifiers);
+    if (real != 0) {
+        return real;
+    }
+    var number = 0;
+    if (win != 0) {
+        number = msg(win, sel("windowNumber"));
+    }
+    let event = msgNewKeyEvent(cls("NSEvent"),
+        sel("keyEventWithType:location:modifierFlags:timestamp:windowNumber:context:characters:charactersIgnoringModifiers:isARepeat:keyCode:"),
+        EVENT_KEY_DOWN, 0.0, 0.0, modifiers, 0.0, number, 0, nsstr(chars), nsstr(chars),
+        0 as uint8, 0 as uint16);
+    return event;
+}
+
+## Offer the key `chars` + `modifiers` to `menu`'s key equivalents
+## (`performKeyEquivalent:`). `stand_in` is the window acting as key while the
+## app has none (0 when it has one): a nil-targeted item AppKit could not
+## send then goes along its chain. Whether an item took it.
+func menuKey(menu: int, chars: string, modifiers: int, stand_in: int): bool {
+    if (stand_in != 0) {
+        # With no key window, NSMenu claims a nil-targeted item's key (⌘W)
+        # and sends its action nowhere: route that item ourselves.
+        let item = findKeyItem(menu, chars, modifiers);
+        if (item != 0 and msg(item, sel("target")) == 0) {
+            msgV(msg(item, sel("menu")), sel("update"));
+            let sent = sendAlongChain(stand_in, msg(item, sel("action")), item);
+            return sent;
+        }
+    }
+    let event = keyEvent(chars, modifiers, stand_in);
+    let taken = (msgI(menu, sel("performKeyEquivalent:"), event) & 255) != 0;
+    return taken;
+}
+
+# ── windows ────────────────────────────────────────────────────────────────
+
+## A titled, closable, miniaturizable, resizable window (`setResizable(false)`
+## for a fixed size).
+pub class Window {
+    pub let handle: int;
+
+    ## A window whose content area is `width` × `height` points, centered.
+    pub func constructor(title: string, width: float, height: float) {
+        let w = make("NSWindow");
+        msgI(w, sel("setStyleMask:"), WINDOW_STYLE);
+        msgDD(w, sel("setContentSize:"), width, height);
+        msgI(w, sel("setTitle:"), nsstr(title));
+        msgI(w, sel("setReleasedWhenClosed:"), 0);
+        msgI(w, sel("setDelegate:"), target());
+        msgV(w, sel("center"));
+        this.handle = w;
+    }
+
+    pub func setTitle(title: string): void {
+        msgI(this.handle, sel("setTitle:"), nsstr(title));
+        return;
+    }
+
+    pub func title(): string {
+        let t = str_of(msg(this.handle, sel("title")));
+        return t;
+    }
+
+    ## The content view (to add views at fixed frames).
+    pub func content(): View {
+        let v = View(msg(this.handle, sel("contentView")));
+        return v;
+    }
+
+    ## Replace the content view (a stack or other container from appkit.layout
+    ## fills the window).
+    pub func setContent(view: View): void {
+        msgI(this.handle, sel("setContentView:"), view.handle);
+        return;
+    }
+
+    ## Add `view` to the content view at a fixed frame.
+    pub func add(view: View, x: float, y: float, w: float, h: float): void {
+        view.setFrame(x, y, w, h);
+        this.content().addSubview(view);
+        return;
+    }
+
+    pub func setMinSize(w: float, h: float): void {
+        msgDD(this.handle, sel("setContentMinSize:"), w, h);
+        return;
+    }
+
+    ## The smallest content size the user can resize the window to (in `w`,
+    ## `h`; setMinSize), 0 x 0 when none was set.
+    pub func minSize(): Rect {
+        let p = point_of(this.handle, "contentMinSize");
+        let r = Rect(x = 0.0, y = 0.0, w = p.x, h = p.y);
+        return r;
+    }
+
+    ## Whether the window is on screen (shown and not hidden or closed; a
+    ## quiet self-test's transparent window counts).
+    pub func isVisible(): bool {
+        let v = isVisibleWindow(this.handle);
+        return v;
+    }
+
+    ## Take the window off the screen without closing it (`orderOut:`): no
+    ## close hooks run, and `show()` brings it back.
+    pub func hide(): void {
+        msgI(this.handle, sel("orderOut:"), 0);
+        return;
+    }
+
+    ## Mark the window's document as having unsaved changes (the dot in the
+    ## close button) or saved.
+    pub func setDocumentEdited(edited: bool): void {
+        var e = 0;
+        if (edited) {
+            e = 1;
+        }
+        msgI(this.handle, sel("setDocumentEdited:"), e);
+        return;
+    }
+
+    ## Whether the window shows unsaved changes (setDocumentEdited).
+    pub func isDocumentEdited(): bool {
+        let e = (msg(this.handle, sel("isDocumentEdited")) & 255) != 0;
+        return e;
+    }
+
+    ## The file the window shows: its icon goes in the title bar (a
+    ## Command-click shows its folders). "" for none.
+    pub func setRepresentedFilename(path: string): void {
+        msgI(this.handle, sel("setRepresentedFilename:"), nsstr(path));
+        return;
+    }
+
+    ## The file set with setRepresentedFilename ("" for none).
+    pub func representedFilename(): string {
+        let path = str_of(msg(this.handle, sel("representedFilename")));
+        return path;
+    }
+
+    ## Draw the window in the appearance `name`: "light", "dark", or "" to
+    ## follow the app (the system setting) again. Views that pick their own
+    ## colors ask View.isDark. Throws ValueError for any other name.
+    pub func setAppearance(name: string): void {
+        let appearance = appearanceNamed(name);
+        msgI(this.handle, sel("setAppearance:"), appearance);
+        return;
+    }
+
+    ## The appearance set with setAppearance: "light", "dark" or "" (none:
+    ## the window follows the app).
+    pub func appearance(): string {
+        let appearance = msg(this.handle, sel("appearance"));
+        if (appearance == 0) {
+            return "";
+        }
+        if (isDarkAppearance(appearance)) {
+            return "dark";
+        }
+        return "light";
+    }
+
+    ## Whether the window is drawn in a dark appearance (its own, or the
+    ## app's when it has none).
+    pub func isDark(): bool {
+        let dark = isDarkAppearance(msg(this.handle, sel("effectiveAppearance")));
+        return dark;
+    }
+
+    ## Give the keyboard focus to `view` (`makeFirstResponder:`), as a click
+    ## on it would: a table, a canvas, a text field (which then edits, its
+    ## text selected). A field that was being edited ends its editing first
+    ## (its onSubmit / onEndEditing run). Whether the view has the focus
+    ## now: false for a view that refuses it (a label, setFocusable(false),
+    ## a table with no columns) — AppKit then gives the focus to the window
+    ## itself — or when the field being edited would not end its editing.
+    pub func focus(view: View): bool {
+        msgI(this.handle, sel("makeFirstResponder:"), view.handle);
+        let ok = this.hasFocus(view);
+        return ok;
+    }
+
+    ## Whether the keyboard focus is in `view`: the window's first responder
+    ## is the view, a view inside it, or the field editor editing it.
+    pub func hasFocus(view: View): bool {
+        var r = msg(this.handle, sel("firstResponder"));
+        if (r == 0) {
+            return false;
+        }
+        let is_view = (msgI(r, sel("isKindOfClass:"), cls("NSView")) & 255) != 0;
+        if (not is_view) {
+            return false;
+        }
+        let is_editor = (msgI(r, sel("isKindOfClass:"), cls("NSText")) & 255) != 0
+            and (msg(r, sel("isFieldEditor")) & 255) != 0;
+        if (is_editor and msg(r, sel("delegate")) != 0) {
+            r = msg(r, sel("delegate"));
+        }
+        let inside = (msgI(r, sel("isDescendantOf:"), view.handle) & 255) != 0;
+        return inside;
+    }
+
+    # ── undo ──
+
+    ## The window's undo manager (AppKit's; shared with its text views).
+    func undoManager(): int {
+        let um = msg(this.handle, sel("undoManager"));
+        if (um == 0) {
+            throw RuntimeError("Window: the window has no undo manager");
+        }
+        return um;
+    }
+
+    ## Hook the app's own undo stack to the window's Edit ▸ Undo / Redo
+    ## (⌘Z / ⇧⌘Z): `undo` runs when a step recorded with registerUndo is
+    ## undone, `redo` when it is redone. Replaces earlier handlers.
+    pub func onUndo(undo: fn(): void, redo: fn(): void): void {
+        g_undo[this.handle] = undo;
+        g_redo[this.handle] = redo;
+        return;
+    }
+
+    ## Record one undoable change named `name` ("Draw Line": the menu then
+    ## reads "Undo Draw Line"), after making it. Edit ▸ Undo runs the onUndo
+    ## undo handler once per step. Each call is its own step (an open
+    ## automatic step — typing in this event — is closed first). Clears Redo.
+    ## Ignored while a step is being undone or redone. Throws RuntimeError
+    ## before onUndo.
+    pub func registerUndo(name: string): void {
+        if (not g_undo.contains_key(this.handle)) {
+            throw RuntimeError("Window.registerUndo: call onUndo first");
+        }
+        let um = this.undoManager();
+        let busy = (msg(um, sel("isUndoing")) & 255) != 0 or (msg(um, sel("isRedoing")) & 255) != 0;
+        if (busy) {
+            return;
+        }
+        closeUndoGroup(um);
+        let step = msg(cls("NSMutableArray"), sel("array"));
+        msgI(step, sel("addObject:"), this.handle);
+        msgI(step, sel("addObject:"), nsstr(name));
+        msgV(um, sel("beginUndoGrouping"));
+        msgIII(um, sel("registerUndoWithTarget:selector:object:"), target(), sel("loupUndoStep:"), step);
+        msgI(um, sel("setActionName:"), nsstr(name));
+        msgV(um, sel("endUndoGrouping"));
+        return;
+    }
+
+    ## Whether Edit ▸ Undo would undo something (an app step or typing).
+    pub func canUndo(): bool {
+        let can = (msg(this.undoManager(), sel("canUndo")) & 255) != 0;
+        return can;
+    }
+
+    ## Whether Edit ▸ Redo would redo something.
+    pub func canRedo(): bool {
+        let can = (msg(this.undoManager(), sel("canRedo")) & 255) != 0;
+        return can;
+    }
+
+    ## The name of the step Undo would undo ("" for none or unnamed).
+    pub func undoActionName(): string {
+        let name = str_of(msg(this.undoManager(), sel("undoActionName")));
+        return name;
+    }
+
+    ## The name of the step Redo would redo.
+    pub func redoActionName(): string {
+        let name = str_of(msg(this.undoManager(), sel("redoActionName")));
+        return name;
+    }
+
+    ## Undo the last step, as Edit ▸ Undo does. Whether there was one.
+    pub func undo(): bool {
+        if (not this.canUndo()) {
+            return false;
+        }
+        msgV(this.undoManager(), sel("undo"));
+        return true;
+    }
+
+    ## Redo the last undone step, as Edit ▸ Redo does. Whether there was one.
+    pub func redo(): bool {
+        if (not this.canRedo()) {
+            return false;
+        }
+        msgV(this.undoManager(), sel("redo"));
+        return true;
+    }
+
+    ## Drop every undo and redo step recorded with registerUndo (typing
+    ## steps stay), e.g. after a new document is loaded or the drawing is
+    ## cleared.
+    pub func clearUndo(): void {
+        msgI(this.undoManager(), sel("removeAllActionsWithTarget:"), target());
+        return;
+    }
+
+    ## Let the user resize the window (the default) or not: a fixed-size
+    ## window has no resize edges and a disabled zoom button.
+    pub func setResizable(resizable: bool): void {
+        let mask = msg(this.handle, sel("styleMask"));
+        let has = (mask & STYLE_RESIZABLE) != 0;
+        if (resizable and not has) {
+            msgI(this.handle, sel("setStyleMask:"), mask + STYLE_RESIZABLE);
+        } else if (has and not resizable) {
+            msgI(this.handle, sel("setStyleMask:"), mask - STYLE_RESIZABLE);
+        }
+        return;
+    }
+
+    ## Whether the user can resize the window.
+    pub func isResizable(): bool {
+        let mask = msg(this.handle, sel("styleMask"));
+        let r = (mask & STYLE_RESIZABLE) != 0;
+        return r;
+    }
+
+    ## Make the content area `w` × `h` points (the title bar comes on top);
+    ## the window keeps its top-left corner.
+    pub func setContentSize(w: float, h: float): void {
+        msgDD(this.handle, sel("setContentSize:"), w, h);
+        return;
+    }
+
+    ## Size the content area to the content view's natural size (its Auto
+    ## Layout `fittingSize`: a stack's children at their natural sizes plus
+    ## the insets).
+    pub func fitToContent(): void {
+        let content = msg(this.handle, sel("contentView"));
+        msgV(content, sel("layoutSubtreeIfNeeded"));
+        let fit = point_of(content, "fittingSize");
+        msgDD(this.handle, sel("setContentSize:"), fit.x, fit.y);
+        return;
+    }
+
+    ## Center the window on its screen.
+    pub func center(): void {
+        msgV(this.handle, sel("center"));
+        return;
+    }
+
+    ## Take the keyboard focus from whatever view has it (no view selected,
+    ## no field editor showing a selection).
+    pub func clearFocus(): void {
+        msgI(this.handle, sel("makeFirstResponder:"), 0);
+        return;
+    }
+
+    pub func show(): void {
+        if (isQuietSelfTest()) {
+            # Off the user's screen in effect: transparent, and clicks pass
+            # through to whatever is underneath (see isQuietSelfTest).
+            msgD(this.handle, sel("setAlphaValue:"), 0.0);
+            msgI(this.handle, sel("setIgnoresMouseEvents:"), 1);
+        }
+        msgI(this.handle, sel("makeKeyAndOrderFront:"), 0);
+        g_key_window = this.handle;
+        return;
+    }
+
+    ## Close the window now (no question asked: see performClose).
+    pub func close(): void {
+        msgV(this.handle, sel("close"));
+        return;
+    }
+
+    ## Close the window as its close button (or ⌘W) does: an onShouldClose
+    ## handler can refuse. Whether it closed. (Unlike AppKit's -performClose:
+    ## it never beeps on a refusal.)
+    pub func performClose(): bool {
+        let closed = closeIfAllowed(this.handle);
+        return closed;
+    }
+
+    ## Ask whether the window may close, as its close button would, without
+    ## closing it (true when no handler has a say).
+    pub func shouldClose(): bool {
+        let ok = askShouldClose(this.handle);
+        return ok;
+    }
+
+    ## The content area's size (in `w`, `h`).
+    pub func contentSize(): Rect {
+        let r = rect_of(msg(this.handle, sel("contentView")), "frame");
+        return r;
+    }
+
+    ## Run `handler` when the window is about to close (it cannot refuse: see
+    ## onShouldClose).
+    pub func onClose(handler: fn(): void): void {
+        g_window_close[this.handle] = handler;
+        return;
+    }
+
+    ## Run `handler` when the user asks to close the window (close button,
+    ## ⌘W, Window ▸ Close, performClose): `false` keeps it open. Replaces any
+    ## earlier handler. Throws RuntimeError when the app added its own
+    ## `windowShouldClose:` to LoupTarget.
+    pub func onShouldClose(handler: fn(): bool): void {
+        if (not g_should_close_added) {
+            let added = class_addMethod(targetClass(), sel("windowShouldClose:"),
+                addressOf(impWindowShouldClose), "c@:@");
+            if (not added) {
+                throw RuntimeError("Window.onShouldClose: LoupTarget already has windowShouldClose: (added by the app with class_addMethod)");
+            }
+            g_should_close_added = true;
+        }
+        g_should_close[this.handle] = handler;
+        # NSWindow looks at what its delegate answers when the delegate is set.
+        msgI(this.handle, sel("setDelegate:"), 0);
+        msgI(this.handle, sel("setDelegate:"), target());
+        return;
+    }
+
+    ## Press the key that types `chars` with `modifiers` (MOD_…) held, as the
+    ## keyboard would: the window offers it to its views' key equivalents
+    ## (buttons), then the menu bar to its items'. Whether one took it. Works
+    ## in a quiet self-test (see the module header). The event is the one a
+    ## real key press makes, so ⇧ + a key matches as on the keyboard:
+    ## ("z", MOD_SHIFT_COMMAND) and ("Z", MOD_SHIFT_COMMAND) both press ⇧⌘Z,
+    ## whether the item was set as "Z" or as "z" with MOD_SHIFT.
+    pub func sendKey(chars: string, modifiers: int): bool {
+        let event = keyEvent(chars, modifiers, this.handle);
+        if ((msgI(this.handle, sel("performKeyEquivalent:"), event) & 255) != 0) {
+            return true;
+        }
+        var stand_in = 0;
+        if (msg(g_app, sel("keyWindow")) == 0) {
+            stand_in = this.handle;
+        }
+        let taken = menuKey(g_menubar, chars, modifiers, stand_in);
+        return taken;
+    }
+
+    ## Send the standard action `action` ("selectAll:", "performClose:", …)
+    ## along this window's responder chain, from its first responder up to
+    ## the app delegate, as a nil-targeted menu item would if this window were
+    ## key. Whether a responder took it.
+    pub func sendAction(action: string): bool {
+        let taken = sendAlongChain(this.handle, sel(action), 0);
+        return taken;
+    }
+
+    ## Write a PNG (sRGB) of the whole window, title bar included, to `path`
+    ## — for tests and documentation (see the module header). arm64 only (it
+    ## passes an NSRect by value). A file that cannot be written is skipped
+    ## silently.
+    pub func snapshot(path: string): void {
+        let frame_view = msg(msg(this.handle, sel("contentView")), sel("superview"));
+        let rep = renderRep(frame_view);
+        writeRepPng(rep, path);
+        return;
+    }
+
+    ## Draw the whole window, title bar included, into a Bitmap (see
+    ## View.render); its coordinates are the window's frame view's, whose
+    ## origin is the window's bottom-left corner (the content view's origin
+    ## too, as the title bar sits above the content).
+    pub func render(): Bitmap {
+        let frame_view = msg(msg(this.handle, sel("contentView")), sel("superview"));
+        let bitmap = View(frame_view).render();
+        return bitmap;
+    }
+}
+
+# ── menus ──────────────────────────────────────────────────────────────────
+
+## A menu item (`setEnabled`, `setChecked`, `perform`, …).
+pub class MenuItem {
+    pub let handle: int;
+
+    pub func constructor(handle: int) {
+        this.handle = handle;
+    }
+
+    ## Enable or disable (grey out) the item. It sticks for an item with a
+    ## handler (Menu.addItem): autoenabling asks LoupTarget, which answers
+    ## with this state.
+    pub func setEnabled(enabled: bool): void {
+        var e = 0;
+        if (enabled) {
+            e = 1;
+            g_item_disabled.remove(this.handle);
+        } else {
+            g_item_disabled[this.handle] = true;
+        }
+        msgI(this.handle, sel("setEnabled:"), e);
+        return;
+    }
+
+    ## Whether the item is enabled now (after its menu's last update).
+    pub func isEnabled(): bool {
+        let e = (msg(this.handle, sel("isEnabled")) & 255) != 0;
+        return e;
+    }
+
+    ## Show or hide the check mark.
+    pub func setChecked(checked: bool): void {
+        var s = 0;
+        if (checked) { s = 1; }
+        msgI(this.handle, sel("setState:"), s);
+        return;
+    }
+
+    ## Whether the check mark shows.
+    pub func checked(): bool {
+        let on = msg(this.handle, sel("state")) == STATE_ON;
+        return on;
+    }
+
+    ## Hide the item (or show it again). A hidden item's shortcut works only
+    ## with setAllowsKeyEquivalentWhenHidden(true).
+    pub func setHidden(hidden: bool): void {
+        var h = 0;
+        if (hidden) { h = 1; }
+        msgI(this.handle, sel("setHidden:"), h);
+        return;
+    }
+
+    ## Whether the item is hidden.
+    pub func isHidden(): bool {
+        let h = msg(this.handle, sel("isHidden")) & 255;
+        return h != 0;
+    }
+
+    ## Whether the item's shortcut still works while it is hidden (a second
+    ## key for an action: keypad Enter beside Return).
+    pub func setAllowsKeyEquivalentWhenHidden(allow: bool): void {
+        var a = 0;
+        if (allow) { a = 1; }
+        msgI(this.handle, sel("setAllowsKeyEquivalentWhenHidden:"), a);
+        return;
+    }
+
+    ## Whether the shortcut works while the item is hidden.
+    pub func allowsKeyEquivalentWhenHidden(): bool {
+        let a = msg(this.handle, sel("allowsKeyEquivalentWhenHidden")) & 255;
+        return a != 0;
+    }
+
+    pub func setTitle(title: string): void {
+        msgI(this.handle, sel("setTitle:"), nsstr(title));
+        return;
+    }
+
+    pub func title(): string {
+        let t = str_of(msg(this.handle, sel("title")));
+        return t;
+    }
+
+    ## Set the shortcut: `key` ("" for none) with `modifiers` (MOD_NONE,
+    ## MOD_COMMAND, MOD_SHIFT_COMMAND, MOD_CONTROL, MOD_OPTION, … added up).
+    pub func setKeyEquivalent(key: string, modifiers: int): void {
+        msgI(this.handle, sel("setKeyEquivalent:"), nsstr(key));
+        msgI(this.handle, sel("setKeyEquivalentModifierMask:"), modifiers);
+        return;
+    }
+
+    ## The shortcut's key ("" for none).
+    pub func keyEquivalent(): string {
+        let k = str_of(msg(this.handle, sel("keyEquivalent")));
+        return k;
+    }
+
+    ## The shortcut's modifier mask (MOD_… bits).
+    pub func modifiers(): int {
+        let m = msg(this.handle, sel("keyEquivalentModifierMask")) & MOD_KEYS;
+        return m;
+    }
+
+    ## Choose the item as a click on it would: its menu is validated
+    ## (`update`), then `performActionForItemAtIndex:` sends the action — or,
+    ## for a standard (nil-targeted) item while the app has no key window (a
+    ## quiet self-test), the action goes along the shown window's responder
+    ## chain (see the module header). Whether an action was sent: false for a
+    ## disabled item or one nothing answers. Throws ValueError when the item
+    ## is in no menu.
+    pub func perform(): bool {
+        let menu = msg(this.handle, sel("menu"));
+        if (menu == 0) {
+            throw ValueError("MenuItem.perform: \"" + this.title() + "\" is in no menu");
+        }
+        msgV(menu, sel("update"));
+        let sent = chooseItem(menu, this.handle);
+        return sent;
+    }
+}
+
+## A menu in the menu bar (`addMenu`) or a submenu (`addSubmenu`).
+pub class Menu {
+    pub let handle: int;
+
+    ## A new, empty menu titled `title`. (`menuOf(handle)` wraps an existing
+    ## NSMenu instead.)
+    pub func constructor(title: string) {
+        var m = g_wrap_menu;
+        if (m != 0) {
+            g_wrap_menu = 0;
+        } else {
+            m = msgI(msg(cls("NSMenu"), sel("alloc")), sel("initWithTitle:"), nsstr(title));
+        }
+        this.handle = m;
+    }
+
+    pub func title(): string {
+        let t = str_of(msg(this.handle, sel("title")));
+        return t;
+    }
+
+    ## An item that runs `handler`; `key` is its ⌘ shortcut ("" for none; an
+    ## upper-case letter adds ⇧).
+    pub func addItem(title: string, key: string, handler: fn(): void): MenuItem {
+        let item = msgIII(msg(cls("NSMenuItem"), sel("alloc")), sel("initWithTitle:action:keyEquivalent:"),
+            nsstr(title), 0, nsstr(key));
+        msgI(this.handle, sel("addItem:"), item);
+        onAction(item, handler);
+        let mi = MenuItem(item);
+        return mi;
+    }
+
+    ## An item that runs `handler`, with the shortcut `key` and the modifier
+    ## mask `modifiers` (MOD_NONE for the bare key, MOD_CONTROL, MOD_OPTION,
+    ## MOD_SHIFT_COMMAND, … added up).
+    pub func addItemWithModifiers(title: string, key: string, modifiers: int, handler: fn(): void): MenuItem {
+        let mi = this.addItem(title, key, handler);
+        msgI(mi.handle, sel("setKeyEquivalentModifierMask:"), modifiers);
+        return mi;
+    }
+
+    ## A hidden item whose shortcut `key` with `modifiers` (MOD_…) still runs
+    ## `handler`: a second shortcut for an action another item shows (keypad
+    ## Enter, "\u{3}" with MOD_NONE, beside a visible "=" item).
+    pub func addHiddenItem(title: string, key: string, modifiers: int, handler: fn(): void): MenuItem {
+        let mi = this.addItemWithModifiers(title, key, modifiers, handler);
+        mi.setHidden(true);
+        mi.setAllowsKeyEquivalentWhenHidden(true);
+        return mi;
+    }
+
+    ## An item that sends the standard AppKit action `action` (e.g. "copy:")
+    ## along the responder chain.
+    pub func addStandard(title: string, action: string, key: string): MenuItem {
+        let item = msgIII(msg(cls("NSMenuItem"), sel("alloc")), sel("initWithTitle:action:keyEquivalent:"),
+            nsstr(title), sel(action), nsstr(key));
+        msgI(this.handle, sel("addItem:"), item);
+        let mi = MenuItem(item);
+        return mi;
+    }
+
+    pub func addSeparator(): void {
+        msgI(this.handle, sel("addItem:"), msg(cls("NSMenuItem"), sel("separatorItem")));
+        return;
+    }
+
+    ## Add `sub` as a submenu item titled `title`.
+    pub func addSubmenu(title: string, sub: Menu): void {
+        let item = msgIII(msg(cls("NSMenuItem"), sel("alloc")), sel("initWithTitle:action:keyEquivalent:"),
+            nsstr(title), 0, nsstr(""));
+        msgI(item, sel("setSubmenu:"), sub.handle);
+        msgI(this.handle, sel("addItem:"), item);
+        return;
+    }
+
+    ## How many items the menu has (separators included).
+    pub func itemCount(): int {
+        let n = msg(this.handle, sel("numberOfItems"));
+        return n;
+    }
+
+    ## The item at `index`. Throws ValueError outside 0 ..< itemCount().
+    pub func itemAt(index: int): MenuItem {
+        if (index < 0 or index >= this.itemCount()) {
+            throw ValueError("Menu.itemAt: " + index.to_string() + " is outside the "
+                + this.itemCount().to_string() + " items of menu \"" + this.title() + "\"");
+        }
+        let mi = MenuItem(msgI(this.handle, sel("itemAtIndex:"), index));
+        return mi;
+    }
+
+    ## The index of the item titled `title`, or -1.
+    pub func indexOfItem(title: string): int {
+        let i = msgI(this.handle, sel("indexOfItemWithTitle:"), nsstr(title));
+        return i;
+    }
+
+    ## The item titled `title`. Throws ValueError when there is none.
+    pub func itemWithTitle(title: string): MenuItem {
+        let item = msgI(this.handle, sel("itemWithTitle:"), nsstr(title));
+        if (item == 0) {
+            throw ValueError("Menu.itemWithTitle: menu \"" + this.title() + "\" has no item \"" + title + "\"");
+        }
+        let mi = MenuItem(item);
+        return mi;
+    }
+
+    ## Whether AppKit enables and disables the items itself before showing
+    ## the menu (the default) — false leaves every item as setEnabled made it.
+    pub func setAutoenablesItems(on: bool): void {
+        var v = 0;
+        if (on) { v = 1; }
+        msgI(this.handle, sel("setAutoenablesItems:"), v);
+        return;
+    }
+
+    ## Validate (enable or disable) the items now, as opening the menu would.
+    pub func update(): void {
+        msgV(this.handle, sel("update"));
+        return;
+    }
+
+    ## Offer the key `chars` with `modifiers` (MOD_…) to the menu's (and its
+    ## submenus') key equivalents, as the keyboard would. Whether an item took
+    ## it. Works in a quiet self-test (see the module header).
+    pub func sendKey(chars: string, modifiers: int): bool {
+        let taken = menuKey(this.handle, chars, modifiers, standInKeyWindow());
+        return taken;
+    }
+}
+
+## Wrap the existing NSMenu `handle` in a Menu proxy (nothing is copied).
+## Throws ValueError for nil.
+pub func menuOf(handle: int): Menu {
+    if (handle == 0) {
+        throw ValueError("menuOf: the NSMenu is nil");
+    }
+    g_wrap_menu = handle;
+    let m = Menu("");
+    return m;
+}
+
+## A menu-bar item for `menu`, titled like it.
+func barItem(menu: Menu): int {
+    let item = make("NSMenuItem");
+    msgI(item, sel("setTitle:"), msg(menu.handle, sel("title")));
+    msgI(item, sel("setSubmenu:"), menu.handle);
+    return item;
+}
+
+## Add `menu` to the menu bar (after the standard ones `appInit` made). The
+## menu-bar item is titled like the menu.
+pub func addMenu(menu: Menu): void {
+    msgI(g_menubar, sel("addItem:"), barItem(menu));
+    return;
+}
+
+## Put `menu` in the menu bar at position `index` (0 is the app menu; 1 is
+## right after it, where File goes). Throws ValueError outside
+## 0 ..= the number of menus.
+pub func insertMenu(menu: Menu, index: int): void {
+    let n = msg(g_menubar, sel("numberOfItems"));
+    if (index < 0 or index > n) {
+        throw ValueError("insertMenu: index " + index.to_string() + " is outside 0.." + n.to_string());
+    }
+    msgII(g_menubar, sel("insertItem:atIndex:"), barItem(menu), index);
+    return;
+}
+
+## Put `menu` in the menu bar right before the menu titled `before` (e.g.
+## "Window", where app menus go). Throws ValueError when there is none.
+pub func addMenuBefore(menu: Menu, before: string): void {
+    let index = menuBarIndex(before);
+    if (index < 0) {
+        throw ValueError("addMenuBefore: the menu bar has no menu \"" + before + "\"");
+    }
+    msgII(g_menubar, sel("insertItem:atIndex:"), barItem(menu), index);
+    return;
+}
+
+## The position of the menu titled `title` in the menu bar, or -1. (Matches
+## the bar item's title or its menu's, so menus an app put in the bar with an
+## untitled item are found too.)
+pub func menuBarIndex(title: string): int {
+    if (g_menubar == 0) {
+        return -1;
+    }
+    let n = msg(g_menubar, sel("numberOfItems"));
+    var i = 0;
+    while (i < n) {
+        let item = msgI(g_menubar, sel("itemAtIndex:"), i);
+        let sub = msg(item, sel("submenu"));
+        if (str_of(msg(item, sel("title"))) == title) {
+            return i;
+        }
+        if (sub != 0 and str_of(msg(sub, sel("title"))) == title) {
+            return i;
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+## The menu titled `title` in the menu bar ("Edit", "Window", an app's
+## "File"). Throws ValueError when there is none.
+pub func menuBarMenu(title: string): Menu {
+    let index = menuBarIndex(title);
+    if (index < 0) {
+        throw ValueError("menuBarMenu: the menu bar has no menu \"" + title + "\"");
+    }
+    let sub = msg(msgI(g_menubar, sel("itemAtIndex:"), index), sel("submenu"));
+    let m = menuOf(sub);
+    return m;
+}
+
+## The menu bar itself (its `sendKey` offers a key to every menu).
+pub func menuBar(): Menu {
+    if (g_menubar == 0) {
+        throw RuntimeError("menuBar: call appInit first");
+    }
+    let m = menuOf(g_menubar);
+    return m;
+}
+
+## The application menu appInit made (About, Hide, Quit).
+pub func appMenu(): Menu {
+    if (g_app_menu == 0) {
+        throw RuntimeError("appMenu: call appInit first");
+    }
+    let m = menuOf(g_app_menu);
+    return m;
+}
+
+## The Edit menu appInit made (Undo, Redo, Cut, Copy, Paste, Select All).
+pub func editMenu(): Menu {
+    if (g_edit_menu == 0) {
+        throw RuntimeError("editMenu: call appInit first");
+    }
+    let m = menuOf(g_edit_menu);
+    return m;
+}
+
+## The Window menu appInit made (Minimize, Close, then AppKit's window list).
+pub func windowMenu(): Menu {
+    if (g_window_menu == 0) {
+        throw RuntimeError("windowMenu: call appInit first");
+    }
+    let m = menuOf(g_window_menu);
+    return m;
+}

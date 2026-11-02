@@ -1,0 +1,65 @@
+text: [line one
+line two — ✓]
+after insert: [line one
+line two — ✓
+third line]
+changes: 1
+after setText: [replaced] changes: 1
+alignment: natural
+setAlignment(center): center
+setAlignment(right): right
+bad alignment: ValueError
+applyFont size: 15
+semibold: true
+text color: secondaryLabelColor
+[setup]
+rich text by default: false
+border by default: false
+usePlainText(false): rich false, undo true, substitutions false
+usePlainText(true): substitutions true
+setSmartSubstitutions(false): false
+setRichText(true): true
+setAllowsUndo(false): false
+setBorder(true): true
+setTextInset: 10 x 6
+setEditable(false): false
+editable again: true
+[scrollers]
+preferred style is legacy or overlay: true
+starts with the preferred style: true
+constants: legacy 0, overlay 1
+vertical true, horizontal false, autohides false
+setScrollerStyle(legacy): legacy, shown true, strip drawn true
+setAutohidesScrollers(true): true, shown with short text false, strip drawn false
+  with 30 lines: shown true
+setScrollerStyle(overlay): overlay, strip drawn false
+setScrollerStyle(5): ValueError, still overlay
+setScrollers(true, true): vertical true, horizontal true
+setScrollers(false, false): vertical false, horizontal false, shown false
+[selection]
+scalars 13, utf16Length 14
+utf16Offset(8): 9, scalarIndex(9): 8, inside the pair scalarIndex(7): 6, past the end scalarIndex(99): 13
+utf16Offset past the end: ValueError
+selectedRange: (9, 5) [world]
+the emoji: (6, 2) [😀]
+setSelectedRange(14, 1): ValueError
+scrollRangeToVisible(-1, 0): ValueError
+insert over the selection: [héllo 😀 there] caret (14, 0), onChange ran: true
+moveToStart: (0, 0), selectedText []
+moveToEnd: (14, 0)
+selectAll: (0, 14) [héllo 😀 there]
+[undo]
+cleared: [] undo false, redo false
+undo() with nothing to undo: false
+typed: [alpha beta] undo true, redo false, onChange 3, onEdited 3
+undo(): true -> [alpha] undo true, redo true
+  after undo: onChange ran 0x, onEdited ran 1x
+undo(): true -> [] undo false, redo true
+undo() again: false
+redo(): true -> [alpha] undo true, redo true
+redo(): true -> [alpha beta] undo true, redo false
+  after two redos: onEdited ran 2x
+redo() again: false
+breakUndoCoalescing, one undo: [alpha beta] undo true, redo true
+clearUndoHistory: [alpha beta gamma] undo false, redo false
+setText keeps onEdited quiet: onEdited 11

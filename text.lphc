@@ -1,0 +1,783 @@
+@mode(host.native)
+
+# appkit.text — multi-line text: TextArea, an NSTextView inside an NSScrollView.
+#
+# Place or lay out `area` (the scroll view, a View); read and write the text
+# with `text()` / `setText()`; `onChange` runs after every edit the user makes
+# (the text view's delegate `textDidChange:`, a method this module adds to the
+# shared LoupTarget class). Text styling takes appkit.controls values:
+# `applyFont(font)` / `font()` (any controls Font, weights included),
+# `setAlignment(TEXT_…)` / `alignment()` (the alignment names; the ABI
+# difference of NSTextAlignment is handled there) and
+# `applyTextColor(colorRef)` / `textColorRef()` (a system color follows dark
+# mode). They apply to the whole text and to what is typed next.
+#
+# ── Change callbacks ──
+# `onChange(handler)` is `textDidChange:` exactly: typing, `insert`, paste,
+# cut, drag and drop — NOT Undo or Redo (NSTextView does not send
+# `textDidChange:` for those) and not `setText`. `onEdited(handler)` runs for
+# all of those AND after every Undo and Redo that changed this text view's
+# text: the module watches the text storage
+# (NSTextStorageDidProcessEditingNotification, recording an edit made while
+# the undo manager is undoing or redoing) and runs the handler on
+# NSUndoManagerDidUndoChangeNotification / DidRedoChangeNotification, after
+# the undo finished — so a status bar or an edited mark never goes stale after
+# ⌘Z. Use one of the two per text area (both run on typing).
+#
+# ── Editor setup ──
+# `usePlainText(substitutions)` makes a plain-text editor: rich text off
+# (pasting drops styles, the font applies to everything), no images, undo on,
+# and the smart quote / dash / replacement / spelling substitutions on or off.
+# The single settings: `setRichText` / `isRichText`, `setAllowsUndo` /
+# `allowsUndo`, `setSmartSubstitutions` / `smartSubstitutions`,
+# `setEditable` / `isEditable`, `setTextInset(w, h)` / `textInset()` (the
+# margin around the text) and `setBorder(on)` / `hasBorder()` (a bezel
+# around the scroll view, like a text field's).
+#
+# ── Scrollers ──
+# The area scrolls vertically; its scroll bars follow the system setting
+# (System Settings ▸ Appearance ▸ Show scroll bars). With a mouse attached
+# (and the default "Automatically") that is the legacy style: a scroller
+# strip stands beside the text all the time, also in `Window.render` /
+# `snapshot` (a scrollableTextView draws it even when the text fits). `setScrollerStyle(SCROLLER_OVERLAY)` uses overlay scrollers (drawn
+# over the text only while scrolling, as with a trackpad),
+# `setScrollerStyle(SCROLLER_LEGACY)` the strip; `scrollerStyle()` reads it
+# back and `preferredScrollerStyle()` is the system setting. (AppKit puts
+# the system setting back when the user changes it while the app runs.)
+# `setAutohidesScrollers(true)` hides a scroller while the text fits (a
+# scrollableTextView keeps it: false); `setScrollers(vertical, horizontal)`
+# says which scrollers exist at all (`hasVerticalScroller()`,
+# `hasHorizontalScroller()`; the default is vertical only — the text wraps
+# to the width, so a horizontal scroller has nothing to scroll).
+#
+# ── Selection and offsets ──
+# AppKit counts text positions in UTF-16 code units; Loup strings count
+# Unicode scalars (`text.length()`, `substring`). They differ for every
+# character outside the Basic Multilingual Plane (an emoji is 2 units, 1
+# scalar). The selection API speaks AppKit's units: `selectedRange()` (a
+# `TextRange`: location, length), `setSelectedRange(location, length)`,
+# `scrollRangeToVisible(location, length)` and `utf16Length()`;
+# `utf16Offset(text, index)` and `scalarIndex(text, offset)` convert. Scalar
+# positions from a Loup search go through `utf16Offset` before
+# `setSelectedRange`. `selectedText()` returns the selected text itself (no
+# offsets involved). `insert(text)` types at the selection, replacing it, as
+# the keyboard does; `selectAll()`, `moveToStart()` and `moveToEnd()` move
+# the selection.
+#
+# ── Undo ──
+# The text view uses its window's undo manager (none until it is in a
+# window; `allowsUndo` must be on — `usePlainText` turns it on). `undo()` /
+# `redo()` do what Edit ▸ Undo / Redo do and say whether there was something
+# to undo; `canUndo()` / `canRedo()` ask. `breakUndoCoalescing()` ends the
+# run of typing that one Undo removes (call it at a save, as TextEdit does);
+# `clearUndoHistory()` forgets every undo step — call it after loading a file
+# into the area, since `setText` keeps the old steps (it clears the WINDOW's
+# undo manager, which the window's text fields share; AppKit offers no
+# per-view removal for a text view's steps).
+# `endUndoStep()` closes the current undo step as the end of a key press
+# does. AppKit groups the undo steps of one event and closes the group only
+# when the event loop dispatches the next event; a self-test's steps all run
+# inside timers within one wait for an event (several `after` steps too), so
+# without `endUndoStep()` one Undo would remove everything the self-test
+# typed. It also breaks typing coalescing (`breakUndoCoalescing` alone does
+# not separate two edits made in the same event: one Undo still takes both).
+
+from appkit.objc import (cls, sel, nsstr, str_of, Rect, point_of, msg, msgV, msgI, msgII, msgIII, msgIIII,
+    msgD, msgDD, malloc, free, class_addMethod);
+from appkit.app import (View, targetClass, target, runHandler);
+from appkit.controls import (Font, ColorRef, textAlignmentValue, textAlignmentName);
+
+## Scroller style (`setScrollerStyle`): legacy scroll bars, a strip beside
+## the text that is always there (NSScrollerStyleLegacy).
+pub const SCROLLER_LEGACY: int = 0;
+## Scroller style: overlay scroll bars, drawn over the text while it scrolls
+## and hidden otherwise (NSScrollerStyleOverlay).
+pub const SCROLLER_OVERLAY: int = 1;
+
+## NSNotFound (NSIntegerMax).
+const NS_NOT_FOUND: int = 9223372036854775807;
+## NSNoBorder / NSBezelBorder (NSScrollView borderType).
+const NO_BORDER: int = 0;
+const BEZEL_BORDER: int = 2;
+## The first code point that needs two UTF-16 units (a surrogate pair).
+const FIRST_SUPPLEMENTARY: int = 65536;
+
+var g_text_change: dict[int, fn(): void] = {};
+var g_installed: bool = false;
+## onEdited handlers, by text view.
+var g_edited: dict[int, fn(): void] = {};
+## The text view of each text storage watched for onEdited.
+var g_storage_view: dict[int, int] = {};
+## Text views whose text an undo or redo in progress changed (run their
+## onEdited handler once it has finished), in order, and as a set.
+var g_undo_pending: list[int] = [];
+var g_undo_pending_set: dict[int, bool] = {};
+var g_undo_observing: bool = false;
+
+## A range of text in UTF-16 code units, as AppKit counts (see the module
+## header): `location` is the offset of its start, `length` how many units
+## it spans (0 for an insertion point).
+pub struct TextRange {
+    pub location: int;
+    pub length: int;
+}
+
+## `- (void)textDidChange:(NSNotification*)note` — the text view was edited.
+func impTextDidChange(self_obj: int, cmd: int, note: int): void {
+    let view = msg(note, sel("object"));
+    if (g_text_change.contains_key(view)) {
+        runHandler(g_text_change[view], "text area change");
+    }
+    if (g_edited.contains_key(view)) {
+        runHandler(g_edited[view], "text area edit");
+    }
+    return;
+}
+
+## Whether the undo manager `um` is in the middle of an undo or a redo.
+func isUndoingOrRedoing(um: int): bool {
+    if (um == 0) {
+        return false;
+    }
+    let undoing = msg(um, sel("isUndoing")) & 255;
+    let redoing = msg(um, sel("isRedoing")) & 255;
+    let busy = undoing != 0 or redoing != 0;
+    return busy;
+}
+
+## `- (void)loupTextStorageEdited:(NSNotification*)note` — a watched text
+## storage processed an edit; note it when an undo or redo made it.
+func impTextStorageEdited(self_obj: int, cmd: int, note: int): void {
+    let storage = msg(note, sel("object"));
+    if (not g_storage_view.contains_key(storage)) {
+        return;
+    }
+    let view = g_storage_view[storage];
+    let um = msg(view, sel("undoManager"));
+    if (not isUndoingOrRedoing(um)) {
+        return;
+    }
+    if (not g_undo_pending_set.contains_key(view)) {
+        g_undo_pending_set[view] = true;
+        g_undo_pending.push(view);
+    }
+    return;
+}
+
+## `- (void)loupTextUndoRedo:(NSNotification*)note` — an undo manager
+## finished an undo or redo: run the onEdited handler of every text view it
+## changed.
+func impTextUndoRedo(self_obj: int, cmd: int, note: int): void {
+    if (g_undo_pending.len() == 0) {
+        return;
+    }
+    let views = g_undo_pending;
+    g_undo_pending = [];
+    g_undo_pending_set = {};
+    for (view in views) {
+        if (g_edited.contains_key(view)) {
+            runHandler(g_edited[view], "text area edit (undo / redo)");
+        }
+    }
+    return;
+}
+
+func install(): void {
+    if (not g_installed) {
+        let c = targetClass();
+        class_addMethod(c, sel("textDidChange:"), addressOf(impTextDidChange), "v@:@");
+        class_addMethod(c, sel("loupTextStorageEdited:"), addressOf(impTextStorageEdited), "v@:@");
+        class_addMethod(c, sel("loupTextUndoRedo:"), addressOf(impTextUndoRedo), "v@:@");
+        g_installed = true;
+    }
+    return;
+}
+
+## Observe `name` notifications from `object` (0: from any object) with the
+## LoupTarget method `selector`.
+func observe(selector: string, name: string, object: int): void {
+    let center = msg(cls("NSNotificationCenter"), sel("defaultCenter"));
+    msgIIII(center, sel("addObserver:selector:name:object:"), target(), sel(selector), nsstr(name), object);
+    return;
+}
+
+## `flag` as an Objective-C BOOL argument.
+func boolArg(flag: bool): int {
+    var b = 0;
+    if (flag) {
+        b = 1;
+    }
+    return b;
+}
+
+## The BOOL result of `[obj selector]`.
+func boolOf(obj: int, selector: string): bool {
+    let r = msg(obj, sel(selector)) & 255;
+    let on = r != 0;
+    return on;
+}
+
+## The scroller style the system setting asks for (System Settings ▸
+## Appearance ▸ Show scroll bars, and whether a mouse is attached):
+## SCROLLER_LEGACY or SCROLLER_OVERLAY. New scroll views start with it.
+pub func preferredScrollerStyle(): int {
+    let style = msg(cls("NSScroller"), sel("preferredScrollerStyle"));
+    return style;
+}
+
+## The UTF-16 offset of the scalar index `index` of `text` (`text.length()`
+## gives the UTF-16 length). Throws ValueError for a negative index or one
+## past the end.
+pub func utf16Offset(text: string, index: int): int {
+    if (index < 0) {
+        throw ValueError("utf16Offset: negative index " + index.to_string());
+    }
+    var offset = 0;
+    var i = 0;
+    for (c in text.scalars()) {
+        if (i >= index) {
+            break;
+        }
+        if (c.toInt() >= FIRST_SUPPLEMENTARY) {
+            offset = offset + 2;
+        } else {
+            offset = offset + 1;
+        }
+        i = i + 1;
+    }
+    if (i < index) {
+        throw ValueError("utf16Offset: index " + index.to_string() + " is past the end of the text ("
+            + i.to_string() + " characters)");
+    }
+    return offset;
+}
+
+## The scalar index (a Loup string index) at the UTF-16 offset `offset` of
+## `text`. An offset inside a surrogate pair gives the index of its
+## character; an offset at or past the end gives `text.length()`. Throws
+## ValueError for a negative offset.
+pub func scalarIndex(text: string, offset: int): int {
+    if (offset < 0) {
+        throw ValueError("scalarIndex: negative UTF-16 offset " + offset.to_string());
+    }
+    var units = 0;
+    var index = 0;
+    for (c in text.scalars()) {
+        var width = 1;
+        if (c.toInt() >= FIRST_SUPPLEMENTARY) {
+            width = 2;
+        }
+        if (units + width > offset) {
+            break;
+        }
+        units = units + width;
+        index = index + 1;
+    }
+    return index;
+}
+
+## A scrollable, editable multi-line text view. `area` is the scroll view to
+## place in a window or a stack; `textView` is the NSTextView inside it.
+pub class TextArea {
+    pub let area: View;
+    pub let textView: int;
+
+    pub func constructor() {
+        let scroll = msg(cls("NSTextView"), sel("scrollableTextView"));
+        this.area = View(scroll);
+        this.textView = msg(scroll, sel("documentView"));
+    }
+
+    ## The whole text.
+    pub func text(): string {
+        let t = str_of(msg(this.textView, sel("string")));
+        return t;
+    }
+
+    ## Replace the whole text (does not run `onChange` or `onEdited`, and
+    ## keeps the undo history: call `clearUndoHistory` after loading a file).
+    pub func setText(text: string): void {
+        msgI(this.textView, sel("setString:"), nsstr(text));
+        return;
+    }
+
+    ## Run `handler` after every edit the user makes (`textDidChange:`:
+    ## typing, `insert`, paste, cut). Not after Undo or Redo, and not after
+    ## `setText` — see `onEdited` for one that also runs after Undo / Redo.
+    pub func onChange(handler: fn(): void): void {
+        install();
+        msgI(this.textView, sel("setDelegate:"), target());
+        g_text_change[this.textView] = handler;
+        return;
+    }
+
+    ## Run `handler` after every change to the text except `setText`: what
+    ## `onChange` sees (typing, `insert`, paste, cut) and also every Undo and
+    ## Redo that changed this text (once each, after the undo finished).
+    ## Replaces an earlier `onEdited` handler; `onChange` is separate (both
+    ## run on typing).
+    pub func onEdited(handler: fn(): void): void {
+        install();
+        msgI(this.textView, sel("setDelegate:"), target());
+        g_edited[this.textView] = handler;
+        let storage = msg(this.textView, sel("textStorage"));
+        if (storage != 0 and not g_storage_view.contains_key(storage)) {
+            g_storage_view[storage] = this.textView;
+            observe("loupTextStorageEdited:", "NSTextStorageDidProcessEditingNotification", storage);
+        }
+        if (not g_undo_observing) {
+            observe("loupTextUndoRedo:", "NSUndoManagerDidUndoChangeNotification", 0);
+            observe("loupTextUndoRedo:", "NSUndoManagerDidRedoChangeNotification", 0);
+            g_undo_observing = true;
+        }
+        return;
+    }
+
+    ## The system font at `size` points, or the monospaced system font.
+    pub func setFont(size: float, monospaced: bool): void {
+        var font = 0;
+        if (monospaced) {
+            font = msgD(cls("NSFont"), sel("userFixedPitchFontOfSize:"), size);
+        } else {
+            font = msgD(cls("NSFont"), sel("systemFontOfSize:"), size);
+        }
+        msgI(this.textView, sel("setFont:"), font);
+        return;
+    }
+
+    ## Use `font` (an appkit.controls Font: `systemFontWithWeight`,
+    ## `monospacedDigitSystemFont`, `fontNamed`, …) for the whole text.
+    pub func applyFont(font: Font): void {
+        msgI(this.textView, sel("setFont:"), font.handle);
+        return;
+    }
+
+    ## The font of the text (of what is typed next when it is empty).
+    pub func font(): Font {
+        let f = Font(msg(this.textView, sel("font")));
+        return f;
+    }
+
+    ## Align the whole text: TEXT_LEFT, TEXT_CENTER, TEXT_RIGHT,
+    ## TEXT_JUSTIFIED or TEXT_NATURAL (appkit.controls; throws ValueError for
+    ## anything else).
+    pub func setAlignment(alignment: string): void {
+        msgI(this.textView, sel("setAlignment:"), textAlignmentValue(alignment));
+        return;
+    }
+
+    ## The text alignment as a name ("left", "center", …).
+    pub func alignment(): string {
+        let a = textAlignmentName(msg(this.textView, sel("alignment")));
+        return a;
+    }
+
+    ## Draw the whole text in `color` (an appkit.controls ColorRef).
+    pub func applyTextColor(color: ColorRef): void {
+        msgI(this.textView, sel("setTextColor:"), color.color_handle);
+        return;
+    }
+
+    ## The text color as a ColorRef (`isNone()` when none is set).
+    pub func textColorRef(): ColorRef {
+        let h = msg(this.textView, sel("textColor"));
+        if (h != 0) {
+            msgV(h, sel("retain"));
+        }
+        let c = ColorRef(h);
+        return c;
+    }
+
+    pub func setEditable(editable: bool): void {
+        var e = 0;
+        if (editable) { e = 1; }
+        msgI(this.textView, sel("setEditable:"), e);
+        return;
+    }
+
+    ## Whether the user can edit the text.
+    pub func isEditable(): bool {
+        let on = boolOf(this.textView, "isEditable");
+        return on;
+    }
+
+    ## Turn the automatic quote, dash and spelling substitutions on or off
+    ## (off suits code and data).
+    pub func setSmartSubstitutions(on: bool): void {
+        var e = 0;
+        if (on) { e = 1; }
+        msgI(this.textView, sel("setAutomaticQuoteSubstitutionEnabled:"), e);
+        msgI(this.textView, sel("setAutomaticDashSubstitutionEnabled:"), e);
+        msgI(this.textView, sel("setAutomaticTextReplacementEnabled:"), e);
+        msgI(this.textView, sel("setContinuousSpellCheckingEnabled:"), e);
+        return;
+    }
+
+    ## Whether the smart substitutions are on (all of them: quotes, dashes,
+    ## text replacement and spell checking, as `setSmartSubstitutions` sets
+    ## them together).
+    pub func smartSubstitutions(): bool {
+        let on = boolOf(this.textView, "isAutomaticQuoteSubstitutionEnabled")
+            and boolOf(this.textView, "isAutomaticDashSubstitutionEnabled")
+            and boolOf(this.textView, "isAutomaticTextReplacementEnabled")
+            and boolOf(this.textView, "isContinuousSpellCheckingEnabled");
+        return on;
+    }
+
+    ## Rich text (on, NSTextView's default) keeps the fonts and colors of
+    ## pasted text; off makes a plain-text view: pasting inserts the text
+    ## only and the font applies to everything.
+    pub func setRichText(on: bool): void {
+        msgI(this.textView, sel("setRichText:"), boolArg(on));
+        return;
+    }
+
+    ## Whether the view takes rich text (see setRichText).
+    pub func isRichText(): bool {
+        let on = boolOf(this.textView, "isRichText");
+        return on;
+    }
+
+    ## Turn undo of the text's edits on or off (`allowsUndo`; off by default
+    ## for a scrollableTextView).
+    pub func setAllowsUndo(on: bool): void {
+        msgI(this.textView, sel("setAllowsUndo:"), boolArg(on));
+        return;
+    }
+
+    ## Whether the text's edits can be undone.
+    pub func allowsUndo(): bool {
+        let on = boolOf(this.textView, "allowsUndo");
+        return on;
+    }
+
+    ## Set the area up as a plain-text editor: rich text off, no images, undo
+    ## on, and the smart substitutions (quotes, dashes, text replacement,
+    ## spell checking) on when `substitutions`, off otherwise (off suits code,
+    ## data and files that must be saved exactly as typed).
+    pub func usePlainText(substitutions: bool): void {
+        this.setRichText(false);
+        msgI(this.textView, sel("setImportsGraphics:"), 0);
+        this.setAllowsUndo(true);
+        this.setSmartSubstitutions(substitutions);
+        return;
+    }
+
+    ## Put a bezel border around the scroll view (like a text field's), or
+    ## none (the default).
+    pub func setBorder(on: bool): void {
+        var border = NO_BORDER;
+        if (on) {
+            border = BEZEL_BORDER;
+        }
+        msgI(this.area.handle, sel("setBorderType:"), border);
+        return;
+    }
+
+    ## Whether the scroll view has a border (any NSBorderType but none).
+    pub func hasBorder(): bool {
+        let border = msg(this.area.handle, sel("borderType"));
+        let has = border != NO_BORDER;
+        return has;
+    }
+
+    # ── scrollers (see the module header) ──
+
+    ## Use overlay scrollers (SCROLLER_OVERLAY: drawn over the text only
+    ## while it scrolls, no strip) or legacy ones (SCROLLER_LEGACY: a strip
+    ## beside the text), whatever the system setting. Throws ValueError for
+    ## any other value. AppKit applies the system setting again when the user
+    ## changes it.
+    pub func setScrollerStyle(style: int): void {
+        if (style != SCROLLER_LEGACY and style != SCROLLER_OVERLAY) {
+            throw ValueError("TextArea.setScrollerStyle: " + style.to_string()
+                + " is not SCROLLER_LEGACY (0) or SCROLLER_OVERLAY (1)");
+        }
+        msgI(this.area.handle, sel("setScrollerStyle:"), style);
+        return;
+    }
+
+    ## The scroller style in use: SCROLLER_LEGACY or SCROLLER_OVERLAY (the
+    ## system setting unless `setScrollerStyle` chose one).
+    pub func scrollerStyle(): int {
+        let style = msg(this.area.handle, sel("scrollerStyle"));
+        return style;
+    }
+
+    ## Which scrollers the area has: `vertical` (the default: true) and
+    ## `horizontal` (false: the text wraps to the width).
+    pub func setScrollers(vertical: bool, horizontal: bool): void {
+        msgI(this.area.handle, sel("setHasVerticalScroller:"), boolArg(vertical));
+        msgI(this.area.handle, sel("setHasHorizontalScroller:"), boolArg(horizontal));
+        return;
+    }
+
+    ## Whether the area has a vertical scroller (it may be hidden: see
+    ## `setAutohidesScrollers`).
+    pub func hasVerticalScroller(): bool {
+        let on = boolOf(this.area.handle, "hasVerticalScroller");
+        return on;
+    }
+
+    ## Whether the area has a horizontal scroller.
+    pub func hasHorizontalScroller(): bool {
+        let on = boolOf(this.area.handle, "hasHorizontalScroller");
+        return on;
+    }
+
+    ## Hide a scroller while the whole text fits (true), or keep it shown
+    ## (false, a scrollableTextView's default; with legacy scrollers that is
+    ## an empty strip beside short text).
+    pub func setAutohidesScrollers(on: bool): void {
+        msgI(this.area.handle, sel("setAutohidesScrollers:"), boolArg(on));
+        return;
+    }
+
+    ## Whether scrollers hide while the text fits.
+    pub func autohidesScrollers(): bool {
+        let on = boolOf(this.area.handle, "autohidesScrollers");
+        return on;
+    }
+
+    ## Whether the vertical scroller is shown (it exists and is not
+    ## auto-hidden; with overlay scrollers it counts as shown even while it
+    ## is faded out). Lays the text out first, so the answer is the one the
+    ## next drawing shows.
+    pub func verticalScrollerShown(): bool {
+        msgV(this.area.handle, sel("layoutSubtreeIfNeeded"));
+        msgV(this.area.handle, sel("tile"));
+        let scroller = msg(this.area.handle, sel("verticalScroller"));
+        if (scroller == 0) {
+            return false;
+        }
+        if (not this.hasVerticalScroller()) {
+            return false;
+        }
+        let hidden = boolOf(scroller, "isHidden");
+        let shown = not hidden;
+        return shown;
+    }
+
+    ## The margin between the text and the view's edges, in points: `w` on
+    ## the left and right, `h` at the top and bottom (textContainerInset).
+    pub func setTextInset(w: float, h: float): void {
+        msgDD(this.textView, sel("setTextContainerInset:"), w, h);
+        return;
+    }
+
+    ## The text inset (`x` the horizontal, `y` the vertical margin).
+    pub func textInset(): Rect {
+        let p = point_of(this.textView, "textContainerInset");
+        return p;
+    }
+
+    # ── selection (UTF-16 units; see the module header) ──
+
+    ## The length of the text in UTF-16 code units (AppKit's count; see
+    ## `utf16Offset`).
+    pub func utf16Length(): int {
+        let n = msg(msg(this.textView, sel("string")), sel("length"));
+        return n;
+    }
+
+    ## Throw ValueError unless (location, length) lies inside the text.
+    func checkRange(what: string, location: int, length: int): void {
+        let n = this.utf16Length();
+        if (location < 0 or length < 0 or location + length > n) {
+            throw ValueError("TextArea." + what + ": the range (" + location.to_string() + ", "
+                + length.to_string() + ") is outside the text (" + n.to_string() + " UTF-16 units)");
+        }
+        return;
+    }
+
+    ## The selection (the first range of a multiple selection), in UTF-16
+    ## units; `length` is 0 for an insertion point.
+    pub func selectedRange(): TextRange {
+        let ranges = msg(this.textView, sel("selectedRanges"));
+        let value = msg(ranges, sel("firstObject"));
+        if (value == 0) {
+            let none = TextRange(location = 0, length = 0);
+            return none;
+        }
+        # An NSRange result cannot come back through objc_msgSend: the
+        # NSValue writes its two integers into memory.
+        let buf = malloc(16);
+        msgII(value, sel("getValue:size:"), buf, 16);
+        let location = Volatile[int].at(buf).read();
+        let length = Volatile[int].at(buf + 8).read();
+        free(buf);
+        let r = TextRange(location = location, length = length);
+        return r;
+    }
+
+    ## Select `length` UTF-16 units from `location` (length 0: put the
+    ## insertion point there). Does not scroll (see scrollRangeToVisible).
+    ## Throws ValueError for a range outside the text.
+    pub func setSelectedRange(location: int, length: int): void {
+        this.checkRange("setSelectedRange", location, length);
+        # An NSRange argument is two integers (location, length).
+        msgII(this.textView, sel("setSelectedRange:"), location, length);
+        return;
+    }
+
+    ## The selected text ("" for an insertion point).
+    pub func selectedText(): string {
+        let r = this.selectedRange();
+        if (r.length == 0) {
+            return "";
+        }
+        let ns = msgII(msg(this.textView, sel("string")), sel("substringWithRange:"), r.location, r.length);
+        let t = str_of(ns);
+        return t;
+    }
+
+    ## Scroll so that the range (UTF-16 units) is visible. Throws ValueError
+    ## for a range outside the text.
+    pub func scrollRangeToVisible(location: int, length: int): void {
+        this.checkRange("scrollRangeToVisible", location, length);
+        msgII(this.textView, sel("scrollRangeToVisible:"), location, length);
+        return;
+    }
+
+    ## Select the whole text (as ⌘A).
+    pub func selectAll(): void {
+        msgI(this.textView, sel("selectAll:"), 0);
+        return;
+    }
+
+    ## Put the insertion point at the start of the text and scroll there.
+    pub func moveToStart(): void {
+        msgI(this.textView, sel("moveToBeginningOfDocument:"), 0);
+        return;
+    }
+
+    ## Put the insertion point at the end of the text and scroll there.
+    pub func moveToEnd(): void {
+        msgI(this.textView, sel("moveToEndOfDocument:"), 0);
+        return;
+    }
+
+    # ── undo ──
+
+    ## The text view's undo manager (its window's; 0 outside a window).
+    func undoManager(): int {
+        let um = msg(this.textView, sel("undoManager"));
+        return um;
+    }
+
+    ## Whether Undo would undo something (false outside a window or with
+    ## `allowsUndo` off).
+    pub func canUndo(): bool {
+        let um = this.undoManager();
+        if (um == 0) {
+            return false;
+        }
+        let can = boolOf(um, "canUndo");
+        return can;
+    }
+
+    ## Whether Redo would redo something.
+    pub func canRedo(): bool {
+        let um = this.undoManager();
+        if (um == 0) {
+            return false;
+        }
+        let can = boolOf(um, "canRedo");
+        return can;
+    }
+
+    ## Undo the last undo step, as Edit ▸ Undo does (the window's undo
+    ## manager: it closes an open step first). Returns false when there was
+    ## nothing to undo. `onEdited` runs afterwards when the text changed.
+    pub func undo(): bool {
+        if (not this.canUndo()) {
+            return false;
+        }
+        msgV(this.textView, sel("breakUndoCoalescing"));
+        msgV(this.undoManager(), sel("undo"));
+        return true;
+    }
+
+    ## Redo the last undone step, as Edit ▸ Redo does. Returns false when
+    ## there was nothing to redo.
+    pub func redo(): bool {
+        if (not this.canRedo()) {
+            return false;
+        }
+        msgV(this.undoManager(), sel("redo"));
+        return true;
+    }
+
+    ## End the current run of typing: what is typed next becomes a separate
+    ## Undo (NSTextView joins consecutive typing into one). Call it after a
+    ## save, so one Undo returns to the saved text.
+    pub func breakUndoCoalescing(): void {
+        msgV(this.textView, sel("breakUndoCoalescing"));
+        return;
+    }
+
+    ## Close the current undo step, as the end of a key press does: break
+    ## the typing coalescing and end the event's automatic undo group. Edits
+    ## after it undo separately. For self-tests, whose steps all run within
+    ## one event (see the module header). It calls the undo manager's own
+    ## end-of-event step (`_processEndOfEventNotification:`, what AppKit runs
+    ## after each event; a private method, used only when the undo manager
+    ## answers it), else ends the open group and opens the next one itself
+    ## (then the step just closed is followed by an empty one, which costs an
+    ## extra Undo when nothing is typed after it).
+    pub func endUndoStep(): void {
+        msgV(this.textView, sel("breakUndoCoalescing"));
+        let um = this.undoManager();
+        if (um == 0) {
+            return;
+        }
+        let by_event = boolOf(um, "groupsByEvent");
+        if (not by_event) {
+            return;
+        }
+        let end_of_event = sel("_processEndOfEventNotification:");
+        let answers = msgI(um, sel("respondsToSelector:"), end_of_event) & 255;
+        if (answers != 0) {
+            msgI(um, end_of_event, 0);
+            return;
+        }
+        let level = msg(um, sel("groupingLevel"));
+        if (level == 1) {
+            msgV(um, sel("endUndoGrouping"));
+            msgV(um, sel("beginUndoGrouping"));
+        }
+        return;
+    }
+
+    ## Forget every undo and redo step (after loading a file, when the old
+    ## steps belong to a different text). This clears the window's undo
+    ## manager, which the window's other text views and fields share.
+    pub func clearUndoHistory(): void {
+        msgV(this.textView, sel("breakUndoCoalescing"));
+        let um = this.undoManager();
+        if (um != 0) {
+            msgV(um, sel("removeAllActions"));
+        }
+        return;
+    }
+
+    ## Insert `text` at the insertion point, replacing the selection, as
+    ## typing would (runs `onChange` / `onEdited`; one undo step with the
+    ## typing around it unless `endUndoStep` / `breakUndoCoalescing` comes
+    ## between).
+    pub func insert(text: string): void {
+        # The range {NSNotFound, 0} means "the current selection" (an NSRange is
+        # two integers: location, length).
+        msgIII(this.textView, sel("insertText:replacementRange:"), nsstr(text), NS_NOT_FOUND, 0);
+        return;
+    }
+
+    ## Give the text view the keyboard focus in its window.
+    pub func focus(): void {
+        let win = msg(this.textView, sel("window"));
+        if (win != 0) {
+            msgI(win, sel("makeFirstResponder:"), this.textView);
+        }
+        return;
+    }
+}

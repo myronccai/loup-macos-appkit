@@ -1,0 +1,640 @@
+@mode(host.native)
+
+# Probe for appkit.objc + appkit.app: window, raw controls, action dispatch,
+# text read-back, menus, timers, struct reads, snapshot — and the menu-bar,
+# key-equivalent, responder-chain, close / quit hook, window-size and
+# rendering APIs, each read back; and window state, appearance,
+# focus, the undo hook, hidden menu items, shifted keys as the keyboard sends
+# them, failing veto hooks, common-mode timers, the clock and the
+# executable's directory. `--self-test [png]` prints what every API
+# reports, writes the window to `<png>` when given, then quits.
+#
+# The self-test runs plain module functions that find the window and views in
+# module-level state; the only closures are handlers that count in globals.
+
+from appkit.objc import (cls, sel, nsstr, str_of, msg, msgV, msgI, msgII, msgIII, msgD, msgDDDD, rect_of);
+from appkit.app import (appInit, run, quit, after, every, isSelfTest, isQuietSelfTest, onAction,
+    onTextChange, nsApp, Window, View, Menu, MenuItem, addMenu, Timer, insertMenu, addMenuBefore,
+    menuBar, menuBarMenu, menuBarIndex, appMenu, editMenu, windowMenu, onStandardAction,
+    setStandardActionEnabled, onShouldQuit, shouldQuit, isDarkMode, Bitmap, Pixel, pixelHex,
+    setHandlerErrorsFatal, handlerErrorCount, uptimeSeconds, uptimeMs, executablePath, executableDir,
+    MOD_NONE, MOD_SHIFT, MOD_CONTROL, MOD_OPTION, MOD_COMMAND, MOD_SHIFT_COMMAND);
+
+var g_clicks: int = 0;
+var g_ticks: int = 0;
+var g_edits: int = 0;
+var g_menu_hits: int = 0;
+var g_saves: int = 0;
+var g_plain: int = 0;
+var g_ctrl: int = 0;
+var g_opt: int = 0;
+var g_shift_cmd: int = 0;
+var g_disabled_hits: int = 0;
+var g_copies: int = 0;
+var g_close_asks: int = 0;
+var g_allow_close: bool = false;
+var g_closed: int = 0;
+var g_quit_asks: int = 0;
+var g_allow_quit: bool = false;
+var g_wins: list[Window] = [];
+var g_button: int = 0;
+var g_swatch: int = 0;
+var g_tabs: int = 0;
+var g_field: int = 0;
+var g_label: int = 0;
+var g_table: int = 0;
+var g_translucent: int = 0;
+var g_hidden_hits: int = 0;
+var g_shift_y: int = 0;
+var g_bang: int = 0;
+var g_undos: int = 0;
+var g_redos: int = 0;
+var g_fail: bool = false;
+var g_default_ticks: int = 0;
+var g_common_ticks: int = 0;
+
+func yes(b: bool): string {
+    let s = b.to_string();
+    return s;
+}
+
+## The titles of the menu-bar items, joined with ", ".
+func barTitles(): string {
+    let bar = msg(nsApp(), sel("mainMenu"));
+    let n = msg(bar, sel("numberOfItems"));
+    var s = "";
+    var i = 0;
+    while (i < n) {
+        if (i > 0) { s = s + ", "; }
+        s = s + str_of(msg(msgI(bar, sel("itemAtIndex:"), i), sel("title")));
+        i = i + 1;
+    }
+    return s;
+}
+
+func buildMenus(): void {
+    let tools = Menu("Tools");
+    tools.addItem("Do Thing", "t", func(): void { global g_menu_hits; g_menu_hits = g_menu_hits + 1; });
+    let disabled = tools.addItem("Disabled", "", func(): void { global g_disabled_hits; g_disabled_hits = g_disabled_hits + 1; });
+    disabled.setEnabled(false);
+    let check = tools.addItem("Check", "", func(): void { return; });
+    check.setChecked(true);
+    addMenu(tools);
+
+    let file = Menu("File");
+    file.addItem("Save", "s", func(): void { global g_saves; g_saves = g_saves + 1; });
+    file.addItemWithModifiers("Plain", "p", MOD_NONE, func(): void { global g_plain; g_plain = g_plain + 1; });
+    file.addItemWithModifiers("Ctrl", "l", MOD_CONTROL, func(): void { global g_ctrl; g_ctrl = g_ctrl + 1; });
+    let opt = file.addItem("Opt", "", func(): void { global g_opt; g_opt = g_opt + 1; });
+    opt.setKeyEquivalent("o", MOD_OPTION);
+    file.addItem("Shift Cmd", "K", func(): void { global g_shift_cmd; g_shift_cmd = g_shift_cmd + 1; });
+    file.addItemWithModifiers("Shift Y", "y", MOD_SHIFT_COMMAND, func(): void { global g_shift_y; g_shift_y = g_shift_y + 1; });
+    file.addItemWithModifiers("Bang", "1", MOD_SHIFT_COMMAND, func(): void { global g_bang; g_bang = g_bang + 1; });
+    tools.addHiddenItem("Do Thing (Alias)", "j", MOD_COMMAND, func(): void { global g_hidden_hits; g_hidden_hits = g_hidden_hits + 1; });
+    insertMenu(file, 1);
+    addMenuBefore(Menu("Extras"), "Window");
+
+    onStandardAction("copy:", func(): void { global g_copies; g_copies = g_copies + 1; });
+    onShouldQuit(func(): bool {
+        global g_quit_asks;
+        g_quit_asks = g_quit_asks + 1;
+        return g_allow_quit;
+    });
+    return;
+}
+
+func probeMenus(): void {
+    println("-- menus");
+    println("bar: " + barTitles());
+    let bar = msg(nsApp(), sel("mainMenu"));
+    println("itemWithTitle Edit found: " + yes(msgI(bar, sel("itemWithTitle:"), nsstr("Edit")) != 0));
+    println("menuBarIndex File / Window / Nope: " + menuBarIndex("File").to_string() + " / "
+        + menuBarIndex("Window").to_string() + " / " + menuBarIndex("Nope").to_string());
+    println("app menu: " + appMenu().title() + ", last item " + appMenu().itemAt(appMenu().itemCount() - 1).title());
+    let edit = editMenu();
+    # (AppKit appends items of its own to a menu titled Edit: list ours.)
+    var titles = "";
+    var i = 0;
+    while (i < 7) {
+        let t = edit.itemAt(i).title();
+        if (t != "") { titles = titles + " " + t; } else { titles = titles + " |"; }
+        i = i + 1;
+    }
+    println("edit menu: " + edit.title() + ":" + titles + "; Redo key " + edit.itemWithTitle("Redo").keyEquivalent());
+    println("window menu item 1: " + windowMenu().itemAt(1).title());
+    println("menuBar is the main menu: " + yes(menuBar().handle == bar));
+    try {
+        menuBarMenu("Nope");
+        println("menuBarMenu Nope: no error");
+    } catch (ValueError as e) {
+        println("menuBarMenu Nope: ValueError");
+    }
+
+    let tools = menuBarMenu("Tools");
+    println("tools index of Check: " + tools.indexOfItem("Check").to_string() + ", of Nope: "
+        + tools.indexOfItem("Nope").to_string());
+    let disabled = tools.itemWithTitle("Disabled");
+    tools.update();
+    println("disabled after update: enabled " + yes(disabled.isEnabled()));
+    println("perform disabled: " + yes(disabled.perform()) + ", hits " + g_disabled_hits.to_string());
+    disabled.setEnabled(true);
+    tools.update();
+    println("re-enabled: enabled " + yes(disabled.isEnabled()) + ", perform " + yes(disabled.perform())
+        + ", hits " + g_disabled_hits.to_string());
+    let check = tools.itemWithTitle("Check");
+    println("checked: " + yes(check.checked()));
+    check.setChecked(false);
+    println("checked after setChecked(false): " + yes(check.checked()));
+    println("perform Do Thing: " + yes(tools.itemWithTitle("Do Thing").perform()) + ", hits "
+        + g_menu_hits.to_string());
+
+    let file = menuBarMenu("File");
+    let plain = file.itemWithTitle("Plain");
+    let ctrl = file.itemWithTitle("Ctrl");
+    let opt = file.itemWithTitle("Opt");
+    let shift_cmd = file.itemWithTitle("Shift Cmd");
+    println("keys: Save " + file.itemWithTitle("Save").keyEquivalent() + "/" + file.itemWithTitle("Save").modifiers().to_string()
+        + ", Plain " + plain.keyEquivalent() + "/" + plain.modifiers().to_string()
+        + ", Ctrl " + ctrl.keyEquivalent() + "/" + ctrl.modifiers().to_string()
+        + ", Opt " + opt.keyEquivalent() + "/" + opt.modifiers().to_string()
+        + ", Shift Cmd " + shift_cmd.keyEquivalent() + "/" + shift_cmd.modifiers().to_string());
+    println("mask constants: none " + MOD_NONE.to_string() + ", shift " + MOD_SHIFT.to_string()
+        + ", cmd " + MOD_COMMAND.to_string() + ", shift-cmd " + MOD_SHIFT_COMMAND.to_string());
+    return;
+}
+
+func probeKeys(): void {
+    println("-- keys");
+    let win = g_wins[0];
+    msgI(g_button, sel("setKeyEquivalent:"), nsstr("b"));
+    msgI(g_button, sel("setKeyEquivalentModifierMask:"), MOD_COMMAND);
+    let before = g_clicks;
+    println("cmd-b (button): " + yes(win.sendKey("b", MOD_COMMAND)) + ", clicks +" + (g_clicks - before).to_string());
+    println("cmd-s (Save): " + yes(win.sendKey("s", MOD_COMMAND)) + ", saves " + g_saves.to_string());
+    println("p (Plain): " + yes(win.sendKey("p", MOD_NONE)) + ", plain " + g_plain.to_string());
+    println("ctrl-l (Ctrl): " + yes(win.sendKey("l", MOD_CONTROL)) + ", ctrl " + g_ctrl.to_string());
+    println("opt-o (Opt): " + yes(win.sendKey("o", MOD_OPTION)) + ", opt " + g_opt.to_string());
+    println("shift-cmd-K (Shift Cmd): " + yes(win.sendKey("K", MOD_SHIFT_COMMAND)) + ", shift-cmd "
+        + g_shift_cmd.to_string());
+    println("ctrl-x (nothing): " + yes(win.sendKey("x", MOD_CONTROL)));
+    println("File menu cmd-s: " + yes(menuBarMenu("File").sendKey("s", MOD_COMMAND)) + ", saves "
+        + g_saves.to_string());
+    println("Tools menu cmd-s (not there): " + yes(menuBarMenu("Tools").sendKey("s", MOD_COMMAND)));
+    return;
+}
+
+func probeActions(): void {
+    println("-- standard actions");
+    let win = g_wins[0];
+    win.clearFocus();
+    println("first responder is the window: " + yes(msg(win.handle, sel("firstResponder")) == win.handle));
+    println("key window: " + yes(msg(nsApp(), sel("keyWindow")) != 0) + " (a quiet self-test has none)");
+    println("Edit > Copy: " + yes(editMenu().itemWithTitle("Copy").perform()) + ", copies " + g_copies.to_string());
+    println("cmd-c: " + yes(win.sendKey("c", MOD_COMMAND)) + ", copies " + g_copies.to_string());
+    println("sendAction copy: " + yes(win.sendAction("copy:")) + ", copies " + g_copies.to_string());
+    println("sendAction paste: (nobody) " + yes(win.sendAction("paste:")));
+    setStandardActionEnabled("copy:", false);
+    println("Copy disabled: perform " + yes(editMenu().itemWithTitle("Copy").perform()) + ", copies "
+        + g_copies.to_string());
+    setStandardActionEnabled("copy:", true);
+    println("Copy enabled: perform " + yes(editMenu().itemWithTitle("Copy").perform()) + ", copies "
+        + g_copies.to_string());
+    try {
+        onStandardAction("loupAction:", func(): void { return; });
+        println("onStandardAction loupAction: no error");
+    } catch (ValueError as e) {
+        println("onStandardAction loupAction: ValueError");
+    }
+    return;
+}
+
+func probeWindows(): void {
+    println("-- windows");
+    let win = g_wins[0];
+    println("resizable: " + yes(win.isResizable()));
+    win.setResizable(false);
+    println("after setResizable(false): " + yes(win.isResizable()) + ", style " + msg(win.handle, sel("styleMask")).to_string());
+    win.setResizable(true);
+    println("after setResizable(true): " + yes(win.isResizable()) + ", style " + msg(win.handle, sel("styleMask")).to_string());
+
+    g_wins.push(Window("Second", 200.0, 100.0));
+    let second = g_wins[1];
+    let box = View(msg(cls("NSView"), sel("new")));
+    box.setWidth(240.0);
+    box.setHeight(120.0);
+    second.setContent(box);
+    second.setContentSize(300.0, 150.0);
+    let cs = second.contentSize();
+    println("second setContentSize: " + cs.w.to_string() + " x " + cs.h.to_string());
+    second.fitToContent();
+    let fs = second.contentSize();
+    println("second fitToContent: " + fs.w.to_string() + " x " + fs.h.to_string());
+    second.center();
+    second.onClose(func(): void { global g_closed; g_closed = g_closed + 1; });
+    second.onShouldClose(func(): bool {
+        global g_close_asks;
+        g_close_asks = g_close_asks + 1;
+        return g_allow_close;
+    });
+    second.show();
+    println("second shouldClose: " + yes(second.shouldClose()) + ", asks " + g_close_asks.to_string());
+    println("second cmd-w (refused): " + yes(second.sendKey("w", MOD_COMMAND)) + ", visible "
+        + yes((msg(second.handle, sel("isVisible")) & 255) != 0) + ", asks " + g_close_asks.to_string());
+    println("second performClose (refused): " + yes(second.performClose()) + ", asks " + g_close_asks.to_string());
+    g_allow_close = true;
+    println("Window > Close (allowed): " + yes(windowMenu().itemWithTitle("Close").perform()) + ", visible "
+        + yes((msg(second.handle, sel("isVisible")) & 255) != 0) + ", asks " + g_close_asks.to_string()
+        + ", onClose " + g_closed.to_string());
+    win.show();
+    println("main shouldClose (no hook): " + yes(win.shouldClose()));
+
+    println("shouldQuit (refused): " + yes(shouldQuit()) + ", asks " + g_quit_asks.to_string());
+    g_allow_quit = true;
+    println("shouldQuit (allowed): " + yes(shouldQuit()) + ", asks " + g_quit_asks.to_string());
+
+    let appearance = str_of(msg(msg(nsApp(), sel("effectiveAppearance")), sel("name")));
+    println("isDarkMode agrees with the appearance: " + yes(isDarkMode() == appearance.contains("Dark")));
+    return;
+}
+
+## An NSView whose layer is filled with the sRGB color (r, g, b) (0..1).
+func swatch(r: float, g: float, b: float): View {
+    let v = View(msg(cls("NSView"), sel("new")));
+    msgI(v.handle, sel("setWantsLayer:"), 1);
+    let color = msgDDDD(cls("NSColor"), sel("colorWithSRGBRed:green:blue:alpha:"), r, g, b, 1.0);
+    msgI(msg(v.handle, sel("layer")), sel("setBackgroundColor:"), msg(color, sel("CGColor")));
+    return v;
+}
+
+## Whether a pixel of row `py` between columns x0 and x1 of `bitmap` is
+## not opaque — a hole through the window: how NSTabView's tab-strip
+## cut-out (a `destOut` layer) used to come out of a window render (viewers
+## show the hole as a white capsule).
+func rowHasHole(bitmap: Bitmap, py: int, x0: int, x1: int): bool {
+    var x = x0;
+    while (x < x1) {
+        let p = bitmap.pixelAt(x, py);
+        if (p.a != 255) {
+            return true;
+        }
+        x = x + 1;
+    }
+    return false;
+}
+
+func probeRender(): void {
+    println("-- rendering");
+    let win = g_wins[0];
+    let sw = View(g_swatch);
+    let bitmap = sw.render();
+    let scale = bitmap.scale();
+    let size = bitmap.pointSize();
+    println("swatch size: " + size.x.to_string() + " x " + size.y.to_string() + ", pixels match the scale: "
+        + yes(bitmap.width() == ((100.0 * scale) as int) and bitmap.height() == ((60.0 * scale) as int))
+        + ", flipped " + yes(bitmap.flipped));
+    println("bottom (10, 10): " + pixelHex(bitmap.colorAt(10.0, 10.0)));
+    println("top (10, 50): " + pixelHex(bitmap.colorAt(10.0, 50.0)));
+    let corner = bitmap.pixelAt(0, 0);
+    println("pixel (0, 0) top-left: " + pixelHex(corner) + " alpha " + corner.a.to_string());
+    try {
+        bitmap.colorAt(100.0, 0.0);
+        println("colorAt outside: no error");
+    } catch (ValueError as e) {
+        println("colorAt outside: ValueError");
+    }
+    bitmap.release();
+    println("View.colorAt (90, 5): " + pixelHex(sw.colorAt(90.0, 5.0)));
+
+    var dir = "/tmp";
+    let tmp = env("TMPDIR");
+    if (tmp != None) { dir = tmp.unwrap(); }
+    let path = dir + "/loup-core-probe-swatch.png";
+    sw.snapshot(path);
+    let loaded = msgI(cls("NSBitmapImageRep"), sel("imageRepWithContentsOfFile:"), nsstr(path));
+    println("snapshot written: " + yes(loaded != 0));
+    if (loaded != 0) {
+        let file_bitmap = Bitmap(loaded, false);
+        let space = msg(loaded, sel("colorSpace"));
+        let srgb = msg(cls("NSColorSpace"), sel("sRGBColorSpace"));
+        let same = (msgI(space, sel("isEqual:"), srgb) & 255) != 0;
+        let same_profile = (msgI(msg(space, sel("ICCProfileData")), sel("isEqual:"), msg(srgb, sel("ICCProfileData"))) & 255) != 0;
+        println("snapshot color space is sRGB: " + yes(same or same_profile));
+        println("snapshot bottom-left pixel: " + pixelHex(file_bitmap.pixelAt(0, file_bitmap.height() - 1))
+            + ", top-left: " + pixelHex(file_bitmap.pixelAt(0, 0)));
+    }
+    msgII(msg(cls("NSFileManager"), sel("defaultManager")), sel("removeItemAtPath:error:"), nsstr(path), 0);
+
+    # NSTabView's tab strip: no longer a hole (a white capsule in viewers) in
+    # a render of the window (the content and the tab view alone always drew
+    # it).
+    let tabs = View(g_tabs);
+    let tf = tabs.frame();
+    let strip = msgI(msg(g_tabs, sel("subviews")), sel("objectAtIndex:"), 1);
+    let sf = rect_of(strip, "frame");
+    let wb = win.render();
+    let s = wb.scale();
+    # The strip's middle, from the window's bottom (a tab view counts y down
+    # from its own top), then as a pixel row from the bitmap's top.
+    let y = tf.y + tf.h - (sf.y + sf.h / 2.0);
+    var row = ((wb.pointSize().y - y) * s) as int;
+    if (wb.flipped) {
+        row = (y * s) as int;
+    }
+    # The middle half of the strip (clear of its rounded ends).
+    let x0 = ((tf.x + sf.x + sf.w / 4.0) * s) as int;
+    let x1 = ((tf.x + sf.x + sf.w * 3.0 / 4.0) * s) as int;
+    println("window render taller than the content: " + yes(wb.pointSize().y > win.contentSize().h)
+        + ", hole at the tab strip: " + yes(rowHasHole(wb, row, x0, x1)));
+    wb.release();
+    return;
+}
+
+func probeHiddenAndShifted(): void {
+    println("-- hidden items and shifted keys");
+    let win = g_wins[0];
+    let alias = menuBarMenu("Tools").itemWithTitle("Do Thing (Alias)");
+    println("hidden item: hidden " + yes(alias.isHidden()) + ", key works hidden " + yes(alias.allowsKeyEquivalentWhenHidden()));
+    println("cmd-j (hidden item): " + yes(win.sendKey("j", MOD_COMMAND)) + ", hits " + g_hidden_hits.to_string());
+    alias.setAllowsKeyEquivalentWhenHidden(false);
+    println("cmd-j (hidden, key off): " + yes(win.sendKey("j", MOD_COMMAND)) + ", hits " + g_hidden_hits.to_string());
+    alias.setHidden(false);
+    println("cmd-j (shown): " + yes(win.sendKey("j", MOD_COMMAND)) + ", hits " + g_hidden_hits.to_string()
+        + ", hidden " + yes(alias.isHidden()));
+    println("shift-cmd-y (item y + shift-cmd): " + yes(win.sendKey("y", MOD_SHIFT_COMMAND)) + ", hits "
+        + g_shift_y.to_string());
+    println("shift-cmd-Y: " + yes(win.sendKey("Y", MOD_SHIFT_COMMAND)) + ", hits " + g_shift_y.to_string());
+    println("cmd-Y (upper case adds shift): " + yes(win.sendKey("Y", MOD_COMMAND)) + ", hits "
+        + g_shift_y.to_string());
+    println("cmd-y (no shift): " + yes(win.sendKey("y", MOD_COMMAND)) + ", hits " + g_shift_y.to_string());
+    println("shift-cmd-k (item K + cmd): " + yes(win.sendKey("k", MOD_SHIFT_COMMAND)) + ", shift-cmd "
+        + g_shift_cmd.to_string());
+    println("File menu shift-cmd-y: " + yes(menuBarMenu("File").sendKey("y", MOD_SHIFT_COMMAND)) + ", hits "
+        + g_shift_y.to_string());
+    println("shift-cmd-1 (item 1 + shift-cmd): " + yes(win.sendKey("1", MOD_SHIFT_COMMAND)) + ", bang "
+        + g_bang.to_string());
+    println("cmd-1 (no shift): " + yes(win.sendKey("1", MOD_COMMAND)) + ", bang " + g_bang.to_string());
+    return;
+}
+
+func probeWindowState(): void {
+    println("-- window state");
+    let win = g_wins[0];
+    println("visible: " + yes(win.isVisible()));
+    win.hide();
+    println("after hide: visible " + yes(win.isVisible()));
+    win.show();
+    println("after show: visible " + yes(win.isVisible()));
+    println("minSize unset: " + win.minSize().w.to_string() + " x " + win.minSize().h.to_string());
+    win.setMinSize(200.0, 150.0);
+    let m = win.minSize();
+    println("minSize: " + m.w.to_string() + " x " + m.h.to_string());
+    println("edited: " + yes(win.isDocumentEdited()));
+    win.setDocumentEdited(true);
+    println("after setDocumentEdited(true): " + yes(win.isDocumentEdited()));
+    win.setDocumentEdited(false);
+    println("after setDocumentEdited(false): " + yes(win.isDocumentEdited()));
+    let exe = executablePath();
+    let name = str_of(msg(nsstr(exe), sel("lastPathComponent")));
+    println("executable: " + name + ", executableDir + name is the path: " + yes(executableDir() + "/" + name == exe));
+    println("represented file: \"" + win.representedFilename() + "\"");
+    win.setRepresentedFilename(exe);
+    println("after setRepresentedFilename: is the executable " + yes(win.representedFilename() == exe));
+    win.setRepresentedFilename("");
+    println("cleared: \"" + win.representedFilename() + "\"");
+    return;
+}
+
+func probeAppearance(): void {
+    println("-- appearance");
+    let win = g_wins[0];
+    println("appearance: \"" + win.appearance() + "\"");
+    win.setAppearance("dark");
+    println("dark: " + win.appearance() + ", window dark " + yes(win.isDark()) + ", content dark "
+        + yes(win.content().isDark()));
+    win.setAppearance("light");
+    println("light: " + win.appearance() + ", window dark " + yes(win.isDark()) + ", content dark "
+        + yes(win.content().isDark()));
+    win.setAppearance("");
+    println("none: \"" + win.appearance() + "\", window follows the app " + yes(win.isDark() == isDarkMode())
+        + ", content too " + yes(win.content().isDark() == isDarkMode()));
+    try {
+        win.setAppearance("blue");
+        println("setAppearance blue: no error");
+    } catch (ValueError as e) {
+        println("setAppearance blue: ValueError");
+    }
+    # A label in white at 50% alpha: the render draws its text once (it was
+    # drawn twice, at 75%, by the label's private subview and its cell).
+    let label = View(g_translucent);
+    let bitmap = label.render();
+    let size = bitmap.pointSize();
+    let p = bitmap.colorAt(7.0, size.y / 2.0);
+    let once = p.a >= 120 and p.a <= 136;
+    println("translucent label text drawn once (alpha about 128): " + yes(once));
+    bitmap.release();
+    return;
+}
+
+func probeFocus(): void {
+    println("-- focus");
+    let win = g_wins[0];
+    let field = View(g_field);
+    let table = View(g_table);
+    let label = View(g_label);
+    println("focus field: " + yes(win.focus(field)) + ", field has it " + yes(win.hasFocus(field)) + ", table "
+        + yes(win.hasFocus(table)));
+    println("focus table: " + yes(win.focus(table)) + ", table has it " + yes(win.hasFocus(table)) + ", field "
+        + yes(win.hasFocus(field)));
+    println("focus label (refuses): " + yes(win.focus(label)) + ", table " + yes(win.hasFocus(table)));
+    win.clearFocus();
+    println("after clearFocus: table " + yes(win.hasFocus(table)) + ", field " + yes(win.hasFocus(field)));
+    return;
+}
+
+func probeUndo(): void {
+    println("-- undo");
+    let win = g_wins[0];
+    win.clearFocus();
+    try {
+        g_wins[1].registerUndo("Nothing");
+        println("registerUndo before onUndo: no error");
+    } catch (RuntimeError as e) {
+        println("registerUndo before onUndo: RuntimeError");
+    }
+    win.onUndo(func(): void { global g_undos; g_undos = g_undos + 1; },
+        func(): void { global g_redos; g_redos = g_redos + 1; });
+    println("canUndo at first: " + yes(win.canUndo()));
+    win.registerUndo("Draw Line");
+    println("registered: canUndo " + yes(win.canUndo()) + ", name " + win.undoActionName());
+    # (The window titles the items as it validates them: keep the MenuItem.)
+    let undo_item = editMenu().itemAt(0);
+    let redo_item = editMenu().itemAt(1);
+    println("Edit > Undo: " + yes(undo_item.perform()) + " \"" + undo_item.title() + "\", undos "
+        + g_undos.to_string() + ", canRedo " + yes(win.canRedo()) + ", redo name " + win.redoActionName());
+    println("Edit > Redo: " + yes(redo_item.perform()) + " \"" + redo_item.title() + "\", redos "
+        + g_redos.to_string() + ", undo name " + win.undoActionName());
+    win.registerUndo("Fill");
+    win.registerUndo("Erase");
+    println("two more steps: undo " + yes(win.undo()) + " -> next " + win.undoActionName() + ", undo "
+        + yes(win.undo()) + " -> next " + win.undoActionName() + ", undos " + g_undos.to_string());
+    println("shift-cmd-z (lower-case z): " + yes(win.sendKey("z", MOD_SHIFT_COMMAND)) + ", redos "
+        + g_redos.to_string() + ", undo name " + win.undoActionName());
+    println("cmd-z: " + yes(win.sendKey("z", MOD_COMMAND)) + ", undos " + g_undos.to_string());
+    println("cmd-z: " + yes(win.sendKey("z", MOD_COMMAND)) + ", undos " + g_undos.to_string() + ", canUndo "
+        + yes(win.canUndo()));
+    println("Edit > Undo with nothing to undo: " + yes(undo_item.perform()) + " \"" + undo_item.title()
+        + "\", undos " + g_undos.to_string());
+    win.clearUndo();
+    println("after clearUndo: canUndo " + yes(win.canUndo()) + ", canRedo " + yes(win.canRedo()));
+    return;
+}
+
+func probeFailingVetoes(): void {
+    println("-- failing veto hooks");
+    let win = g_wins[0];
+    setHandlerErrorsFatal(false);
+    let errors = handlerErrorCount();
+    win.onShouldClose(func(): bool {
+        if (g_fail) {
+            throw RuntimeError("the save failed");
+        }
+        return true;
+    });
+    onShouldQuit(func(): bool {
+        if (g_fail) {
+            throw RuntimeError("the save failed");
+        }
+        return true;
+    });
+    g_fail = true;
+    println("throwing should-close: performClose " + yes(win.performClose()) + ", visible " + yes(win.isVisible()));
+    println("throwing should-quit: shouldQuit " + yes(shouldQuit()));
+    g_fail = false;
+    println("errors reported: " + (handlerErrorCount() - errors).to_string());
+    println("not throwing: shouldClose " + yes(win.shouldClose()) + ", shouldQuit " + yes(shouldQuit()));
+    setHandlerErrorsFatal(true);
+    return;
+}
+
+func probeTimers(): void {
+    println("-- timers and clock");
+    let t0 = uptimeSeconds();
+    let m0 = uptimeMs();
+    let diff = m0 - ((t0 * 1000.0) as int);
+    println("uptimeMs agrees with uptimeSeconds: " + yes(diff >= -50 and diff <= 50));
+    let plain = every(0.01, func(): void { global g_default_ticks; g_default_ticks = g_default_ticks + 1; });
+    let common = every(0.01, func(): void { global g_common_ticks; g_common_ticks = g_common_ticks + 1; });
+    common.runInCommonModes();
+    println("in common modes: every " + yes(plain.isInCommonModes()) + ", runInCommonModes " + yes(common.isInCommonModes()));
+    # Run the event loop as menu tracking does, for 0.2 s.
+    let run_loop = msg(cls("NSRunLoop"), sel("currentRunLoop"));
+    let end = uptimeSeconds() + 0.2;
+    while (uptimeSeconds() < end) {
+        let until = msgD(cls("NSDate"), sel("dateWithTimeIntervalSinceNow:"), 0.05);
+        msgII(run_loop, sel("runMode:beforeDate:"), nsstr("NSEventTrackingRunLoopMode"), until);
+    }
+    println("while a menu tracks: common-modes timer fired " + yes(g_common_ticks > 0) + ", default timer fired "
+        + yes(g_default_ticks > 0));
+    plain.stop();
+    common.stop();
+    println("stopped: valid " + yes(common.isValid()) + ", in common modes " + yes(common.isInCommonModes()));
+    println("the clock moved on: " + yes(uptimeSeconds() > t0));
+    return;
+}
+
+func newTabView(): View {
+    let t = msgDDDD(msg(cls("NSTabView"), sel("alloc")), sel("initWithFrame:"), 0.0, 0.0, 200.0, 90.0);
+    let titles = ["One", "Two"];
+    for (title in titles) {
+        let item = msgI(msg(cls("NSTabViewItem"), sel("alloc")), sel("initWithIdentifier:"), 0);
+        msgI(item, sel("setLabel:"), nsstr(title));
+        msgI(t, sel("addTabViewItem:"), item);
+    }
+    let v = View(t);
+    return v;
+}
+
+pub func main(): void {
+    appInit("Core Probe");
+    g_wins.push(Window("Core Probe", 360.0, 330.0));
+    let win = g_wins[0];
+
+    let label = View(msgI(cls("NSTextField"), sel("labelWithString:"), nsstr("héllo ✓")));
+    win.add(label, 20.0, 150.0, 300.0, 24.0);
+
+    let field = View(msgI(cls("NSTextField"), sel("textFieldWithString:"), nsstr("typed text")));
+    win.add(field, 20.0, 110.0, 300.0, 24.0);
+    g_field = field.handle;
+    g_label = label.handle;
+
+    # A table (focusable) and a label in white at 50% alpha (the render check).
+    let table = View(msg(cls("NSTableView"), sel("new")));
+    msgI(table.handle, sel("addTableColumn:"), msgI(msg(cls("NSTableColumn"), sel("alloc")),
+        sel("initWithIdentifier:"), nsstr("only")));
+    win.add(table, 260.0, 60.0, 80.0, 30.0);
+    g_table = table.handle;
+    let translucent = View(msgI(cls("NSTextField"), sel("labelWithString:"), nsstr("\u{2588}\u{2588}\u{2588}")));
+    let white = msgDDDD(cls("NSColor"), sel("colorWithSRGBRed:green:blue:alpha:"), 1.0, 1.0, 1.0, 0.5);
+    msgI(translucent.handle, sel("setTextColor:"), white);
+    win.add(translucent, 260.0, 20.0, 80.0, 24.0);
+    g_translucent = translucent.handle;
+    onTextChange(field.handle, func(): void { global g_edits; g_edits = g_edits + 1; });
+
+    let button = View(msgIII(cls("NSButton"), sel("buttonWithTitle:target:action:"), nsstr("Press"), 0, 0));
+    win.add(button, 20.0, 60.0, 100.0, 32.0);
+    onAction(button.handle, func(): void { global g_clicks; g_clicks = g_clicks + 1; });
+    g_button = button.handle;
+
+    # A 100 × 60 swatch: teal (#2A9D8F) with a red (#E63946) top half.
+    let sw = swatch(0.1647, 0.6157, 0.5608);
+    win.add(sw, 140.0, 10.0, 100.0, 60.0);
+    let top = swatch(0.902, 0.2235, 0.2745);
+    top.setFrame(0.0, 30.0, 100.0, 30.0);
+    sw.addSubview(top);
+    g_swatch = sw.handle;
+
+    let tabs = newTabView();
+    win.add(tabs, 20.0, 190.0, 300.0, 120.0);
+    g_tabs = tabs.handle;
+
+    buildMenus();
+    let tools = menuBarMenu("Tools");
+
+    let ticker = every(0.05, func(): void { global g_ticks; g_ticks = g_ticks + 1; });
+
+    if (isSelfTest()) {
+        after(0.5, func(): void {
+            msgI(button.handle, sel("performClick:"), 0);
+            msgI(button.handle, sel("performClick:"), 0);
+            println("clicks: " + g_clicks.to_string());
+            println("label: " + str_of(msg(label.handle, sel("stringValue"))));
+            println("field: " + str_of(msg(field.handle, sel("stringValue"))));
+            msgI(field.handle, sel("setStringValue:"), nsstr("changed ✓"));
+            println("field now: " + str_of(msg(field.handle, sel("stringValue"))));
+            let f = button.frame();
+            println("button frame: " + f.x.to_string() + " " + f.y.to_string() + " " + f.w.to_string() + " " + f.h.to_string());
+            let cs = win.contentSize();
+            println("content: " + cs.w.to_string() + " x " + cs.h.to_string());
+            msgI(tools.handle, sel("performActionForItemAtIndex:"), 0);
+            println("menu hits: " + g_menu_hits.to_string());
+            println("ticks > 3: " + (g_ticks > 3).to_string());
+            ticker.stop();
+            println("title: " + win.title());
+            probeMenus();
+            probeKeys();
+            probeActions();
+            probeWindows();
+            probeRender();
+            probeHiddenAndShifted();
+            probeWindowState();
+            probeAppearance();
+            probeFocus();
+            probeUndo();
+            probeFailingVetoes();
+            probeTimers();
+            if (runtime.args().len() > 1) { win.snapshot(runtime.args()[1]); }
+            quit();
+        });
+    }
+    run(win);
+}

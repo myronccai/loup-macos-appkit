@@ -1,0 +1,621 @@
+@mode(host.native)
+
+# Probe for appkit.table: a 3-column, 20-row TableView driven by Loup
+# closures, and a ListView. `--self-test [png]` drives every API and prints
+# what it observes (checked against selftest.out by run_all.sh --probes);
+# without it the window just runs.
+
+from appkit.objc import (cls, sel, nsstr, str_of, point_of, msg, msgV, msgI, msgII, msgRetD);
+from appkit.app import (appInit, run, quit, after, isSelfTest, Window, View);
+from appkit.table import (TableView, ListView, LIST_COLUMN, COLUMN_FIXED, COLUMN_AUTORESIZES,
+    COLUMN_USER_RESIZES, COLUMN_RESIZABLE, AUTORESIZE_NONE, AUTORESIZE_UNIFORM, AUTORESIZE_SEQUENTIAL,
+    AUTORESIZE_REVERSE_SEQUENTIAL, AUTORESIZE_LAST, AUTORESIZE_FIRST);
+from appkit.controls import (Font, monospacedDigitSystemFont, systemFontWithWeight, TEXT_RIGHT,
+    TEXT_CENTER, TEXT_NATURAL, WEIGHT_REGULAR, WEIGHT_SEMIBOLD);
+
+struct Row {
+    name: string;
+    kind: string;
+    size: int;
+}
+
+struct Task {
+    done: bool;
+    title: string;
+    prio: int;
+}
+
+var g_rows: list[Row] = [];
+var g_tasks: list[Task] = [];
+var g_tasks_h: int = 0;
+var g_log: list[string] = [];
+var g_status: int = 0;
+
+## Column alignment and fonts (appkit.controls names and Fonts), read back.
+func testColumnStyle(table: TableView, list: ListView): void {
+    println("size alignment: " + table.columnAlignment("size"));
+    table.setColumnAlignment("size", TEXT_RIGHT);
+    println("size setColumnAlignment(right): " + table.columnAlignment("size"));
+    table.setColumnAlignment("kind", TEXT_CENTER);
+    println("kind setColumnAlignment(center): " + table.columnAlignment("kind"));
+    var bad = "no error";
+    try {
+        table.setColumnAlignment("nope", TEXT_RIGHT);
+    } catch (ValueError as e) {
+        bad = "ValueError";
+    }
+    println("unknown column alignment: " + bad);
+    table.setColumnFont("size", monospacedDigitSystemFont(12.0, WEIGHT_REGULAR));
+    let size_font = table.columnFont("size");
+    println("size column font: " + size_font.size().to_string());
+    list.setCellFont(systemFontWithWeight(13.0, WEIGHT_SEMIBOLD));
+    println("list cell font semibold: " + (list.columnFont("item").weight() > 0.2).to_string()
+        + " size " + list.columnFont("item").size().to_string());
+    return;
+}
+
+func mkTask(done: bool, title: string, prio: int): Task {
+    let t = Task(done = done, title = title, prio = prio);
+    return t;
+}
+
+## The second table: a check-box column, a title and a priority. Its
+## closures read module-level state and the table's handle, not the proxy.
+func makeTasks(win: Window): TableView {
+    global g_tasks;
+    global g_tasks_h;
+    g_tasks = [];
+    g_tasks.push(mkTask(true, "Write the probe", 2));
+    g_tasks.push(mkTask(false, "Check the box", 1));
+    g_tasks.push(mkTask(false, "Sort the rows", 3));
+    g_tasks.push(mkTask(true, "Commit an edit", 2));
+    let tasks = TableView();
+    tasks.addCheckBoxColumn("done", "Done", 44.0);
+    tasks.addColumn("title", "Title", 200.0);
+    tasks.addColumn("prio", "Priority", 60.0);
+    g_tasks_h = tasks.handle;
+    tasks.setRowCount(func(): int { return g_tasks.len(); });
+    tasks.setCell(func(column: string, row: int): string {
+        let t = g_tasks[row];
+        if (column == "done") {
+            if (t.done) {
+                return "1";
+            }
+            return "0";
+        }
+        if (column == "title") {
+            return t.title;
+        }
+        return t.prio.to_string();
+    });
+    tasks.onToggle(func(column: string, row: int, checked: bool): void {
+        global g_tasks;
+        log("toggle " + column + " " + row.to_string() + " " + checked.to_string());
+        let old = g_tasks[row];
+        g_tasks[row] = mkTask(checked, old.title, old.prio);
+    });
+    tasks.onEdit(func(column: string, row: int, text: string): void {
+        global g_tasks;
+        log("task edit " + column + " " + row.to_string() + " '" + text + "'");
+        let old = g_tasks[row];
+        g_tasks[row] = mkTask(old.done, text, old.prio);
+    });
+    tasks.onHeaderClick(func(column: string): void { log("task header " + column); });
+    tasks.onSort(func(column: string, ascending: bool): void {
+        log("sort " + column + " ascending=" + ascending.to_string());
+        sortTasks(column, ascending);
+        msgV(g_tasks_h, sel("reloadData"));
+    });
+    tasks.onDoubleClick(func(row: int): void { log("task double-click " + row.to_string()); });
+    win.add(tasks.scroll, 20.0, 410.0, 600.0, 190.0);
+    return tasks;
+}
+
+func sortTasks(column: string, ascending: bool): void {
+    global g_tasks;
+    g_tasks.sort(func(a: Task, b: Task): int {
+        var d = 0;
+        if (column == "prio" and a.prio != b.prio) {
+            d = a.prio - b.prio;
+        } else if (a.title < b.title) {
+            d = -1;
+        } else if (a.title > b.title) {
+            d = 1;
+        }
+        if (not ascending) {
+            d = 0 - d;
+        }
+        return d;
+    });
+    return;
+}
+
+func rowsOf(tasks: TableView): string {
+    var parts: list[string] = [];
+    var r = 0;
+    while (r < tasks.rowCount()) {
+        var mark = "[ ]";
+        if (tasks.isChecked("done", r)) {
+            mark = "[x]";
+        }
+        parts.push(mark + " " + tasks.cellText("title", r) + " (" + tasks.cellText("prio", r) + ")");
+        r = r + 1;
+    }
+    let s = parts.join("; ");
+    return s;
+}
+
+## Run `step` and print "ValueError" or "no error".
+func expectValueError(name: string, step: fn(): void): void {
+    var r = "no error";
+    try {
+        step();
+    } catch (ValueError as e) {
+        r = "ValueError";
+    }
+    println(name + ": " + r);
+    return;
+}
+
+## The room the columns of `t` leave free in its visible width (points; the
+## table style's own padding when they fill it).
+func freeWidth(t: TableView): float {
+    let clip = msg(t.scroll.handle, sel("contentView"));
+    let visible = View(clip).frame().w;
+    let cols = msg(t.handle, sel("tableColumns"));
+    let n = msg(cols, sel("count"));
+    var total = 0.0;
+    var i = 0;
+    while (i < n) {
+        total = total + msgRetD(msgI(cols, sel("objectAtIndex:"), i), sel("width"));
+        i = i + 1;
+    }
+    let spacing = point_of(t.handle, "intercellSpacing").x * (n as float);
+    let free = visible - total - spacing;
+    return free;
+}
+
+func same(a: float, b: float): bool {
+    let d = a - b;
+    let s = d > -1.0 and d < 1.0;
+    return s;
+}
+
+## Check boxes, column sizing and resizing, header titles, the sort toggle
+## and the test hooks, read back.
+func testTasks(tasks: TableView, list: ListView): void {
+    println("-- tasks");
+    println("tasks: " + rowsOf(tasks));
+    println("done is check-box column: " + tasks.isCheckBoxColumn("done").to_string()
+        + ", title: " + tasks.isCheckBoxColumn("title").to_string());
+    println("cell done 0: " + tasks.cellText("done", 0) + " 1: " + tasks.cellText("done", 1));
+    tasks.clickCheckBox("done", 1);
+    flushLog();
+    println("checked 1 after click: " + tasks.isChecked("done", 1).to_string());
+    tasks.clickCheckBox("done", 0);
+    flushLog();
+    println("checked 0 after click: " + tasks.isChecked("done", 0).to_string());
+    tasks.setColumnEditable("done", false);
+    tasks.clickCheckBox("done", 2);
+    flushLog();
+    println("read-only box 2 after click: " + tasks.isChecked("done", 2).to_string());
+    tasks.setColumnEditable("done", true);
+    tasks.setEditable(false);
+    println("done editable after setEditable(false): " + (msg(tasks.column("done"), sel("isEditable")) & 255).to_string());
+    expectValueError("clickCheckBox on a text column", func(): void { tasks.clickCheckBox("title", 0); });
+    expectValueError("clickCheckBox row 9", func(): void { tasks.clickCheckBox("done", 9); });
+    expectValueError("isChecked on a text column", func(): void { tasks.isChecked("prio", 0); });
+
+    println("resizing done: " + tasks.columnResizing("done").to_string() + " title: "
+        + tasks.columnResizing("title").to_string());
+    tasks.setColumnResizing("prio", COLUMN_USER_RESIZES);
+    println("resizing prio: " + tasks.columnResizing("prio").to_string());
+    expectValueError("setColumnResizing(9)", func(): void { tasks.setColumnResizing("prio", 9); });
+    println("resizing constants: " + COLUMN_FIXED.to_string() + " " + COLUMN_AUTORESIZES.to_string() + " "
+        + COLUMN_USER_RESIZES.to_string() + " " + COLUMN_RESIZABLE.to_string());
+    tasks.setColumnWidthRange("title", 120.0, 400.0);
+    println("title range: " + tasks.columnMinWidth("title").to_string() + " .. " + tasks.columnMaxWidth("title").to_string());
+    tasks.setColumnWidthRange("prio", 40.0, 0.0);
+    println("prio range: " + tasks.columnMinWidth("prio").to_string() + " .. " + tasks.columnMaxWidth("prio").to_string());
+    expectValueError("setColumnWidthRange max < min", func(): void { tasks.setColumnWidthRange("prio", 50.0, 10.0); });
+    tasks.setColumnWidth("prio", 70.0);
+    println("prio width: " + tasks.columnWidth("prio").to_string());
+    tasks.setColumnWidth("title", 500.0);
+    println("title width capped at max: " + tasks.columnWidth("title").to_string());
+    tasks.setColumnWidth("title", 200.0);
+
+    println("autoresizing: " + tasks.columnAutoresizing().to_string());
+    tasks.setColumnAutoresizing(AUTORESIZE_SEQUENTIAL);
+    println("autoresizing now: " + tasks.columnAutoresizing().to_string());
+    tasks.setColumnAutoresizing(AUTORESIZE_UNIFORM);
+    expectValueError("setColumnAutoresizing(9)", func(): void { tasks.setColumnAutoresizing(9); });
+    println("autoresize constants: " + AUTORESIZE_NONE.to_string() + " " + AUTORESIZE_UNIFORM.to_string() + " "
+        + AUTORESIZE_SEQUENTIAL.to_string() + " " + AUTORESIZE_REVERSE_SEQUENTIAL.to_string() + " "
+        + AUTORESIZE_LAST.to_string() + " " + AUTORESIZE_FIRST.to_string());
+    tasks.setColumnWidthRange("title", 120.0, 0.0);
+    let free_start = freeWidth(tasks);
+    tasks.sizeColumnsToFit();
+    let free_fit = freeWidth(tasks);
+    println("sizeColumnsToFit fills the empty strip: " + (free_start > free_fit + 100.0).to_string()
+        + " (title grew: " + (tasks.columnWidth("title") > 300.0).to_string() + ")");
+    println("fixed done width after fit: " + tasks.columnWidth("done").to_string());
+    println("user-only prio width after fit: " + tasks.columnWidth("prio").to_string());
+    tasks.sizeColumnsToFit();
+    println("sizeColumnsToFit again changes nothing: " + same(freeWidth(tasks), free_fit).to_string());
+    tasks.setColumnWidth("title", 150.0);
+    println("narrowed title leaves a strip: " + (freeWidth(tasks) > free_fit + 100.0).to_string());
+    tasks.sizeLastColumnToFit();
+    println("sizeLastColumnToFit fills it again: " + same(freeWidth(tasks), free_fit).to_string()
+        + " (the last autoresizing column, title, grew: " + (tasks.columnWidth("title") > 300.0).to_string()
+        + "; user-only prio kept " + tasks.columnWidth("prio").to_string() + ")");
+    tasks.setColumnWidth("prio", 70.0);
+    tasks.sizeColumnsToFit();
+
+    println("title header: " + tasks.columnTitle("title"));
+    tasks.setColumnTitle("prio", "Prio");
+    println("prio header now: " + tasks.columnTitle("prio"));
+    expectValueError("columnTitle of an unknown column", func(): void { tasks.columnTitle("nope"); });
+
+    println("sort column before: '" + tasks.sortColumn() + "' ascending " + tasks.sortAscending().to_string());
+    tasks.clickHeader("title");
+    flushLog();
+    println("sorted: " + tasks.sortColumn() + " " + tasks.sortIndicator("title") + ": " + rowsOf(tasks));
+    tasks.clickHeader("title");
+    flushLog();
+    println("sorted: " + tasks.sortColumn() + " " + tasks.sortIndicator("title") + ": " + rowsOf(tasks));
+    tasks.clickHeader("prio");
+    flushLog();
+    println("sorted: " + tasks.sortColumn() + " " + tasks.sortIndicator("prio") + " title indicator '"
+        + tasks.sortIndicator("title") + "': " + rowsOf(tasks));
+    tasks.setColumnSortable("done", false);
+    tasks.clickHeader("done");
+    flushLog();
+    println("after unsortable done click: " + tasks.sortColumn() + " ascending " + tasks.sortAscending().to_string());
+    tasks.setSortIndicator("prio", false);
+    println("setSortIndicator(prio, descending): " + tasks.sortColumn() + " ascending " + tasks.sortAscending().to_string());
+    tasks.clickHeader("prio");
+    flushLog();
+    println("after click: ascending " + tasks.sortAscending().to_string());
+    expectValueError("clickHeader of an unknown column", func(): void { tasks.clickHeader("nope"); });
+
+    tasks.doubleClickRow(2);
+    flushLog();
+    tasks.setColumnEditable("title", true);
+    tasks.doubleClickRow(1);
+    flushLog();
+    println("editing after doubleClickRow on an editable column: " + tasks.isEditing().to_string());
+    expectValueError("doubleClickRow(9)", func(): void { tasks.doubleClickRow(9); });
+
+    tasks.commitEdit("title", 0, "Renamed task");
+    flushLog();
+    println("title 0 after commitEdit: " + tasks.cellText("title", 0) + " editing: " + tasks.isEditing().to_string());
+    tasks.commitEdit("title", 3, "Another");
+    flushLog();
+    println("title 3 after commitEdit: " + tasks.cellText("title", 3));
+    expectValueError("commitEdit on a read-only column", func(): void { tasks.commitEdit("prio", 0, "9"); });
+    expectValueError("commitEdit on a check-box column", func(): void { tasks.commitEdit("done", 0, "1"); });
+    expectValueError("commitEdit row 9", func(): void { tasks.commitEdit("title", 9, "x"); });
+
+    # A table in no window cannot open a field editor: commitEdit sends the
+    # value to the data source itself.
+    let loose = TableView();
+    loose.addColumn("c", "C", 80.0);
+    loose.setRowCount(func(): int { return 2; });
+    loose.setCell(func(column: string, row: int): string { return "r" + row.to_string(); });
+    loose.setEditable(true);
+    loose.onEdit(func(column: string, row: int, text: string): void {
+        log("loose edit " + column + " " + row.to_string() + " '" + text + "'");
+    });
+    loose.reload();
+    loose.commitEdit("c", 1, "no window");
+    flushLog();
+
+    println("-- list hooks");
+    println("LIST_COLUMN: " + LIST_COLUMN + " item 0: " + list.cellText(LIST_COLUMN, 0));
+    list.doubleClickRow(1);
+    flushLog();
+    list.setEditable(true);
+    list.onEdit(func(column: string, row: int, text: string): void {
+        log("list edit " + column + " " + row.to_string() + " '" + text + "'");
+    });
+    list.commitEdit(LIST_COLUMN, 0, "Omega");
+    flushLog();
+    list.setEditable(false);
+    return;
+}
+
+## clickRow (a real mouse-down / mouse-up) and onClick, read back.
+func testClicks(win: Window, table: TableView, list: ListView): void {
+    println("-- clicks");
+    table.setMultipleSelection(false);
+    table.deselectAll();
+    flushLog();
+    table.clickRow(5);
+    flushLog();
+    println("after clickRow(5): selected " + table.selectedRow().to_string() + ", clickedRow "
+        + msg(table.handle, sel("clickedRow")).to_string() + ", table has the focus "
+        + win.hasFocus(table).to_string());
+    table.clickRow(5);
+    flushLog();
+    println("clicking the selected row again: selected " + table.selectedRow().to_string());
+    table.setMultipleSelection(true);
+    table.selectRows([1, 2]);
+    flushLog();
+    table.clickRow(7);
+    flushLog();
+    println("clickRow(7) with rows 1 and 2 selected: " + ints(table.selectedRows()));
+    table.setMultipleSelection(false);
+    expectValueError("clickRow(99)", func(): void { table.clickRow(99); });
+    list.clickRow(2);
+    flushLog();
+    println("list after clickRow(2): " + list.selectedRow().to_string() + " '" + list.selectedItem() + "'");
+    # Not in a window: the row is selected and onClick runs directly.
+    let loose = TableView();
+    loose.addColumn("c", "C", 80.0);
+    loose.setRowCount(func(): int { return 3; });
+    loose.setCell(func(column: string, row: int): string { return "r" + row.to_string(); });
+    loose.onSelect(func(row: int): void { log("loose select " + row.to_string()); });
+    loose.onClick(func(row: int): void { log("loose click " + row.to_string()); });
+    loose.reload();
+    loose.clickRow(1);
+    flushLog();
+    println("loose selected: " + loose.selectedRow().to_string());
+    return;
+}
+
+func kindOf(i: int): string {
+    let kinds = ["text", "image", "audio", "video"];
+    let k = kinds[i % 4];
+    return k;
+}
+
+func makeRows(n: int): void {
+    global g_rows;
+    g_rows = [];
+    var i = 0;
+    while (i < n) {
+        g_rows.push(Row(name = "file" + (i + 1).to_string(), kind = kindOf(i), size = (i * 37 + 11) % 100));
+        i = i + 1;
+    }
+    return;
+}
+
+func log(line: string): void {
+    g_log.push(line);
+    return;
+}
+
+func setStatus(text: string): void {
+    msgI(g_status, sel("setStringValue:"), nsstr(text));
+    return;
+}
+
+func sortRows(column: string): void {
+    global g_rows;
+    g_rows.sort(func(a: Row, b: Row): int {
+        if (column == "size") {
+            let d = a.size - b.size;
+            return d;
+        }
+        var x = a.name;
+        var y = b.name;
+        if (column == "kind") {
+            x = a.kind;
+            y = b.kind;
+        }
+        if (x < y) {
+            return -1;
+        }
+        if (x > y) {
+            return 1;
+        }
+        return 0;
+    });
+    return;
+}
+
+func ints(xs: list[int]): string {
+    var parts: list[string] = [];
+    for (x in xs) {
+        parts.push(x.to_string());
+    }
+    let s = "[" + parts.join(", ") + "]";
+    return s;
+}
+
+func flushLog(): void {
+    global g_log;
+    for (line in g_log) {
+        println("  event: " + line);
+    }
+    g_log = [];
+    return;
+}
+
+pub func main(): void {
+    appInit("Table Probe");
+    let win = Window("Table Probe", 640.0, 620.0);
+    makeRows(20);
+
+    let table = TableView();
+    table.addColumn("name", "Name", 150.0);
+    table.addColumn("kind", "Kind", 110.0);
+    table.addColumn("size", "Size", 80.0);
+    table.setRowCount(func(): int { return g_rows.len(); });
+    table.setCell(func(column: string, row: int): string {
+        let r = g_rows[row];
+        if (column == "name") {
+            return r.name;
+        }
+        if (column == "kind") {
+            return r.kind;
+        }
+        return r.size.to_string() + " KB";
+    });
+    table.setAlternatingRows(true);
+    table.onSelect(func(row: int): void {
+        log("select " + row.to_string());
+        if (row >= 0) {
+            setStatus("Selected " + g_rows[row].name);
+        } else {
+            setStatus("No selection");
+        }
+    });
+    table.onDoubleClick(func(row: int): void { log("double-click " + row.to_string()); });
+    table.onClick(func(row: int): void { log("click " + row.to_string()); });
+    table.onEdit(func(column: string, row: int, text: string): void {
+        global g_rows;
+        log("edit " + column + " " + row.to_string() + " '" + text + "'");
+        if (column == "name") {
+            let old = g_rows[row];
+            g_rows[row] = Row(name = text, kind = old.kind, size = old.size);
+        }
+    });
+    table.onHeaderClick(func(column: string): void {
+        log("header " + column);
+        sortRows(column);
+        table.setSortIndicator(column, true);
+        table.reload();
+    });
+    win.add(table.scroll, 20.0, 50.0, 400.0, 350.0);
+
+    let list = ListView();
+    list.setItems(["Inbox", "Drafts", "Sent", "Archive", "Trash"]);
+    list.onSelect(func(row: int): void { log("list select " + row.to_string()); });
+    list.onDoubleClick(func(row: int): void { log("list double-click " + row.to_string()); });
+    list.onClick(func(row: int): void { log("list click " + row.to_string()); });
+    win.add(list.scroll, 440.0, 50.0, 180.0, 350.0);
+
+    let tasks = makeTasks(win);
+
+    g_status = msgI(cls("NSTextField"), sel("labelWithString:"), nsstr("No selection"));
+    win.add(View(g_status), 20.0, 16.0, 600.0, 22.0);
+
+    if (isSelfTest()) {
+        after(0.5, func(): void {
+            global g_rows;
+            println("columns: " + table.columnCount().to_string());
+            println("rows: " + table.rowCount().to_string());
+            println("column 'kind' exists: " + (table.column("kind") != 0).to_string());
+            println("column 'nope' exists: " + (table.column("nope") != 0).to_string());
+            println("width name: " + table.columnWidth("name").to_string());
+            println("cell name 0: " + table.cellText("name", 0));
+            println("cell kind 1: " + table.cellText("kind", 1));
+            println("cell size 19: " + table.cellText("size", 19));
+            println("cell out of range: '" + table.cellText("size", 99) + "'");
+            println("selected before: " + table.selectedRow().to_string());
+
+            table.selectRow(3);
+            println("selected after selectRow(3): " + table.selectedRow().to_string());
+            flushLog();
+
+            table.setMultipleSelection(true);
+            table.selectRows([1, 2, 5]);
+            println("selectedRows: " + ints(table.selectedRows()));
+            flushLog();
+            table.deselectAll();
+            println("after deselectAll: " + table.selectedRow().to_string());
+            flushLog();
+            table.setMultipleSelection(false);
+
+            # change the data behind the closures, then reload
+            makeRows(25);
+            g_rows[0] = Row(name = "README.md", kind = "text", size = 4);
+            println("rows before reload: " + table.rowCount().to_string());
+            table.reload();
+            println("rows after reload: " + table.rowCount().to_string());
+            println("cell name 0 after reload: " + table.cellText("name", 0));
+            println("cell name 24 after reload: " + table.cellText("name", 24));
+            table.scrollToRow(24);
+            table.scrollToRow(0);
+
+            # double-click: the table's real double action, sent programmatically
+            table.selectRow(4);
+            msgII(table.handle, sel("sendAction:to:"), msg(table.handle, sel("doubleAction")),
+                msg(table.handle, sel("target")));
+            flushLog();
+
+            # header click (the delegate message AppKit sends on a click)
+            msgII(msg(table.handle, sel("delegate")), sel("tableView:didClickTableColumn:"),
+                table.handle, table.column("size"));
+            flushLog();
+            println("sort indicator size: '" + table.sortIndicator("size") + "'");
+            println("sort indicator name: '" + table.sortIndicator("name") + "'");
+            println("first row after sort: " + table.cellText("name", 0) + " " + table.cellText("size", 0));
+            table.setSortIndicator("name", false);
+            println("sort indicator name (descending): '" + table.sortIndicator("name") + "'");
+            println("sort indicator size (cleared): '" + table.sortIndicator("size") + "'");
+            table.setSortIndicator("", true);
+            println("sort indicator name (all cleared): '" + table.sortIndicator("name") + "'");
+            sortRows("name");
+            table.setSortIndicator("name", true);
+            table.reload();
+
+            # editing: begin editing a cell, type, commit
+            table.setEditable(true);
+            table.setColumnEditable("size", false);
+            println("editable name: " + (msg(table.column("name"), sel("isEditable")) & 255).to_string());
+            println("editable size: " + (msg(table.column("size"), sel("isEditable")) & 255).to_string());
+            table.editCell("name", 2);
+            let editor = msg(table.handle, sel("currentEditor"));
+            println("editing: " + (editor != 0).to_string());
+            if (editor != 0) {
+                msgI(editor, sel("setString:"), nsstr("renamed.txt"));
+                msgI(win.handle, sel("makeFirstResponder:"), table.handle);
+            }
+            flushLog();
+            println("cell name 2 after edit: " + table.cellText("name", 2));
+            table.setEditable(false);
+            println("editable name after setEditable(false): " + (msg(table.column("name"), sel("isEditable")) & 255).to_string());
+
+            table.setColumnTitle("size", "Size (KB)");
+            println("size title: " + str_of(msg(msg(table.column("size"), sel("headerCell")), sel("stringValue"))));
+            println("alternating: " + table.alternatingRows().to_string());
+            table.setAlternatingRows(false);
+            println("alternating after off: " + table.alternatingRows().to_string());
+            table.setAlternatingRows(true);
+            table.setHeaderVisible(false);
+            println("header visible: " + table.headerVisible().to_string());
+            table.setHeaderVisible(true);
+            println("header visible again: " + table.headerVisible().to_string());
+            table.setGridLines(true);
+            println("grid mask: " + msg(table.handle, sel("gridStyleMask")).to_string());
+            table.setGridLines(false);
+            println("grid mask off: " + msg(table.handle, sel("gridStyleMask")).to_string());
+            table.setRowHeight(20.0);
+            println("row height: " + table.rowHeight().to_string());
+
+            # the list
+            println("list rows: " + list.rowCount().to_string());
+            println("list columns: " + list.columnCount().to_string());
+            println("list header visible: " + list.headerVisible().to_string());
+            println("list item 2: " + list.cellText("item", 2));
+            list.selectRow(2);
+            println("list selected: " + list.selectedRow().to_string() + " '" + list.selectedItem() + "'");
+            msgII(list.handle, sel("sendAction:to:"), msg(list.handle, sel("doubleAction")),
+                msg(list.handle, sel("target")));
+            flushLog();
+            list.setItems(["Alpha", "Beta", "Gamma", "Delta", "Epsilon", "Zeta"]);
+            let shown: list[string] = list.items();
+            println("list items: " + shown.join(","));
+            println("list rows after setItems: " + list.rowCount().to_string());
+            list.selectRow(4);
+            println("list selected: " + list.selectedRow().to_string() + " '" + list.selectedItem() + "'");
+            flushLog();
+
+            table.selectRow(3);
+            flushLog();
+            testColumnStyle(table, list);
+            testTasks(tasks, list);
+            testClicks(win, table, list);
+            let sf = table.scroll.frame();
+            println("scroll frame: " + sf.x.to_string() + " " + sf.y.to_string() + " " + sf.w.to_string() + " " + sf.h.to_string());
+            let argv = runtime.args();
+            if (argv.len() > 1) {
+                win.snapshot(argv[1]);
+            }
+            quit();
+        });
+    }
+    run(win);
+}

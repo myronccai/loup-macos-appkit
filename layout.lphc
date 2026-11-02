@@ -1,0 +1,1685 @@
+@mode(host.native)
+
+# appkit.layout — containers that lay their children out with Auto Layout, so
+# an app rarely positions a view by hand: VStack / HStack (NSStackView),
+# ScrollView, Box, TabView, SplitView, GridView, Separator, and helpers that
+# pin a view to its container or make it fill a window.
+#
+# Every container is an `appkit.app.View` (its `handle` is the Objective-C
+# object), so containers nest: a stack holds stacks, a tab holds a grid, a
+# window's content is a stack (`Window.setContent(stack)` — the window keeps
+# its content view sized to the window, and the stack lays its children out
+# inside it on every resize).
+#
+# Fitting. Every stack child is kept inside both cross-axis insets (a
+# `>=` constraint at priority 740 per edge), so `fittingSize` (and
+# `Window.fitToContent`) of a VStack includes the left AND right insets
+# whatever the alignment — NSStackView's own inset constraints for the edge
+# an alignment leaves free are only priority 250, which lost to the fitting
+# compression (a leading-aligned stack reported its width without the
+# trailing inset). A squeezed child still overflows into the inset rather
+# than shrinking (compression resistance 750 wins).
+#
+# Grids. Column settings (`setColumnAlignment`, `setColumnWidth`) may be made
+# before the first `addRow`: they are kept and applied when a row creates the
+# column. One cell can override its column / row (`setCellXAlignment`,
+# `setCellYAlignment`), and `mergeCellRange(column, row, columns, rows)`
+# merges a block. A cell, row or column that does not exist throws ValueError
+# (AppKit would raise an uncaught NSRangeException and abort). Read-backs:
+# `columnAlignment`, `columnWidth`, `rowAlignment`, `cellXAlignment`,
+# `cellYAlignment`, `mergeHead`; ALIGN_INHERIT means "none of its own".
+#
+# Per-container state that AppKit does not keep for us (the constraints this
+# module adds for `ALIGN_FILL` and stretched children, tab-change handlers)
+# lives in module-level registries keyed by the Objective-C object, so the
+# proxy classes stay immutable. Constraints stored there are retained and
+# released when their view is removed.
+
+from appkit.objc import (cls, sel, make, nsstr, str_of, Rect, rect_of, point_of, nsarray, msg,
+    msgV, msgI, msgII, msgIIII, msgD, msgDD, msgDDDD, msgID, msgRetD, class_addMethod,
+    objc_allocateClassPair, objc_registerClassPair);
+from appkit.app import (View, Window, targetClass, target, runHandler);
+
+@symbol("objc_msgSend") extern native "objc" func msgDI(recv: int, sel: int, d: float, a: int): int;
+@symbol("objc_msgSend") extern native "objc" func msgFI(recv: int, sel: int, p: float32, a: int): int;
+@symbol("objc_msgSend") extern native "objc" func msgRetFI(recv: int, sel: int, a: int): float32;
+
+# ── public constants ────────────────────────────────────────────────────────
+
+## Stack / grid alignment: the start of the cross axis (left in a VStack, top
+## in an HStack; a grid column's left, a grid row's top).
+pub const ALIGN_LEADING: int = 0;
+## Stack / grid alignment: centered on the cross axis (the stacks' default).
+pub const ALIGN_CENTER: int = 1;
+## Stack / grid alignment: the end of the cross axis (right in a VStack,
+## bottom in an HStack).
+pub const ALIGN_TRAILING: int = 2;
+## Stack / grid alignment: every child is stretched across the whole cross
+## axis (minus the insets).
+pub const ALIGN_FILL: int = 3;
+## HStack alignment: children share their first text baseline (a VStack
+## treats it as ALIGN_LEADING).
+pub const ALIGN_BASELINE: int = 4;
+## Grid alignment: no placement of its own — a cell follows its column (or
+## row), a column the grid (leading), a row the grid (top). Also what the
+## grid read-backs report for a cell, column or row with none set.
+pub const ALIGN_INHERIT: int = -1;
+
+## Stack distribution (the default): children are packed from the start with
+## the stack's spacing; extra room collects at the end (or in a spacer).
+pub const DIST_GRAVITY: int = -1;
+## Stack distribution: children fill the stack; the one with the lowest
+## hugging priority (a spacer, an expanding child) takes the extra room.
+pub const DIST_FILL: int = 0;
+## Stack distribution: children fill the stack and all get the same size.
+pub const DIST_FILL_EQUALLY: int = 1;
+## Stack distribution: children fill the stack in proportion to their
+## natural sizes.
+pub const DIST_FILL_PROPORTIONALLY: int = 2;
+## Stack distribution: children keep their natural sizes; the gaps between
+## them are equal and grow with the stack.
+pub const DIST_EQUAL_SPACING: int = 3;
+## Stack distribution: the children's centers are equally spaced.
+pub const DIST_EQUAL_CENTERING: int = 4;
+
+## SplitView divider style: a thick divider.
+pub const DIVIDER_THICK: int = 1;
+## SplitView divider style: a thin line (the default).
+pub const DIVIDER_THIN: int = 2;
+## SplitView divider style: the pane-splitter look (thick, with a grip).
+pub const DIVIDER_PANE_SPLITTER: int = 3;
+
+# NSLayoutAttribute.
+const ATTR_TOP: int = 3;
+const ATTR_BOTTOM: int = 4;
+const ATTR_LEADING: int = 5;
+const ATTR_TRAILING: int = 6;
+const ATTR_CENTER_X: int = 9;
+const ATTR_CENTER_Y: int = 10;
+const ATTR_FIRST_BASELINE: int = 12;
+# NSGridCellPlacement.
+const PLACE_INHERITED: int = 0;
+const PLACE_LEADING: int = 2;
+const PLACE_TRAILING: int = 3;
+const PLACE_CENTER: int = 4;
+const PLACE_FILL: int = 5;
+# NSGridRowAlignment.
+const ROW_ALIGN_INHERITED: int = 0;
+const ROW_ALIGN_NONE: int = 1;
+const ROW_ALIGN_FIRST_BASELINE: int = 2;
+# NSBoxType / NSBorderType / NSAutoresizingMask.
+const BOX_SEPARATOR: int = 2;
+const BORDER_NONE: int = 0;
+const BORDER_BEZEL: int = 2;
+const RESIZE_WIDTH: int = 2;
+# Content padding inside a tab (points).
+const TAB_PADDING: float = 10.0;
+# A spacer's preferred length gives way at this priority (below everything).
+const SPACER_PRIORITY: float = 1.0;
+# An expanding child's preferred length pulls at this priority (above a spacer).
+const EXPAND_PRIORITY: float = 2.0;
+const EXPAND_LENGTH: float = 100000.0;
+# A stack child stays inside the cross-axis insets at this priority: above
+# the fitting compression (50) and NSStackView's own 250, below compression
+# resistance (750).
+const BOUND_PRIORITY: float = 740.0;
+# A grid keeps its natural size at this priority (a stack pulls at 249.99).
+const GRID_HUG_PRIORITY: float = 251.0;
+
+# ── registries ──────────────────────────────────────────────────────────────
+
+# Stack → its ALIGN_* value (what `alignment()` reports).
+var g_align: dict[int, int] = {};
+# Stack → the cross-axis edge constraints this module added (retained).
+var g_edges: dict[int, list[int]] = {};
+# Constraint → 0 (pinned to the start edge) or 1 (to the end edge).
+var g_edge_side: dict[int, int] = {};
+# Constraint → the child it positions.
+var g_edge_view: dict[int, int] = {};
+# Constraint → true when ALIGN_FILL added it (false: a stretched child's).
+var g_edge_fill: dict[int, bool] = {};
+# Stack → the children added with addStretched / addSeparator / addExpanding.
+var g_stretched: dict[int, list[int]] = {};
+# Tab view → its change handler.
+var g_tab_change: dict[int, fn(int): void] = {};
+# Scroll view → the document-width constraint (retained), when it has one.
+var g_fit_width: dict[int, int] = {};
+var g_tab_method: bool = false;
+var g_flipped_clip_class: int = 0;
+
+# ── small helpers ───────────────────────────────────────────────────────────
+
+func bit(flag: bool): int {
+    var b = 0;
+    if (flag) {
+        b = 1;
+    }
+    return b;
+}
+
+func isTrue(objc_bool: int): bool {
+    let b = (objc_bool & 255) != 0;
+    return b;
+}
+
+func isKind(obj: int, class_name: string): bool {
+    let r = msgI(obj, sel("isKindOfClass:"), cls(class_name));
+    let k = isTrue(r);
+    return k;
+}
+
+## `[NSNumber numberWithDouble:]`.
+func nsdouble(d: float): int {
+    let n = msgD(cls("NSNumber"), sel("numberWithDouble:"), d);
+    return n;
+}
+
+## Set an (inactive) constraint's priority. NSLayoutPriority is a C float;
+## key-value coding converts the NSNumber, so no float32 argument is needed.
+func setPriority(constraint: int, priority: float): void {
+    msgII(constraint, sel("setValue:forKey:"), nsdouble(priority), nsstr("priority"));
+    return;
+}
+
+func activate(constraint: int): void {
+    msgI(constraint, sel("setActive:"), 1);
+    return;
+}
+
+func anchor(view: int, name: string): int {
+    let a = msg(view, sel(name));
+    return a;
+}
+
+## `a == b + constant`, active, for two anchors.
+func pinAnchor(a: int, b: int, constant: float): int {
+    let c = msgID(a, sel("constraintEqualToAnchor:constant:"), b, constant);
+    activate(c);
+    return c;
+}
+
+func useAutoLayout(view: int): void {
+    msgI(view, sel("setTranslatesAutoresizingMaskIntoConstraints:"), 0);
+    return;
+}
+
+func newView(class_name: string): int {
+    let v = make(class_name);
+    useAutoLayout(v);
+    return v;
+}
+
+## Lay out `view` and everything inside it now (instead of before the next
+## draw) — call it on a window's content view before reading frames.
+pub func layoutNow(view: View): void {
+    msgV(view.handle, sel("layoutSubtreeIfNeeded"));
+    return;
+}
+
+## A width and a height (points).
+pub struct Size {
+    pub w: float;
+    pub h: float;
+}
+
+## The empty room between a stack's edges and its children (points).
+pub struct Insets {
+    pub top: float;
+    pub left: float;
+    pub bottom: float;
+    pub right: float;
+}
+
+## The smallest size `view`'s constraints allow (`fittingSize`).
+pub func fittingSize(view: View): Size {
+    let p = point_of(view.handle, "fittingSize");
+    let s = Size(w = p.x, h = p.y);
+    return s;
+}
+
+## Pin `child` to all four edges of `parent` (adding it as a subview first if
+## it is not one), `margin` points in. `child` switches to Auto Layout.
+pub func pinToEdges(child: View, parent: View, margin: float): void {
+    let c = child.handle;
+    let p = parent.handle;
+    if (msg(c, sel("superview")) != p) {
+        msgI(p, sel("addSubview:"), c);
+    }
+    useAutoLayout(c);
+    pinAnchor(anchor(c, "topAnchor"), anchor(p, "topAnchor"), margin);
+    pinAnchor(anchor(c, "leadingAnchor"), anchor(p, "leadingAnchor"), margin);
+    pinAnchor(anchor(c, "bottomAnchor"), anchor(p, "bottomAnchor"), 0.0 - margin);
+    pinAnchor(anchor(c, "trailingAnchor"), anchor(p, "trailingAnchor"), 0.0 - margin);
+    return;
+}
+
+## Make `view` fill `win`'s content area, `margin` points in from each edge,
+## and follow the window as it resizes. (`win.setContent(view)` is the other
+## way: it makes `view` the content view itself, with no margin.)
+pub func fillWindow(win: Window, view: View, margin: float): void {
+    pinToEdges(view, win.content(), margin);
+    return;
+}
+
+## Fix `view`'s minimum width and height (Auto Layout `>=` constraints); 0
+## leaves that dimension alone. Use it on views with no natural size (scroll,
+## tab and split views) so a stack cannot squeeze them away.
+pub func setMinSize(view: View, w: float, h: float): void {
+    if (w > 0.0) {
+        let c = msgD(anchor(view.handle, "widthAnchor"), sel("constraintGreaterThanOrEqualToConstant:"), w);
+        activate(c);
+    }
+    if (h > 0.0) {
+        let c = msgD(anchor(view.handle, "heightAnchor"), sel("constraintGreaterThanOrEqualToConstant:"), h);
+        activate(c);
+    }
+    return;
+}
+
+# ── separator ───────────────────────────────────────────────────────────────
+
+## A thin line (an NSBox of the separator type) between groups of views.
+## A horizontal separator is 1 point tall with no width of its own; give it
+## one, or use `Stack.addSeparator()`, which stretches it across the stack.
+pub class Separator : View {
+    ## `vertical`: a vertical line (for an HStack); false: a horizontal one.
+    pub func constructor(vertical: bool) {
+        var w = 20.0;
+        var h = 1.0;
+        if (vertical) {
+            w = 1.0;
+            h = 20.0;
+        }
+        let box = msgDDDD(msg(cls("NSBox"), sel("alloc")), sel("initWithFrame:"), 0.0, 0.0, w, h);
+        msgI(box, sel("setBoxType:"), BOX_SEPARATOR);
+        useAutoLayout(box);
+        super(box);
+    }
+
+    ## Whether the line is vertical (AppKit decides from the frame's shape).
+    pub func isVertical(): bool {
+        let f = rect_of(this.handle, "frame");
+        let v = f.h > f.w;
+        return v;
+    }
+}
+
+# ── stacks ──────────────────────────────────────────────────────────────────
+
+func newStack(vertical: bool): int {
+    let s = newView("NSStackView");
+    var orientation = 0;
+    if (vertical) {
+        orientation = 1;
+    }
+    msgI(s, sel("setOrientation:"), orientation);
+    g_align[s] = ALIGN_CENTER;
+    if (vertical) {
+        msgI(s, sel("setAlignment:"), ATTR_CENTER_X);
+    } else {
+        msgI(s, sel("setAlignment:"), ATTR_CENTER_Y);
+    }
+    return s;
+}
+
+# The stack logic, shared by VStack and HStack, which extend View directly
+# and forward here. (They were written this way around a toolchain bug, since
+# fixed: a method inherited from a class in another module that returned a
+# class value read the result's fields at the wrong offset.)
+class StackImpl {
+    pub let handle: int;
+
+    pub func constructor(handle: int) {
+        this.handle = handle;
+    }
+
+    ## True for a VStack (top to bottom), false for an HStack (left to right).
+    pub func isVertical(): bool {
+        let v = msg(this.handle, sel("orientation")) == 1;
+        return v;
+    }
+
+    ## Append `view` to the end of the stack.
+    pub func add(view: View): void {
+        this.arrange(view.handle, false);
+        return;
+    }
+
+    ## Append every view of `views`, in order.
+    pub func addAll(views: list[View]): void {
+        for (v in views) {
+            this.add(v);
+        }
+        return;
+    }
+
+    ## Append `view` stretched across the whole cross axis (full width in a
+    ## VStack, full height in an HStack) whatever the alignment.
+    pub func addStretched(view: View): void {
+        this.arrange(view.handle, true);
+        return;
+    }
+
+    ## Append `view` stretched across the cross axis AND taking all the extra
+    ## room along the main axis (a text area or table under a toolbar row).
+    ## Give it a minimum with `setMinSize` so it cannot shrink to nothing.
+    pub func addExpanding(view: View): void {
+        this.addStretched(view);
+        var dim = "widthAnchor";
+        if (this.isVertical()) {
+            dim = "heightAnchor";
+        }
+        let c = msgD(anchor(view.handle, dim), sel("constraintEqualToConstant:"), EXPAND_LENGTH);
+        setPriority(c, EXPAND_PRIORITY);
+        activate(c);
+        return;
+    }
+
+    ## Append a flexible empty view that takes the extra room along the main
+    ## axis (it gives way before every other child): `[a, spacer, b]` pushes
+    ## `b` to the far end. Returns the spacer.
+    pub func addSpacer(): View {
+        let s = newView("NSView");
+        var dim = "widthAnchor";
+        var orientation = 0;
+        if (this.isVertical()) {
+            dim = "heightAnchor";
+            orientation = 1;
+        }
+        msgFI(s, sel("setContentHuggingPriority:forOrientation:"), SPACER_PRIORITY as float32, orientation);
+        msgFI(s, sel("setContentCompressionResistancePriority:forOrientation:"), SPACER_PRIORITY as float32, orientation);
+        let c = msgD(anchor(s, dim), sel("constraintEqualToConstant:"), 0.0);
+        setPriority(c, SPACER_PRIORITY);
+        activate(c);
+        let spacer = View(s);
+        this.add(spacer);
+        return spacer;
+    }
+
+    ## Append a separator line across the stack (horizontal in a VStack,
+    ## vertical in an HStack). Returns it.
+    pub func addSeparator(): Separator {
+        let line = Separator(not this.isVertical());
+        this.addStretched(line);
+        return line;
+    }
+
+    ## Remove `view` from the stack (and from the window).
+    pub func remove(view: View): void {
+        let h = view.handle;
+        this.dropEdges(h, false);
+        if (g_stretched.contains_key(this.handle)) {
+            var kept: list[int] = [];
+            for (k in g_stretched[this.handle]) {
+                if (k != h) {
+                    kept.push(k);
+                }
+            }
+            g_stretched[this.handle] = kept;
+        }
+        msgI(this.handle, sel("removeArrangedSubview:"), h);
+        msgV(h, sel("removeFromSuperview"));
+        return;
+    }
+
+    ## How many children the stack has (hidden ones included).
+    pub func count(): int {
+        let n = msg(msg(this.handle, sel("arrangedSubviews")), sel("count"));
+        return n;
+    }
+
+    ## The child at `index` (0 is the first added).
+    pub func child(index: int): View {
+        let v = View(msgI(msg(this.handle, sel("arrangedSubviews")), sel("objectAtIndex:"), index));
+        return v;
+    }
+
+    ## The gap between neighbouring children (points; AppKit's default is 8).
+    pub func setSpacing(spacing: float): void {
+        msgD(this.handle, sel("setSpacing:"), spacing);
+        return;
+    }
+
+    pub func spacing(): float {
+        let s = msgRetD(this.handle, sel("spacing"));
+        return s;
+    }
+
+    ## A different gap after `view` only.
+    pub func setSpacingAfter(view: View, spacing: float): void {
+        msgDI(this.handle, sel("setCustomSpacing:afterView:"), spacing, view.handle);
+        return;
+    }
+
+    ## Where children sit on the cross axis: ALIGN_LEADING, ALIGN_CENTER (the
+    ## default), ALIGN_TRAILING, ALIGN_FILL (stretched edge to edge) or, in an
+    ## HStack, ALIGN_BASELINE.
+    pub func setAlignment(align: int): void {
+        let old = g_align[this.handle];
+        var attr = 0;
+        if (this.isVertical()) {
+            attr = ATTR_CENTER_X;
+            if (align == ALIGN_LEADING or align == ALIGN_FILL or align == ALIGN_BASELINE) { attr = ATTR_LEADING; }
+            if (align == ALIGN_TRAILING) { attr = ATTR_TRAILING; }
+        } else {
+            attr = ATTR_CENTER_Y;
+            if (align == ALIGN_LEADING or align == ALIGN_FILL) { attr = ATTR_TOP; }
+            if (align == ALIGN_TRAILING) { attr = ATTR_BOTTOM; }
+            if (align == ALIGN_BASELINE) { attr = ATTR_FIRST_BASELINE; }
+        }
+        msgI(this.handle, sel("setAlignment:"), attr);
+        g_align[this.handle] = align;
+        if (align == ALIGN_FILL and old != ALIGN_FILL) {
+            let n = this.count();
+            var i = 0;
+            while (i < n) {
+                let kid = this.child(i).handle;
+                if (not this.isStretched(kid)) {
+                    this.pinCross(kid, true);
+                }
+                i = i + 1;
+            }
+        }
+        if (align != ALIGN_FILL and old == ALIGN_FILL) {
+            this.dropEdges(0, true);
+        }
+        return;
+    }
+
+    ## The ALIGN_* value last set (ALIGN_CENTER at first).
+    pub func alignment(): int {
+        let a = g_align[this.handle];
+        return a;
+    }
+
+    ## How children share the main axis: DIST_GRAVITY (the default), DIST_FILL,
+    ## DIST_FILL_EQUALLY, DIST_FILL_PROPORTIONALLY, DIST_EQUAL_SPACING or
+    ## DIST_EQUAL_CENTERING.
+    pub func setDistribution(dist: int): void {
+        msgI(this.handle, sel("setDistribution:"), dist);
+        return;
+    }
+
+    ## The DIST_* value AppKit reports.
+    pub func distribution(): int {
+        let d = msg(this.handle, sel("distribution"));
+        return d;
+    }
+
+    ## Empty room between the stack's edges and its children (points).
+    pub func setInsets(top: float, left: float, bottom: float, right: float): void {
+        msgDDDD(this.handle, sel("setEdgeInsets:"), top, left, bottom, right);
+        if (g_edges.contains_key(this.handle)) {
+            for (c in g_edges[this.handle]) {
+                var constant = 0.0;
+                if (this.isVertical()) {
+                    constant = left;
+                    if (g_edge_side[c] == 1) { constant = 0.0 - right; }
+                } else {
+                    constant = top;
+                    if (g_edge_side[c] == 1) { constant = 0.0 - bottom; }
+                }
+                msgD(c, sel("setConstant:"), constant);
+            }
+        }
+        return;
+    }
+
+    ## The insets AppKit reports.
+    pub func insets(): Insets {
+        let r = rect_of(this.handle, "edgeInsets");
+        let out = Insets(top = r.x, left = r.y, bottom = r.w, right = r.h);
+        return out;
+    }
+
+    ## Add `kid` as the last arranged child; pin it across the cross axis
+    ## when it is stretched or the stack fills, and keep it inside the
+    ## cross-axis insets (see `bindCross`).
+    func arrange(kid: int, stretched: bool): void {
+        useAutoLayout(kid);
+        msgI(this.handle, sel("addArrangedSubview:"), kid);
+        this.bindCross(kid);
+        if (stretched) {
+            var kids: list[int] = [];
+            if (g_stretched.contains_key(this.handle)) {
+                kids = g_stretched[this.handle];
+            }
+            kids.push(kid);
+            g_stretched[this.handle] = kids;
+            this.pinCross(kid, false);
+        } else if (g_align[this.handle] == ALIGN_FILL) {
+            this.pinCross(kid, true);
+        }
+        return;
+    }
+
+    func isStretched(kid: int): bool {
+        if (not g_stretched.contains_key(this.handle)) {
+            return false;
+        }
+        let found = g_stretched[this.handle].contains(kid);
+        return found;
+    }
+
+    ## Pin `kid` to both cross-axis edges (inside the current insets).
+    func pinCross(kid: int, for_fill: bool): void {
+        let ins = this.insets();
+        var start_name = "topAnchor";
+        var end_name = "bottomAnchor";
+        var start_k = ins.top;
+        var end_k = 0.0 - ins.bottom;
+        if (this.isVertical()) {
+            start_name = "leadingAnchor";
+            end_name = "trailingAnchor";
+            start_k = ins.left;
+            end_k = 0.0 - ins.right;
+        }
+        let c0 = pinAnchor(anchor(kid, start_name), anchor(this.handle, start_name), start_k);
+        let c1 = pinAnchor(anchor(kid, end_name), anchor(this.handle, end_name), end_k);
+        var list: list[int] = [];
+        if (g_edges.contains_key(this.handle)) {
+            list = g_edges[this.handle];
+        }
+        for (c in [c0, c1]) {
+            msgV(c, sel("retain"));
+            g_edge_view[c] = kid;
+            g_edge_fill[c] = for_fill;
+            list.push(c);
+        }
+        g_edge_side[c0] = 0;
+        g_edge_side[c1] = 1;
+        g_edges[this.handle] = list;
+        return;
+    }
+
+    ## Keep `kid` inside both cross-axis insets: `kid.start >= start + inset`
+    ## and `kid.end <= end - inset` at BOUND_PRIORITY. NSStackView's own
+    ## inset constraints for the edges an alignment leaves free are only
+    ## priority 250 (`NSStackView.Edge.Min.*`), which loses to the fitting
+    ## compression of `fittingSize`, so a leading-aligned stack used to
+    ## report its width without the trailing inset (and a centered one
+    ## without either). Below compression resistance (750), so a squeezed
+    ## child still overflows into the inset as before instead of shrinking.
+    ## Kept in `g_edges` like a stretched child's pins (not fill-only), so
+    ## `setInsets` updates them and `remove` drops them.
+    func bindCross(kid: int): void {
+        let ins = this.insets();
+        var start_name = "topAnchor";
+        var end_name = "bottomAnchor";
+        var start_k = ins.top;
+        var end_k = 0.0 - ins.bottom;
+        if (this.isVertical()) {
+            start_name = "leadingAnchor";
+            end_name = "trailingAnchor";
+            start_k = ins.left;
+            end_k = 0.0 - ins.right;
+        }
+        let c0 = msgID(anchor(kid, start_name), sel("constraintGreaterThanOrEqualToAnchor:constant:"),
+            anchor(this.handle, start_name), start_k);
+        let c1 = msgID(anchor(kid, end_name), sel("constraintLessThanOrEqualToAnchor:constant:"),
+            anchor(this.handle, end_name), end_k);
+        var list: list[int] = [];
+        if (g_edges.contains_key(this.handle)) {
+            list = g_edges[this.handle];
+        }
+        for (c in [c0, c1]) {
+            setPriority(c, BOUND_PRIORITY);
+            activate(c);
+            msgV(c, sel("retain"));
+            g_edge_view[c] = kid;
+            g_edge_fill[c] = false;
+            list.push(c);
+        }
+        g_edge_side[c0] = 0;
+        g_edge_side[c1] = 1;
+        g_edges[this.handle] = list;
+        return;
+    }
+
+    ## Deactivate and forget edge constraints: those of `kid` (when not 0), or
+    ## (when `fill_only`) every one ALIGN_FILL added.
+    func dropEdges(kid: int, fill_only: bool): void {
+        if (not g_edges.contains_key(this.handle)) {
+            return;
+        }
+        var kept: list[int] = [];
+        for (c in g_edges[this.handle]) {
+            var drop = false;
+            if (kid != 0 and g_edge_view[c] == kid) { drop = true; }
+            if (fill_only and g_edge_fill[c]) { drop = true; }
+            if (drop) {
+                msgI(c, sel("setActive:"), 0);
+                g_edge_view.remove(c);
+                g_edge_fill.remove(c);
+                g_edge_side.remove(c);
+                msgV(c, sel("release"));
+            } else {
+                kept.push(c);
+            }
+        }
+        g_edges[this.handle] = kept;
+        return;
+    }
+}
+
+## A column of views, top to bottom (an NSStackView, vertical). Children are
+## laid out in the order added, `spacing()` apart, inside the insets;
+## `setAlignment` places them horizontally. Hidden children take no room.
+pub class VStack : View {
+    pub func constructor() {
+        super(newStack(true));
+    }
+
+    ## True for a VStack (top to bottom), false for an HStack (left to right).
+    pub func isVertical(): bool {
+        let r = StackImpl(this.handle).isVertical();
+        return r;
+    }
+
+    ## Append `view` to the end of the stack.
+    pub func add(view: View): void {
+        StackImpl(this.handle).add(view);
+        return;
+    }
+
+    ## Append every view of `views`, in order.
+    pub func addAll(views: list[View]): void {
+        StackImpl(this.handle).addAll(views);
+        return;
+    }
+
+    ## Append `view` stretched across the whole cross axis (full width in a
+    ## VStack, full height in an HStack) whatever the alignment.
+    pub func addStretched(view: View): void {
+        StackImpl(this.handle).addStretched(view);
+        return;
+    }
+
+    ## Append `view` stretched across the cross axis AND taking all the extra
+    ## room along the main axis (a text area or table under a toolbar row).
+    ## Give it a minimum with `setMinSize` so it cannot shrink to nothing.
+    pub func addExpanding(view: View): void {
+        StackImpl(this.handle).addExpanding(view);
+        return;
+    }
+
+    ## Append a flexible empty view that takes the extra room along the main
+    ## axis (it gives way before every other child): `[a, spacer, b]` pushes
+    ## `b` to the far end. Returns the spacer.
+    pub func addSpacer(): View {
+        let r = StackImpl(this.handle).addSpacer();
+        return r;
+    }
+
+    ## Append a separator line across the stack (horizontal in a VStack,
+    ## vertical in an HStack). Returns it.
+    pub func addSeparator(): Separator {
+        let r = StackImpl(this.handle).addSeparator();
+        return r;
+    }
+
+    ## Remove `view` from the stack (and from the window).
+    pub func remove(view: View): void {
+        StackImpl(this.handle).remove(view);
+        return;
+    }
+
+    ## How many children the stack has (hidden ones included).
+    pub func count(): int {
+        let r = StackImpl(this.handle).count();
+        return r;
+    }
+
+    ## The child at `index` (0 is the first added).
+    pub func child(index: int): View {
+        let r = StackImpl(this.handle).child(index);
+        return r;
+    }
+
+    ## The gap between neighbouring children (points; AppKit's default is 8).
+    pub func setSpacing(spacing: float): void {
+        StackImpl(this.handle).setSpacing(spacing);
+        return;
+    }
+
+    pub func spacing(): float {
+        let r = StackImpl(this.handle).spacing();
+        return r;
+    }
+
+    ## A different gap after `view` only.
+    pub func setSpacingAfter(view: View, spacing: float): void {
+        StackImpl(this.handle).setSpacingAfter(view, spacing);
+        return;
+    }
+
+    ## Where children sit on the cross axis: ALIGN_LEADING, ALIGN_CENTER (the
+    ## default), ALIGN_TRAILING, ALIGN_FILL (stretched edge to edge) or, in an
+    ## HStack, ALIGN_BASELINE.
+    pub func setAlignment(align: int): void {
+        StackImpl(this.handle).setAlignment(align);
+        return;
+    }
+
+    ## The ALIGN_* value last set (ALIGN_CENTER at first).
+    pub func alignment(): int {
+        let r = StackImpl(this.handle).alignment();
+        return r;
+    }
+
+    ## How children share the main axis: DIST_GRAVITY (the default), DIST_FILL,
+    ## DIST_FILL_EQUALLY, DIST_FILL_PROPORTIONALLY, DIST_EQUAL_SPACING or
+    ## DIST_EQUAL_CENTERING.
+    pub func setDistribution(dist: int): void {
+        StackImpl(this.handle).setDistribution(dist);
+        return;
+    }
+
+    ## The DIST_* value AppKit reports.
+    pub func distribution(): int {
+        let r = StackImpl(this.handle).distribution();
+        return r;
+    }
+
+    ## Empty room between the stack's edges and its children (points).
+    pub func setInsets(top: float, left: float, bottom: float, right: float): void {
+        StackImpl(this.handle).setInsets(top, left, bottom, right);
+        return;
+    }
+
+    ## The insets AppKit reports.
+    pub func insets(): Insets {
+        let r = StackImpl(this.handle).insets();
+        return r;
+    }
+}
+
+## A row of views, left to right (an NSStackView, horizontal). Children are
+## laid out in the order added, `spacing()` apart, inside the insets;
+## `setAlignment` places them vertically. Hidden children take no room.
+pub class HStack : View {
+    pub func constructor() {
+        super(newStack(false));
+    }
+
+    ## True for a VStack (top to bottom), false for an HStack (left to right).
+    pub func isVertical(): bool {
+        let r = StackImpl(this.handle).isVertical();
+        return r;
+    }
+
+    ## Append `view` to the end of the stack.
+    pub func add(view: View): void {
+        StackImpl(this.handle).add(view);
+        return;
+    }
+
+    ## Append every view of `views`, in order.
+    pub func addAll(views: list[View]): void {
+        StackImpl(this.handle).addAll(views);
+        return;
+    }
+
+    ## Append `view` stretched across the whole cross axis (full width in a
+    ## VStack, full height in an HStack) whatever the alignment.
+    pub func addStretched(view: View): void {
+        StackImpl(this.handle).addStretched(view);
+        return;
+    }
+
+    ## Append `view` stretched across the cross axis AND taking all the extra
+    ## room along the main axis (a text area or table under a toolbar row).
+    ## Give it a minimum with `setMinSize` so it cannot shrink to nothing.
+    pub func addExpanding(view: View): void {
+        StackImpl(this.handle).addExpanding(view);
+        return;
+    }
+
+    ## Append a flexible empty view that takes the extra room along the main
+    ## axis (it gives way before every other child): `[a, spacer, b]` pushes
+    ## `b` to the far end. Returns the spacer.
+    pub func addSpacer(): View {
+        let r = StackImpl(this.handle).addSpacer();
+        return r;
+    }
+
+    ## Append a separator line across the stack (horizontal in a VStack,
+    ## vertical in an HStack). Returns it.
+    pub func addSeparator(): Separator {
+        let r = StackImpl(this.handle).addSeparator();
+        return r;
+    }
+
+    ## Remove `view` from the stack (and from the window).
+    pub func remove(view: View): void {
+        StackImpl(this.handle).remove(view);
+        return;
+    }
+
+    ## How many children the stack has (hidden ones included).
+    pub func count(): int {
+        let r = StackImpl(this.handle).count();
+        return r;
+    }
+
+    ## The child at `index` (0 is the first added).
+    pub func child(index: int): View {
+        let r = StackImpl(this.handle).child(index);
+        return r;
+    }
+
+    ## The gap between neighbouring children (points; AppKit's default is 8).
+    pub func setSpacing(spacing: float): void {
+        StackImpl(this.handle).setSpacing(spacing);
+        return;
+    }
+
+    pub func spacing(): float {
+        let r = StackImpl(this.handle).spacing();
+        return r;
+    }
+
+    ## A different gap after `view` only.
+    pub func setSpacingAfter(view: View, spacing: float): void {
+        StackImpl(this.handle).setSpacingAfter(view, spacing);
+        return;
+    }
+
+    ## Where children sit on the cross axis: ALIGN_LEADING, ALIGN_CENTER (the
+    ## default), ALIGN_TRAILING, ALIGN_FILL (stretched edge to edge) or, in an
+    ## HStack, ALIGN_BASELINE.
+    pub func setAlignment(align: int): void {
+        StackImpl(this.handle).setAlignment(align);
+        return;
+    }
+
+    ## The ALIGN_* value last set (ALIGN_CENTER at first).
+    pub func alignment(): int {
+        let r = StackImpl(this.handle).alignment();
+        return r;
+    }
+
+    ## How children share the main axis: DIST_GRAVITY (the default), DIST_FILL,
+    ## DIST_FILL_EQUALLY, DIST_FILL_PROPORTIONALLY, DIST_EQUAL_SPACING or
+    ## DIST_EQUAL_CENTERING.
+    pub func setDistribution(dist: int): void {
+        StackImpl(this.handle).setDistribution(dist);
+        return;
+    }
+
+    ## The DIST_* value AppKit reports.
+    pub func distribution(): int {
+        let r = StackImpl(this.handle).distribution();
+        return r;
+    }
+
+    ## Empty room between the stack's edges and its children (points).
+    pub func setInsets(top: float, left: float, bottom: float, right: float): void {
+        StackImpl(this.handle).setInsets(top, left, bottom, right);
+        return;
+    }
+
+    ## The insets AppKit reports.
+    pub func insets(): Insets {
+        let r = StackImpl(this.handle).insets();
+        return r;
+    }
+}
+
+# ── scroll view ─────────────────────────────────────────────────────────────
+
+## `- (BOOL)isFlipped` of LoupFlippedClipView: documents start at the top.
+func impIsFlipped(self_obj: int, cmd: int): int {
+    return 1;
+}
+
+## An NSClipView subclass whose y axis points down, so an Auto Layout document
+## pinned to its top starts at the top and scrolls (created on first use).
+func flippedClipClass(): int {
+    if (g_flipped_clip_class == 0) {
+        let c = objc_allocateClassPair(cls("NSClipView"), "LoupFlippedClipView", 0);
+        class_addMethod(c, sel("isFlipped"), addressOf(impIsFlipped), "c@:");
+        objc_registerClassPair(c);
+        g_flipped_clip_class = c;
+    }
+    return g_flipped_clip_class;
+}
+
+## A scrolling view around one document view. An NSTextView document is set
+## up to wrap its text to the visible width and grow downward; a table or
+## outline view (frame-based) is used as is; any other document (a stack, a
+## grid, …) is laid out with Auto Layout, pinned to the top and as wide as the
+## visible area (vertical scrolling; `setFitWidth(false)` to scroll sideways).
+## A scroll view has no natural size: fix one (`setMinSize`, `setWidth`,
+## `setHeight`) or let a container stretch it (`Stack.addExpanding`).
+pub class ScrollView : View {
+    pub func constructor(document: View) {
+        let sv = newView("NSScrollView");
+        msgI(sv, sel("setHasVerticalScroller:"), 1);
+        msgI(sv, sel("setAutohidesScrollers:"), 1);
+        msgI(sv, sel("setBorderType:"), BORDER_BEZEL);
+        let doc = document.handle;
+        if (isKind(doc, "NSTextView")) {
+            msgDD(doc, sel("setMinSize:"), 0.0, 0.0);
+            msgDD(doc, sel("setMaxSize:"), 10000000.0, 10000000.0);
+            msgI(doc, sel("setVerticallyResizable:"), 1);
+            msgI(doc, sel("setHorizontallyResizable:"), 0);
+            msgI(doc, sel("setAutoresizingMask:"), RESIZE_WIDTH);
+            let container = msg(doc, sel("textContainer"));
+            msgDD(container, sel("setContainerSize:"), 10000000.0, 10000000.0);
+            msgI(container, sel("setWidthTracksTextView:"), 1);
+            msgI(sv, sel("setDocumentView:"), doc);
+        } else if (isKind(doc, "NSTableView") or isKind(doc, "NSCollectionView")) {
+            msgI(sv, sel("setHasHorizontalScroller:"), 1);
+            msgI(sv, sel("setDocumentView:"), doc);
+        } else {
+            let clip = msg(msg(flippedClipClass(), sel("alloc")), sel("init"));
+            msgI(clip, sel("setDrawsBackground:"), 0);
+            msgI(sv, sel("setContentView:"), clip);
+            msgI(sv, sel("setDrawsBackground:"), 0);
+            useAutoLayout(doc);
+            msgI(sv, sel("setDocumentView:"), doc);
+            pinAnchor(anchor(doc, "topAnchor"), anchor(clip, "topAnchor"), 0.0);
+            pinAnchor(anchor(doc, "leadingAnchor"), anchor(clip, "leadingAnchor"), 0.0);
+            let fit = pinAnchor(anchor(doc, "trailingAnchor"), anchor(clip, "trailingAnchor"), 0.0);
+            msgV(fit, sel("retain"));
+            g_fit_width[sv] = fit;
+        }
+        super(sv);
+    }
+
+    ## The document view.
+    pub func document(): View {
+        let d = View(msg(this.handle, sel("documentView")));
+        return d;
+    }
+
+    ## Draw a bezel around the scroll view (the default) or no border.
+    pub func setBorder(bordered: bool): void {
+        var b = BORDER_NONE;
+        if (bordered) { b = BORDER_BEZEL; }
+        msgI(this.handle, sel("setBorderType:"), b);
+        return;
+    }
+
+    ## Which scroll bars may appear (they hide when not needed).
+    pub func setScrollers(vertical: bool, horizontal: bool): void {
+        msgI(this.handle, sel("setHasVerticalScroller:"), bit(vertical));
+        msgI(this.handle, sel("setHasHorizontalScroller:"), bit(horizontal));
+        return;
+    }
+
+    ## For an Auto Layout document: keep it as wide as the visible area (true,
+    ## the default) or let it be wider and scroll sideways (false; turn the
+    ## horizontal scroller on with `setScrollers`).
+    pub func setFitWidth(fit: bool): void {
+        if (g_fit_width.contains_key(this.handle)) {
+            msgI(g_fit_width[this.handle], sel("setActive:"), bit(fit));
+        }
+        return;
+    }
+
+    ## Scroll so the document point (x, y) — measured from the document's top
+    ## left — is at the top left of the visible area.
+    pub func scrollTo(x: float, y: float): void {
+        let clip = msg(this.handle, sel("contentView"));
+        msgDD(clip, sel("scrollToPoint:"), x, y);
+        msgI(this.handle, sel("reflectScrolledClipView:"), clip);
+        return;
+    }
+
+    ## Scroll back to the top of the document.
+    pub func scrollToTop(): void {
+        this.scrollTo(0.0, 0.0);
+        return;
+    }
+
+    ## The part of the document that is visible: `x`, `y` measured from the
+    ## document's top left, and the visible `w` × `h`.
+    pub func visibleRect(): Rect {
+        # Every document this class sets up scrolls in a flipped clip view
+        # (text and table views are flipped themselves; any other document
+        # gets LoupFlippedClipView), so the clip's bounds are the answer.
+        let r = rect_of(msg(this.handle, sel("contentView")), "bounds");
+        return r;
+    }
+}
+
+# ── box ─────────────────────────────────────────────────────────────────────
+
+## A titled group box (NSBox) around one content view. The content is pinned
+## inside the box, so the box takes its size from the content (a stack or a
+## grid) and the content follows the box when it is stretched.
+pub class Box : View {
+    pub func constructor(title: string, content: View) {
+        let b = newView("NSBox");
+        msgI(b, sel("setTitle:"), nsstr(title));
+        super(b);
+        this.setContent(content);
+    }
+
+    pub func setTitle(title: string): void {
+        msgI(this.handle, sel("setTitle:"), nsstr(title));
+        return;
+    }
+
+    pub func title(): string {
+        let t = str_of(msg(this.handle, sel("title")));
+        return t;
+    }
+
+    ## Replace the content view.
+    pub func setContent(content: View): void {
+        let inner = msg(this.handle, sel("contentView"));
+        let old = msg(inner, sel("subviews"));
+        let n = msg(old, sel("count"));
+        var i = n - 1;
+        while (i >= 0) {
+            msgV(msgI(old, sel("objectAtIndex:"), i), sel("removeFromSuperview"));
+            i = i - 1;
+        }
+        pinToEdges(content, View(inner), 0.0);
+        return;
+    }
+
+    ## The content view (as passed to the constructor or `setContent`).
+    pub func content(): View {
+        let subs = msg(msg(this.handle, sel("contentView")), sel("subviews"));
+        var v = View(0);
+        if (msg(subs, sel("count")) > 0) {
+            v = View(msgI(subs, sel("objectAtIndex:"), 0));
+        }
+        return v;
+    }
+}
+
+# ── tab view ────────────────────────────────────────────────────────────────
+
+## `- (void)tabView:(NSTabView*)tv didSelectTabViewItem:(NSTabViewItem*)item`.
+func impTabDidSelect(self_obj: int, cmd: int, tab: int, item: int): void {
+    if (not g_tab_change.contains_key(tab)) {
+        return;
+    }
+    let handler = g_tab_change[tab];
+    let index = msgI(tab, sel("indexOfTabViewItem:"), item);
+    runHandler(func(): void { handler(index); }, "tab change");
+    return;
+}
+
+## Teach the shared LoupTarget class the tab-view delegate method (before any
+## tab view is given it as delegate: AppKit asks what the delegate responds to
+## when it is set).
+func ensureTabDelegate(): void {
+    if (not g_tab_method) {
+        class_addMethod(targetClass(), sel("tabView:didSelectTabViewItem:"), addressOf(impTabDidSelect), "v@:@@");
+        g_tab_method = true;
+    }
+    return;
+}
+
+## Tabs (NSTabView): one page per tab, the selected page shown. Each page is
+## pinned inside its tab with a 10-point margin, and the tab view is never
+## smaller than the largest page's natural size.
+pub class TabView : View {
+    pub func constructor() {
+        ensureTabDelegate();
+        let t = msgDDDD(msg(cls("NSTabView"), sel("alloc")), sel("initWithFrame:"), 0.0, 0.0, 400.0, 300.0);
+        useAutoLayout(t);
+        super(t);
+    }
+
+    ## Add a tab titled `title` showing `page`; returns its index.
+    pub func addTab(title: string, page: View): int {
+        let holder = make("NSView");
+        pinToEdges(page, View(holder), TAB_PADDING);
+        let item = msgI(msg(cls("NSTabViewItem"), sel("alloc")), sel("initWithIdentifier:"), 0);
+        msgI(item, sel("setLabel:"), nsstr(title));
+        msgI(item, sel("setView:"), holder);
+        msgI(this.handle, sel("addTabViewItem:"), item);
+        # The tab view sizes its pages by frame, not by their constraints, so
+        # floor its own size at this page's natural size plus the tab chrome.
+        let fit = point_of(holder, "fittingSize");
+        let outer = rect_of(this.handle, "frame");
+        let inner = rect_of(this.handle, "contentRect");
+        let cw = fit.x + outer.w - inner.w;
+        let ch = fit.y + outer.h - inner.h;
+        setMinSize(this, cw, ch);
+        let index = this.count() - 1;
+        return index;
+    }
+
+    ## How many tabs there are.
+    pub func count(): int {
+        let n = msg(this.handle, sel("numberOfTabViewItems"));
+        return n;
+    }
+
+    ## The index of the selected tab (-1 when there are none).
+    pub func selectedIndex(): int {
+        let item = msg(this.handle, sel("selectedTabViewItem"));
+        if (item == 0) {
+            return -1;
+        }
+        let i = msgI(this.handle, sel("indexOfTabViewItem:"), item);
+        return i;
+    }
+
+    ## Select the tab at `index` (runs the change handler).
+    pub func select(index: int): void {
+        msgI(this.handle, sel("selectTabViewItemAtIndex:"), index);
+        return;
+    }
+
+    ## The title of the tab at `index`.
+    pub func tabTitle(index: int): string {
+        let item = msgI(this.handle, sel("tabViewItemAtIndex:"), index);
+        let t = str_of(msg(item, sel("label")));
+        return t;
+    }
+
+    ## Run `handler(index)` whenever the selected tab changes (by a click or
+    ## by `select`). Replaces any earlier handler.
+    pub func onChange(handler: fn(int): void): void {
+        g_tab_change[this.handle] = handler;
+        msgI(this.handle, sel("setDelegate:"), target());
+        return;
+    }
+}
+
+# ── split view ──────────────────────────────────────────────────────────────
+
+## Resizable panes divided by draggable dividers (NSSplitView). Panes keep
+## their order; the split view sizes them by frame, so a pane that is a stack
+## or grid lays its own children out inside whatever size it is given.
+pub class SplitView : View {
+    ## `vertical`: true puts the panes side by side (vertical dividers), false
+    ## stacks them top to bottom (horizontal dividers).
+    pub func constructor(vertical: bool) {
+        let s = newView("NSSplitView");
+        msgI(s, sel("setVertical:"), bit(vertical));
+        msgI(s, sel("setDividerStyle:"), DIVIDER_THIN);
+        super(s);
+    }
+
+    ## Append a pane; returns its index.
+    pub func addPane(pane: View): int {
+        msgI(pane.handle, sel("setTranslatesAutoresizingMaskIntoConstraints:"), 1);
+        # The split view sizes its panes by frame, and a pane is 0 points
+        # tall or wide before the first layout (or while its tab is hidden):
+        # a stack pane would then break its own edge constraints (an
+        # "Unable to simultaneously satisfy constraints" log). Let it clip
+        # instead: its edge constraints drop below required.
+        if (isTrue(msgI(pane.handle, sel("isKindOfClass:"), cls("NSStackView")))) {
+            msgFI(pane.handle, sel("setClippingResistancePriority:forOrientation:"), 250.0 as float32, 0);
+            msgFI(pane.handle, sel("setClippingResistancePriority:forOrientation:"), 250.0 as float32, 1);
+        }
+        msgI(this.handle, sel("addArrangedSubview:"), pane.handle);
+        let index = this.paneCount() - 1;
+        return index;
+    }
+
+    pub func paneCount(): int {
+        let n = msg(msg(this.handle, sel("arrangedSubviews")), sel("count"));
+        return n;
+    }
+
+    ## The pane at `index`.
+    pub func pane(index: int): View {
+        let v = View(msgI(msg(this.handle, sel("arrangedSubviews")), sel("objectAtIndex:"), index));
+        return v;
+    }
+
+    ## True when the panes are side by side.
+    pub func isVertical(): bool {
+        let v = isTrue(msg(this.handle, sel("isVertical")));
+        return v;
+    }
+
+    ## Move divider `index` (0: between panes 0 and 1) to `position` points
+    ## from the left (side by side) or top (stacked). Lay the window out first:
+    ## the split view needs its size.
+    pub func setDividerPosition(index: int, position: float): void {
+        msgDI(this.handle, sel("setPosition:ofDividerAtIndex:"), position, index);
+        return;
+    }
+
+    ## Where divider `index` is (points from the left or top): the end of
+    ## pane `index`.
+    pub func dividerPosition(index: int): float {
+        let f = rect_of(this.pane(index).handle, "frame");
+        var p = f.y + f.h;
+        if (this.isVertical()) {
+            p = f.x + f.w;
+        }
+        return p;
+    }
+
+    ## DIVIDER_THIN (the default), DIVIDER_THICK or DIVIDER_PANE_SPLITTER.
+    pub func setDividerStyle(style: int): void {
+        msgI(this.handle, sel("setDividerStyle:"), style);
+        return;
+    }
+
+    pub func dividerThickness(): float {
+        let t = msgRetD(this.handle, sel("dividerThickness"));
+        return t;
+    }
+
+    ## How firmly pane `index` keeps its size when the split view resizes: the
+    ## pane with the lowest priority grows and shrinks first (AppKit's default
+    ## is 250; e.g. 260 keeps a sidebar steady while the main pane grows).
+    pub func setHoldingPriority(index: int, priority: float): void {
+        msgFI(this.handle, sel("setHoldingPriority:forSubviewAtIndex:"), priority as float32, index);
+        return;
+    }
+
+    pub func holdingPriority(index: int): float {
+        let p = msgRetFI(this.handle, sel("holdingPriorityForSubviewAtIndex:"), index);
+        let d = p as float;
+        return d;
+    }
+}
+
+# ── grid ──────────────────────────────────────────────────────────────────
+
+func placement(align: int): int {
+    var p = PLACE_CENTER;
+    if (align == ALIGN_INHERIT) { p = PLACE_INHERITED; }
+    if (align == ALIGN_LEADING or align == ALIGN_BASELINE) { p = PLACE_LEADING; }
+    if (align == ALIGN_TRAILING) { p = PLACE_TRAILING; }
+    if (align == ALIGN_FILL) { p = PLACE_FILL; }
+    return p;
+}
+
+## The ALIGN_* value of an NSGridCellPlacement (ALIGN_INHERIT for inherited
+## or none).
+func alignOfPlacement(p: int): int {
+    var a = ALIGN_INHERIT;
+    if (p == PLACE_LEADING) { a = ALIGN_LEADING; }
+    if (p == PLACE_TRAILING) { a = ALIGN_TRAILING; }
+    if (p == PLACE_CENTER) { a = ALIGN_CENTER; }
+    if (p == PLACE_FILL) { a = ALIGN_FILL; }
+    return a;
+}
+
+## Throw ValueError unless `align` is an ALIGN_* value a grid accepts.
+func checkGridAlign(align: int, baseline_ok: bool, what: string): void {
+    var ok = align == ALIGN_INHERIT or align == ALIGN_LEADING or align == ALIGN_CENTER
+        or align == ALIGN_TRAILING or align == ALIGN_FILL;
+    if (baseline_ok and align == ALIGN_BASELINE) {
+        ok = true;
+    }
+    if (not ok) {
+        throw ValueError("appkit.layout: GridView." + what + ": not a grid alignment: " + align.to_string());
+    }
+    return;
+}
+
+# Grid → the column placements / widths set before the column existed
+# (indexed by column; NO_PLACEMENT / NO_WIDTH where none is pending).
+var g_grid_pending_place: dict[int, list[int]] = {};
+var g_grid_pending_width: dict[int, list[float]] = {};
+const NO_PLACEMENT: int = -100;
+const NO_WIDTH: float = -1.0;
+# NSGridViewSizeForContent (FLT_MIN): a column or row sized by its views.
+const SIZE_FOR_CONTENT_LIMIT: float = 0.000001;
+
+## An empty grid cell (pass it to `GridView.addRow` to leave a cell blank).
+pub func emptyCell(): View {
+    let v = View(msg(cls("NSGridCell"), sel("emptyContentView")));
+    return v;
+}
+
+## Rows and columns of views (NSGridView): every view in a column shares the
+## column's width, every view in a row the row's height — forms with labels on
+## the left and fields on the right. Columns appear as rows need them; column
+## settings made before a column exists (`setColumnAlignment`,
+## `setColumnWidth` on a new grid) are remembered and applied by the `addRow`
+## that creates it. The grid hugs its content (priority 251, just above a
+## stack's pull), so a form in a stack keeps its natural size unless it is
+## stretched explicitly (`Stack.addStretched`, ALIGN_FILL, `pinToEdges`).
+## Indexes are checked: a cell, row or column that does not exist throws
+## ValueError (AppKit would raise an uncaught NSRangeException).
+pub class GridView : View {
+    pub func constructor() {
+        let g = newView("NSGridView");
+        for (dim in ["widthAnchor", "heightAnchor"]) {
+            let c = msgD(anchor(g, dim), sel("constraintEqualToConstant:"), 0.0);
+            setPriority(c, GRID_HUG_PRIORITY);
+            activate(c);
+        }
+        super(g);
+    }
+
+    ## Append a row holding `views` (one per column, `emptyCell()` for a gap);
+    ## returns the row's index. Applies column settings made before the
+    ## columns existed.
+    pub func addRow(views: list[View]): int {
+        var handles: list[int] = [];
+        for (v in views) {
+            useAutoLayout(v.handle);
+            handles.push(v.handle);
+        }
+        msgI(this.handle, sel("addRowWithViews:"), nsarray(handles));
+        this.applyPending();
+        let index = this.rowCount() - 1;
+        return index;
+    }
+
+    pub func rowCount(): int {
+        let n = msg(this.handle, sel("numberOfRows"));
+        return n;
+    }
+
+    pub func columnCount(): int {
+        let n = msg(this.handle, sel("numberOfColumns"));
+        return n;
+    }
+
+    ## Throw ValueError unless (`column`, `row`) is a cell of the grid.
+    func checkCell(column: int, row: int, what: string): void {
+        if (column < 0 or column >= this.columnCount() or row < 0 or row >= this.rowCount()) {
+            throw ValueError("appkit.layout: GridView." + what + ": no cell (" + column.to_string() + ", "
+                + row.to_string() + ") in a grid of " + this.columnCount().to_string() + " columns x "
+                + this.rowCount().to_string() + " rows");
+        }
+        return;
+    }
+
+    ## Throw ValueError unless `row` is a row of the grid.
+    func checkRow(row: int, what: string): void {
+        if (row < 0 or row >= this.rowCount()) {
+            throw ValueError("appkit.layout: GridView." + what + ": no row " + row.to_string() + " (the grid has "
+                + this.rowCount().to_string() + ")");
+        }
+        return;
+    }
+
+    ## The NSGridCell at (`column`, `row`), checked.
+    func gridCell(column: int, row: int, what: string): int {
+        this.checkCell(column, row, what);
+        let c = msgII(this.handle, sel("cellAtColumnIndex:rowIndex:"), column, row);
+        return c;
+    }
+
+    ## The view in the cell at (`column`, `row`) (a merged cell's view for
+    ## every cell it covers). Throws ValueError for a cell that does not exist.
+    pub func cell(column: int, row: int): View {
+        let c = this.gridCell(column, row, "cell");
+        let v = View(msg(c, sel("contentView")));
+        return v;
+    }
+
+    ## The vertical gap between rows (points).
+    pub func setRowSpacing(spacing: float): void {
+        msgD(this.handle, sel("setRowSpacing:"), spacing);
+        return;
+    }
+
+    pub func rowSpacing(): float {
+        let s = msgRetD(this.handle, sel("rowSpacing"));
+        return s;
+    }
+
+    ## The horizontal gap between columns (points).
+    pub func setColumnSpacing(spacing: float): void {
+        msgD(this.handle, sel("setColumnSpacing:"), spacing);
+        return;
+    }
+
+    pub func columnSpacing(): float {
+        let s = msgRetD(this.handle, sel("columnSpacing"));
+        return s;
+    }
+
+    ## Remember a column setting for a column that does not exist yet.
+    func pendPlacement(column: int, p: int): void {
+        var list: list[int] = [];
+        if (g_grid_pending_place.contains_key(this.handle)) {
+            list = g_grid_pending_place[this.handle];
+        }
+        while (list.len() <= column) {
+            list.push(NO_PLACEMENT);
+        }
+        list[column] = p;
+        g_grid_pending_place[this.handle] = list;
+        return;
+    }
+
+    func pendWidth(column: int, width: float): void {
+        var list: list[float] = [];
+        if (g_grid_pending_width.contains_key(this.handle)) {
+            list = g_grid_pending_width[this.handle];
+        }
+        while (list.len() <= column) {
+            list.push(NO_WIDTH);
+        }
+        list[column] = width;
+        g_grid_pending_width[this.handle] = list;
+        return;
+    }
+
+    ## Apply (and forget) the pending settings of every column that exists now.
+    func applyPending(): void {
+        let n = this.columnCount();
+        if (g_grid_pending_place.contains_key(this.handle)) {
+            var list = g_grid_pending_place[this.handle];
+            var i = 0;
+            while (i < list.len() and i < n) {
+                if (list[i] != NO_PLACEMENT) {
+                    let col = msgI(this.handle, sel("columnAtIndex:"), i);
+                    msgI(col, sel("setXPlacement:"), list[i]);
+                    list[i] = NO_PLACEMENT;
+                }
+                i = i + 1;
+            }
+            g_grid_pending_place[this.handle] = list;
+        }
+        if (g_grid_pending_width.contains_key(this.handle)) {
+            var list = g_grid_pending_width[this.handle];
+            var i = 0;
+            while (i < list.len() and i < n) {
+                if (list[i] != NO_WIDTH) {
+                    let col = msgI(this.handle, sel("columnAtIndex:"), i);
+                    msgD(col, sel("setWidth:"), list[i]);
+                    list[i] = NO_WIDTH;
+                }
+                i = i + 1;
+            }
+            g_grid_pending_width[this.handle] = list;
+        }
+        return;
+    }
+
+    ## Place the views of `column` horizontally in their cells: ALIGN_LEADING,
+    ## ALIGN_CENTER, ALIGN_TRAILING (e.g. right-aligned form labels),
+    ## ALIGN_FILL, or ALIGN_INHERIT (the grid's default, leading;
+    ## ALIGN_BASELINE counts as leading, any other value as center). May be
+    ## called before the column exists (before the first `addRow`): the
+    ## setting is kept and applied when a row creates the column. Throws
+    ## ValueError for a negative column.
+    pub func setColumnAlignment(column: int, align: int): void {
+        if (column < 0) {
+            throw ValueError("appkit.layout: GridView.setColumnAlignment: negative column " + column.to_string());
+        }
+        let p = placement(align);
+        if (column >= this.columnCount()) {
+            this.pendPlacement(column, p);
+            return;
+        }
+        let col = msgI(this.handle, sel("columnAtIndex:"), column);
+        msgI(col, sel("setXPlacement:"), p);
+        return;
+    }
+
+    ## The ALIGN_* value set for `column` (pending or applied); ALIGN_INHERIT
+    ## when none was set.
+    pub func columnAlignment(column: int): int {
+        if (column < 0) {
+            throw ValueError("appkit.layout: GridView.columnAlignment: negative column " + column.to_string());
+        }
+        if (column >= this.columnCount()) {
+            var a = ALIGN_INHERIT;
+            if (g_grid_pending_place.contains_key(this.handle)) {
+                let list = g_grid_pending_place[this.handle];
+                if (column < list.len() and list[column] != NO_PLACEMENT) {
+                    a = alignOfPlacement(list[column]);
+                }
+            }
+            return a;
+        }
+        let col = msgI(this.handle, sel("columnAtIndex:"), column);
+        let a = alignOfPlacement(msg(col, sel("xPlacement")));
+        return a;
+    }
+
+    ## Place the views of `row` vertically in their cells: ALIGN_LEADING (top),
+    ## ALIGN_CENTER, ALIGN_TRAILING (bottom), ALIGN_FILL or ALIGN_BASELINE (the
+    ## first text baselines line up). Throws ValueError for a row that does
+    ## not exist.
+    pub func setRowAlignment(row: int, align: int): void {
+        this.checkRow(row, "setRowAlignment");
+        let r = msgI(this.handle, sel("rowAtIndex:"), row);
+        if (align == ALIGN_BASELINE) {
+            msgI(r, sel("setRowAlignment:"), ROW_ALIGN_FIRST_BASELINE);
+        } else {
+            msgI(r, sel("setYPlacement:"), placement(align));
+        }
+        return;
+    }
+
+    ## The ALIGN_* value of `row`: ALIGN_BASELINE when its baselines are
+    ## aligned, else its vertical placement (ALIGN_INHERIT when none).
+    pub func rowAlignment(row: int): int {
+        this.checkRow(row, "rowAlignment");
+        let r = msgI(this.handle, sel("rowAtIndex:"), row);
+        if (msg(r, sel("rowAlignment")) == ROW_ALIGN_FIRST_BASELINE) {
+            return ALIGN_BASELINE;
+        }
+        let a = alignOfPlacement(msg(r, sel("yPlacement")));
+        return a;
+    }
+
+    ## Fix the width of `column` (points). Like `setColumnAlignment`, it may
+    ## be called before the column exists.
+    pub func setColumnWidth(column: int, width: float): void {
+        if (column < 0) {
+            throw ValueError("appkit.layout: GridView.setColumnWidth: negative column " + column.to_string());
+        }
+        if (column >= this.columnCount()) {
+            this.pendWidth(column, width);
+            return;
+        }
+        let col = msgI(this.handle, sel("columnAtIndex:"), column);
+        msgD(col, sel("setWidth:"), width);
+        return;
+    }
+
+    ## The fixed width of `column` (pending or applied); 0 when the column is
+    ## sized by its views.
+    pub func columnWidth(column: int): float {
+        if (column < 0) {
+            throw ValueError("appkit.layout: GridView.columnWidth: negative column " + column.to_string());
+        }
+        if (column >= this.columnCount()) {
+            var w = 0.0;
+            if (g_grid_pending_width.contains_key(this.handle)) {
+                let list = g_grid_pending_width[this.handle];
+                if (column < list.len() and list[column] != NO_WIDTH) {
+                    w = list[column];
+                }
+            }
+            return w;
+        }
+        let col = msgI(this.handle, sel("columnAtIndex:"), column);
+        var w = msgRetD(col, sel("width"));
+        if (w < SIZE_FOR_CONTENT_LIMIT) {
+            w = 0.0;
+        }
+        return w;
+    }
+
+    ## Place the view of the one cell (`column`, `row`) horizontally,
+    ## overriding its column: ALIGN_LEADING, ALIGN_CENTER, ALIGN_TRAILING,
+    ## ALIGN_FILL, or ALIGN_INHERIT (back to the column's placement) — e.g. a
+    ## button centered at its natural width in a fill-aligned column.
+    pub func setCellXAlignment(column: int, row: int, align: int): void {
+        checkGridAlign(align, false, "setCellXAlignment");
+        let c = this.gridCell(column, row, "setCellXAlignment");
+        msgI(c, sel("setXPlacement:"), placement(align));
+        return;
+    }
+
+    ## The ALIGN_* value set on the cell itself (ALIGN_INHERIT: it follows
+    ## its column).
+    pub func cellXAlignment(column: int, row: int): int {
+        let c = this.gridCell(column, row, "cellXAlignment");
+        let a = alignOfPlacement(msg(c, sel("xPlacement")));
+        return a;
+    }
+
+    ## Place the view of the one cell (`column`, `row`) vertically,
+    ## overriding its row: ALIGN_LEADING (top), ALIGN_CENTER, ALIGN_TRAILING
+    ## (bottom), ALIGN_FILL, ALIGN_BASELINE, or ALIGN_INHERIT (back to the
+    ## row's placement and baseline alignment).
+    pub func setCellYAlignment(column: int, row: int, align: int): void {
+        checkGridAlign(align, true, "setCellYAlignment");
+        let c = this.gridCell(column, row, "setCellYAlignment");
+        if (align == ALIGN_INHERIT) {
+            msgI(c, sel("setRowAlignment:"), ROW_ALIGN_INHERITED);
+            msgI(c, sel("setYPlacement:"), PLACE_INHERITED);
+        } else if (align == ALIGN_BASELINE) {
+            msgI(c, sel("setRowAlignment:"), ROW_ALIGN_FIRST_BASELINE);
+        } else {
+            msgI(c, sel("setRowAlignment:"), ROW_ALIGN_NONE);
+            msgI(c, sel("setYPlacement:"), placement(align));
+        }
+        return;
+    }
+
+    ## The ALIGN_* value set on the cell itself (ALIGN_INHERIT: it follows
+    ## its row).
+    pub func cellYAlignment(column: int, row: int): int {
+        let c = this.gridCell(column, row, "cellYAlignment");
+        if (msg(c, sel("rowAlignment")) == ROW_ALIGN_FIRST_BASELINE) {
+            return ALIGN_BASELINE;
+        }
+        let a = alignOfPlacement(msg(c, sel("yPlacement")));
+        return a;
+    }
+
+    ## Merge `count` cells of `row`, starting at `column`, into one (the first
+    ## cell's view spans them). Throws ValueError when the range leaves the
+    ## grid.
+    pub func mergeCells(row: int, column: int, count: int): void {
+        this.mergeCellRange(column, row, count, 1);
+        return;
+    }
+
+    ## Merge the block of `columns` x `rows` cells whose top-left cell is
+    ## (`column`, `row`) into one: the top-left cell's view spans the block
+    ## (put `emptyCell()` in the others). Throws ValueError when the block is
+    ## empty or leaves the grid.
+    pub func mergeCellRange(column: int, row: int, columns: int, rows: int): void {
+        if (columns < 1 or rows < 1) {
+            throw ValueError("appkit.layout: GridView.mergeCellRange: an empty range (" + columns.to_string()
+                + " x " + rows.to_string() + ")");
+        }
+        this.checkCell(column, row, "mergeCellRange");
+        this.checkCell(column + columns - 1, row + rows - 1, "mergeCellRange");
+        msgIIII(this.handle, sel("mergeCellsInHorizontalRange:verticalRange:"), column, columns, row, rows);
+        return;
+    }
+
+    ## The cell at the top left of the merged block that covers (`column`,
+    ## `row`), as [column, row]; the cell itself when it is not merged.
+    pub func mergeHead(column: int, row: int): list[int] {
+        # Every cell of a merged block is the head cell's object, whose
+        # column and row are the block's top left.
+        let c = this.gridCell(column, row, "mergeHead");
+        let hc = msgI(this.handle, sel("indexOfColumn:"), msg(c, sel("column")));
+        let hr = msgI(this.handle, sel("indexOfRow:"), msg(c, sel("row")));
+        let out = [hc, hr];
+        return out;
+    }
+}

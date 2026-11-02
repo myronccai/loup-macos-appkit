@@ -1,0 +1,54 @@
+drawn on screen: true
+display() drew: true
+handler draws == drawCount: true
+graphics canvas is the canvas: true
+graphics size: 420.0 x 320.0
+text width > 100: true
+full draw dirty: 0.0 0.0 420.0 320.0
+Graphics(...) fields: 12.0 34.0 true 1.0 2.0 3.0 4.0
+redrawRect + flush drew: true, dirty: 10.0 20.0 30.0 40.0
+flush with nothing pending drew: false
+canvas frame: 0.0 0.0 420.0 320.0
+toWindow(10, 20): 10.0,300.0
+fromWindow back: 10.0,20.0
+mouse: down 40.0,250.0 | drag 120.0,300.0 | drag 200.0,250.0 | drag 280.0,300.0 | up 380.0,240.0
+has focus after click: true
+bad kind: Canvas.sendMouse: kind must be "down", "drag" or "up", not "hover"
+focus(): true
+typed: hi!
+key codes: 4,34,18
+redraw + display drew again: true
+applyFillColor(srgb) drawn: true
+applyFillColor(system blue) drawn as resolved: true
+style defaults: cap 0, join 0, dash 0
+style lineJoin after setLineJoin(bevel): 2
+style lineCap after setLineCap(square): 2
+style lineDash: 10.0 10.0 phase 5.0
+style solid again: dash 0
+style setLineCap(7) ValueError: true
+style setLineJoin(-2) ValueError: true
+style setLineDash([-1]) ValueError: true
+style setLineDash([0, 0]) ValueError: true
+render is sRGB: true
+join miter: (88, 22) painted, (86, 24) painted
+join round: (188, 22) blank, (186, 24) painted
+join bevel: (288, 22) blank, (286, 24) blank
+cap butt: inside painted, 3 pt past the end blank
+cap round: inside painted, 3 pt past the end painted, 3 pt past and 4 pt aside blank
+cap square: inside painted, 3 pt past the end painted, 3 pt past and 4 pt aside painted
+dash [10, 10]: painted blank painted
+dash phase 5: painted blank painted
+dots [0, 8] round: painted blank
+unset cap (class default butt): blank
+png: sRGB true, 400.0 x 200.0 pt, same pixels: true
+png cap round past the end: painted, butt: blank
+loadBitmap(removed file): RuntimeError
+class default round: defaults: cap 1, join 0, dash 0, unset cap past the end painted
+tool tip tags: true, count 2
+toolTipAt(50, 110): Butt cap, (50, 125): Round cap, (390, 190): []
+overlapping, added last: Overlap, count 3
+removeToolTip: count 2, (25, 110): []
+removeToolTip again: ValueError
+addToolTip(empty rect): ValueError
+other canvas count: 0
+removeAllToolTips: count 0

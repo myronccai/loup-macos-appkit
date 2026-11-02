@@ -1,0 +1,151 @@
+columns: 3
+rows: 20
+column 'kind' exists: true
+column 'nope' exists: false
+width name: 148
+cell name 0: file1
+cell kind 1: image
+cell size 19: 14 KB
+cell out of range: ''
+selected before: -1
+selected after selectRow(3): 3
+  event: select 3
+selectedRows: [1, 2, 5]
+  event: select 5
+after deselectAll: -1
+  event: select -1
+rows before reload: 20
+rows after reload: 25
+cell name 0 after reload: README.md
+cell name 24 after reload: file25
+  event: select 4
+  event: double-click 4
+  event: header size
+sort indicator size: 'ascending'
+sort indicator name: ''
+first row after sort: file17 3 KB
+sort indicator name (descending): 'descending'
+sort indicator size (cleared): ''
+sort indicator name (all cleared): ''
+editable name: 1
+editable size: 0
+editing: true
+  event: select 2
+  event: edit name 2 'renamed.txt'
+cell name 2 after edit: renamed.txt
+editable name after setEditable(false): 0
+size title: Size (KB)
+alternating: true
+alternating after off: false
+header visible: false
+header visible again: true
+grid mask: 3
+grid mask off: 0
+row height: 20
+list rows: 5
+list columns: 1
+list header visible: false
+list item 2: Sent
+list selected: 2 'Sent'
+  event: list select 2
+  event: list double-click 2
+list items: Alpha,Beta,Gamma,Delta,Epsilon,Zeta
+list rows after setItems: 6
+list selected: 4 'Epsilon'
+  event: list select 4
+  event: select 3
+size alignment: left
+size setColumnAlignment(right): right
+kind setColumnAlignment(center): center
+unknown column alignment: ValueError
+size column font: 12
+list cell font semibold: true size 13
+-- tasks
+tasks: [x] Write the probe (2); [ ] Check the box (1); [ ] Sort the rows (3); [x] Commit an edit (2)
+done is check-box column: true, title: false
+cell done 0: 1 1: 0
+  event: toggle done 1 true
+checked 1 after click: true
+  event: toggle done 0 false
+checked 0 after click: false
+read-only box 2 after click: false
+done editable after setEditable(false): 1
+clickCheckBox on a text column: ValueError
+clickCheckBox row 9: ValueError
+isChecked on a text column: ValueError
+resizing done: 0 title: 3
+resizing prio: 2
+setColumnResizing(9): ValueError
+resizing constants: 0 1 2 3
+title range: 120 .. 400
+prio range: 40 .. 0
+setColumnWidthRange max < min: ValueError
+prio width: 70
+title width capped at max: 400
+autoresizing: 1
+autoresizing now: 2
+setColumnAutoresizing(9): ValueError
+autoresize constants: 0 1 2 3 4 5
+sizeColumnsToFit fills the empty strip: true (title grew: true)
+fixed done width after fit: 44
+user-only prio width after fit: 70
+sizeColumnsToFit again changes nothing: true
+narrowed title leaves a strip: true
+sizeLastColumnToFit fills it again: true (the last autoresizing column, title, grew: true; user-only prio kept 70)
+title header: Title
+prio header now: Prio
+columnTitle of an unknown column: ValueError
+sort column before: '' ascending true
+  event: task header title
+  event: sort title ascending=true
+sorted: title ascending: [x] Check the box (1); [x] Commit an edit (2); [ ] Sort the rows (3); [ ] Write the probe (2)
+  event: task header title
+  event: sort title ascending=false
+sorted: title descending: [ ] Write the probe (2); [ ] Sort the rows (3); [x] Commit an edit (2); [x] Check the box (1)
+  event: task header prio
+  event: sort prio ascending=true
+sorted: prio ascending title indicator '': [x] Check the box (1); [x] Commit an edit (2); [ ] Write the probe (2); [ ] Sort the rows (3)
+  event: task header done
+after unsortable done click: prio ascending true
+setSortIndicator(prio, descending): prio ascending false
+  event: task header prio
+  event: sort prio ascending=true
+after click: ascending true
+clickHeader of an unknown column: ValueError
+  event: task double-click 2
+  event: task double-click 1
+editing after doubleClickRow on an editable column: false
+doubleClickRow(9): ValueError
+  event: task edit title 0 'Renamed task'
+title 0 after commitEdit: Renamed task editing: false
+  event: task edit title 3 'Another'
+title 3 after commitEdit: Another
+commitEdit on a read-only column: ValueError
+commitEdit on a check-box column: ValueError
+commitEdit row 9: ValueError
+  event: loose edit c 1 'no window'
+-- list hooks
+LIST_COLUMN: item item 0: Alpha
+  event: list select 1
+  event: list double-click 1
+  event: list select 0
+  event: list edit item 0 'Omega'
+-- clicks
+  event: select -1
+  event: select 5
+  event: click 5
+after clickRow(5): selected 5, clickedRow -1, table has the focus true
+  event: click 5
+clicking the selected row again: selected 5
+  event: select 2
+  event: select 7
+  event: click 7
+clickRow(7) with rows 1 and 2 selected: [7]
+clickRow(99): ValueError
+  event: list select 2
+  event: list click 2
+list after clickRow(2): 2 'Gamma'
+  event: loose select 1
+  event: loose click 1
+loose selected: 1
+scroll frame: 20 50 400 350

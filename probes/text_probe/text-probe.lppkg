@@ -1,0 +1,13 @@
+name = "text-probe"
+version = "0.1.0"
+
+[build]
+entry = "src/main.lphc"
+mode = "host.native"
+delivery = "native"
+
+[dependencies]
+appkit = { path = "../.." }
+
+[delivery.native]
+framework = ["AppKit"]

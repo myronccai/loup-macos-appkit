@@ -1,0 +1,828 @@
+@mode(host.native)
+
+# appkit.dialogs — modal dialogs (NSAlert, NSOpenPanel, NSSavePanel) and the
+# system services an app reaches for next to them: the clipboard
+# (NSPasteboard), the beep, named sounds (NSSound), opening URLs and revealing
+# files in the Finder (NSWorkspace).
+#
+# Text files: `readTextFile(path)` and `writeTextFile(path, text)` read and
+# write a UTF-8 file through Foundation (`+[NSString
+# stringWithContentsOfFile:encoding:error:]`, `-writeToFile:atomically:
+# encoding:error:`) and REPORT a failure — a missing file, a folder, no
+# permission, bytes that are not UTF-8 — as a value with Foundation's
+# localized message for the user ("The file “x.txt” couldn’t be opened
+# because there is no such file."), never as an exception. `io.fs` works
+# natively too, and its failures are catchable `IoError`s on every lane
+# (`catch (IoError as e)`), but they are written for developers
+# ("read_text failed on '/Users/…/x.txt': No such file or directory (os
+# error 2)"), and `io.fs.readText` accepts bytes that are not UTF-8 (a
+# Latin-1 file loads as broken text) where `readTextFile` refuses them. So
+# a GUI app reading or writing a file the user picked uses these helpers
+# (the message can go straight into an alert); `io.fs` stays the portable
+# route for `host.dual` code and `loup test`. These helpers are macOS-only.
+# Paths are used as given (no `~` expansion); a write is atomic (a
+# temporary file renamed over the target).
+#
+# Save panels: `saveFile(name)` takes any name as typed;
+# `saveFileWithTypes(name, ["png"])` restricts the panel to those types, so
+# it adds the extension to a name typed without one and asks about
+# replacing the file under the full name.
+#
+# Modal dialogs block the event loop until the user answers, so a GUI
+# self-test cannot drive them. `setTestAnswers` installs a queue of canned
+# answers: while it is non-empty every dialog function (and `openURL` /
+# `revealInFinder`, which would leave the app) takes the next answer, records
+# what it would have shown in `testLog()`, and returns WITHOUT showing
+# anything. With an empty queue the real dialogs run.
+
+from appkit.objc import (cls, sel, make, nsstr, str_of, nsarray, nsstrings, msg, msgV, msgI, msgII,
+    msgIII, msgIIII, msgDD, malloc, free);
+from appkit.app import (isSelfTest, isQuietSelfTest);
+
+@symbol("objc_msgSend") extern native "objc" func msgF(recv: int, sel: int, v: float32): int;
+
+extern native "AppKit.framework" func NSBeep(): void;
+
+## NSAlertFirstButtonReturn — `runModal` of an NSAlert returns this plus the
+## 0-based index of the pressed button.
+pub const ALERT_FIRST_BUTTON: int = 1000;
+## NSModalResponseOK — an open or save panel's `runModal` when the user chose.
+pub const PANEL_OK: int = 1;
+## NSPasteboardTypeString — the clipboard type of plain text.
+pub const PASTEBOARD_TEXT: string = "public.utf8-plain-text";
+
+## NSUTF8StringEncoding.
+const UTF8: int = 4;
+
+## Width of the text field `prompt` adds to its alert.
+const PROMPT_FIELD_WIDTH: float = 260.0;
+## Height of the text field `prompt` adds to its alert.
+const PROMPT_FIELD_HEIGHT: float = 24.0;
+
+var g_answers: list[string] = [];
+var g_answer_pos: int = 0;
+var g_test_log: list[string] = [];
+## The NSArray handles of `ClipboardContents` not yet given back to
+## `restoreClipboard` (each holds one retain).
+var g_live_saves: dict[int, bool] = {};
+## Extra NSSound copies started by `playSound` while the shared named sound
+## was busy; each holds one retain until it has finished playing.
+var g_sound_copies: list[int] = [];
+
+# ── canned answers (testing) ───────────────────────────────────────────────
+
+## Queue canned answers for the dialogs (for self-tests). While answers are
+## left, each dialog function — and `openURL` / `revealInFinder` — takes the
+## next one instead of showing anything:
+## `alert` the pressed button's 0-based index as a decimal string ("0", "1")
+## or "-1" (the alert ended without a button press);
+## `confirm` "yes" or "no"; `info` any answer (it is ignored);
+## `prompt` the text typed ("" means Cancel); `openFile` / `openFolder` /
+## `saveFile` / `saveFileWithTypes` the chosen path ("" means Cancel;
+## `saveFileWithTypes` completes the extension as its panel does);
+## `openURL` / `revealInFinder`
+## "yes" or "no" (whether it succeeded).
+## Replaces any earlier queue and clears `testLog()`. `setTestAnswers([])`
+## turns the canned answers off.
+pub func setTestAnswers(answers: list[string]): void {
+    g_answers = answers;
+    g_answer_pos = 0;
+    g_test_log = [];
+    return;
+}
+
+## How many canned answers are still queued (0: the real dialogs run).
+pub func testAnswersLeft(): int {
+    let left = g_answers.len() - g_answer_pos;
+    return left;
+}
+
+## One line per call answered from the canned queue, in call order:
+## `<function>: <what it would have shown> -> <answer>`.
+pub func testLog(): list[string] {
+    let log = g_test_log;
+    return log;
+}
+
+## Whether a canned answer is waiting.
+func hasCanned(): bool {
+    let waiting = g_answer_pos < g_answers.len();
+    return waiting;
+}
+
+## Whether `what` (a dialog, a panel, a workspace call) takes the next canned
+## answer instead of acting for real. A `--self-test` run never shows a real
+## modal dialog or panel and never opens another app: with no canned answer
+## waiting there, `what` is a RuntimeError naming it (queue its answer with
+## `setTestAnswers` first).
+func useCanned(what: string): bool {
+    if (hasCanned()) {
+        return true;
+    }
+    if (isSelfTest()) {
+        throw RuntimeError("appkit.dialogs." + what + ": no canned answer is waiting in a --self-test run (a self-test never shows a real dialog or panel, or opens another app); call setTestAnswers first");
+    }
+    return false;
+}
+
+## Take the next canned answer, logging `what` against it.
+func takeCanned(what: string): string {
+    let answer = g_answers[g_answer_pos];
+    g_answer_pos = g_answer_pos + 1;
+    g_test_log.push(what + " -> " + answer);
+    return answer;
+}
+
+## A canned "yes" / "no" as a bool (anything else is a ValueError).
+func cannedBool(fname: string, answer: string): bool {
+    if (answer == "yes") {
+        return true;
+    }
+    if (answer == "no") {
+        return false;
+    }
+    throw ValueError("appkit.dialogs." + fname + ": the canned answer must be \"yes\" or \"no\", got \"" + answer + "\"");
+}
+
+## The canned `alert` answer for an alert that ended without a button press.
+const NO_BUTTON_ANSWER: string = "-1";
+
+## Whether `text` is a plain non-negative decimal integer ("0", "12").
+func isIndex(text: string): bool {
+    if (text.len() == 0) {
+        return false;
+    }
+    let n = text.toInt();
+    if (n < 0) {
+        return false;
+    }
+    let canonical = n.to_string();
+    let same = canonical == text;
+    return same;
+}
+
+# ── alerts ─────────────────────────────────────────────────────────────────
+
+## A new NSAlert (+1, the caller releases it) with its title and message.
+func newAlert(title: string, message: string): int {
+    let a = make("NSAlert");
+    let ns_title = nsstr(title);
+    msgI(a, sel("setMessageText:"), ns_title);
+    let ns_message = nsstr(message);
+    msgI(a, sel("setInformativeText:"), ns_message);
+    return a;
+}
+
+## Add a button titled `title` to the alert `a` (the first added is the
+## default; later ones go to its left).
+func addAlertButton(a: int, title: string): void {
+    let ns_title = nsstr(title);
+    msgI(a, sel("addButtonWithTitle:"), ns_title);
+    return;
+}
+
+## Run the alert `a` modally and return its NSModalResponse.
+func runAlert(a: int): int {
+    let response = msg(a, sel("runModal"));
+    return response;
+}
+
+## Show a modal alert with `title` (bold) and `message`, and buttons titled
+## `buttons` from right to left (the first is the default, Return; a button
+## titled "Cancel" answers Escape). Returns the 0-based index of the pressed
+## button. With no buttons (`[]`) the alert gets one "OK" button, which
+## returns 0. Returns -1 when the alert ended without a button press (another
+## piece of code called `stopModal` / `abortModal` on the application).
+## Canned answer: the index as a decimal string, or "-1" for an alert that
+## ended without a button press.
+pub func alert(title: string, message: string, buttons: list[string]): int {
+    var titles = buttons;
+    if (titles.len() == 0) {
+        titles = ["OK"];
+    }
+    let count = titles.len();
+    if (useCanned("alert")) {
+        let answer = takeCanned("alert: " + title + " [" + buttons.join(", ") + "]");
+        if (answer == NO_BUTTON_ANSWER) {
+            return -1;
+        }
+        if (not isIndex(answer)) {
+            throw ValueError("appkit.dialogs.alert: the canned answer must be a button index or \"-1\", got \"" + answer + "\"");
+        }
+        let index = answer.toInt();
+        if (index >= count) {
+            throw ValueError("appkit.dialogs.alert: canned button index " + answer + " is out of range (the alert has " + count.to_string() + " button(s))");
+        }
+        return index;
+    }
+    let a = newAlert(title, message);
+    for (b in titles) {
+        addAlertButton(a, b);
+    }
+    let response = runAlert(a);
+    msgV(a, sel("release"));
+    let index = response - ALERT_FIRST_BUTTON;
+    if (index < 0) {
+        return -1;
+    }
+    if (index >= count) {
+        return -1;
+    }
+    return index;
+}
+
+## Ask a yes/no question: an alert with "OK" (default) and "Cancel". Returns
+## true for OK. Canned answer: "yes" or "no".
+pub func confirm(title: string, message: string): bool {
+    if (useCanned("confirm")) {
+        let answer = takeCanned("confirm: " + title);
+        let yes = cannedBool("confirm", answer);
+        return yes;
+    }
+    let index = alert(title, message, ["OK", "Cancel"]);
+    let yes = index == 0;
+    return yes;
+}
+
+## Show an informational alert with one "OK" button and wait until it is
+## dismissed. Canned answer: any (it is consumed and ignored).
+pub func info(title: string, message: string): void {
+    if (useCanned("info")) {
+        takeCanned("info: " + title);
+        return;
+    }
+    alert(title, message, ["OK"]);
+    return;
+}
+
+## Ask for a line of text: an alert with a text field (pre-filled with
+## `defaultText`) and "OK" / "Cancel". Returns the text, or "" when cancelled.
+## Canned answer: the text ("" stands for Cancel).
+pub func prompt(title: string, message: string, defaultText: string): string {
+    if (useCanned("prompt")) {
+        let answer = takeCanned("prompt: " + title + " [" + defaultText + "]");
+        return answer;
+    }
+    let a = newAlert(title, message);
+    addAlertButton(a, "OK");
+    addAlertButton(a, "Cancel");
+    let ns_default = nsstr(defaultText);
+    let field = msgI(cls("NSTextField"), sel("textFieldWithString:"), ns_default);
+    msgDD(field, sel("setFrameSize:"), PROMPT_FIELD_WIDTH, PROMPT_FIELD_HEIGHT);
+    msgI(a, sel("setAccessoryView:"), field);
+    msgV(a, sel("layout"));
+    let alert_window = msg(a, sel("window"));
+    msgI(alert_window, sel("setInitialFirstResponder:"), field);
+    let response = runAlert(a);
+    var text = "";
+    if (response == ALERT_FIRST_BUTTON) {
+        let ns_text = msg(field, sel("stringValue"));
+        text = str_of(ns_text);
+    }
+    msgV(a, sel("release"));
+    return text;
+}
+
+# ── open and save panels ───────────────────────────────────────────────────
+
+## The file-system path of the panel's chosen URL ("" for none).
+func panelPath(panel: int): string {
+    let url = msg(panel, sel("URL"));
+    if (url == 0) {
+        return "";
+    }
+    let ns_path = msg(url, sel("path"));
+    let path = str_of(ns_path);
+    return path;
+}
+
+## The UTTypes of the extensions `exts` (no dots: "txt"), in order; [] when
+## the UTType class is missing (before macOS 11).
+func contentTypes(exts: list[string]): list[int] {
+    var types: list[int] = [];
+    let ut = cls("UTType");
+    if (ut == 0) {
+        return types;
+    }
+    for (e in exts) {
+        let ns_ext = nsstr(e);
+        let t = msgI(ut, sel("typeWithFilenameExtension:"), ns_ext);
+        if (t != 0) {
+            types.push(t);
+        }
+    }
+    return types;
+}
+
+## Restrict `panel` to files with the extensions `exts` (no dots: "txt").
+## Uses UTType (`allowedContentTypes`) when available, else the older
+## `allowedFileTypes`.
+func restrictTypes(panel: int, exts: list[string]): void {
+    if (exts.len() == 0) {
+        return;
+    }
+    let ut = cls("UTType");
+    if (ut == 0) {
+        let ns_exts = nsstrings(exts);
+        msgI(panel, sel("setAllowedFileTypes:"), ns_exts);
+        return;
+    }
+    let types = contentTypes(exts);
+    let ns_types = nsarray(types);
+    msgI(panel, sel("setAllowedContentTypes:"), ns_types);
+    return;
+}
+
+## The extension of the last component of `path` ("" when its name has no
+## dot after the first character: "notes", ".profile").
+func extensionOf(path: string): string {
+    let parts = path.split("/");
+    let name = parts[parts.len() - 1];
+    let pieces = name.split(".");
+    if (pieces.len() < 2) {
+        return "";
+    }
+    let first = pieces[0];
+    if (first.len() == 0 and pieces.len() == 2) {
+        return "";
+    }
+    let ext = pieces[pieces.len() - 1];
+    return ext;
+}
+
+## `path` as a save panel restricted to the extensions `exts` returns it:
+## unchanged when its extension is one of the allowed types (by UTType, so
+## "jpeg" counts for "jpg" and case does not matter), else with the first
+## type's preferred extension added ("drawing" → "drawing.png",
+## "notes.txt" → "notes.txt.png"). "" (Cancel) and `exts` [] leave it as is.
+func withAllowedExtension(path: string, exts: list[string]): string {
+    if (path.len() == 0 or exts.len() == 0) {
+        return path;
+    }
+    let ext = extensionOf(path);
+    let types = contentTypes(exts);
+    if (types.len() == 0) {
+        # No UTType: compare the extensions as text.
+        for (e in exts) {
+            if (ext.toLowerCase() == e.toLowerCase()) {
+                return path;
+            }
+        }
+        let plain = path + "." + exts[0];
+        return plain;
+    }
+    if (ext.len() > 0) {
+        let typed = msgI(cls("UTType"), sel("typeWithFilenameExtension:"), nsstr(ext));
+        if (typed != 0) {
+            for (t in types) {
+                let conforms = msgI(typed, sel("conformsToType:"), t) & 255;
+                if (conforms != 0) {
+                    return path;
+                }
+            }
+        }
+    }
+    var preferred = str_of(msg(types[0], sel("preferredFilenameExtension")));
+    if (preferred.len() == 0) {
+        preferred = exts[0];
+    }
+    let completed = path + "." + preferred;
+    return completed;
+}
+
+## An NSOpenPanel choosing one item: files when `files`, else folders.
+func openPanel(files: bool): int {
+    let panel = msg(cls("NSOpenPanel"), sel("openPanel"));
+    var f = 0;
+    var d = 1;
+    if (files) {
+        f = 1;
+        d = 0;
+    }
+    msgI(panel, sel("setCanChooseFiles:"), f);
+    msgI(panel, sel("setCanChooseDirectories:"), d);
+    msgI(panel, sel("setAllowsMultipleSelection:"), 0);
+    return panel;
+}
+
+## Ask for a file to open (NSOpenPanel). `allowedExtensions` limits the
+## choice to those extensions, written without the dot (`["txt", "md"]`);
+## `[]` allows any file. Returns the chosen path, or "" when cancelled.
+## Canned answer: the path.
+pub func openFile(allowedExtensions: list[string]): string {
+    if (useCanned("openFile")) {
+        let answer = takeCanned("openFile: [" + allowedExtensions.join(", ") + "]");
+        return answer;
+    }
+    let panel = openPanel(true);
+    restrictTypes(panel, allowedExtensions);
+    let response = msg(panel, sel("runModal"));
+    if (response != PANEL_OK) {
+        return "";
+    }
+    let path = panelPath(panel);
+    return path;
+}
+
+## Ask for a folder (NSOpenPanel choosing directories). Returns its path, or
+## "" when cancelled. Canned answer: the path.
+pub func openFolder(): string {
+    if (useCanned("openFolder")) {
+        let answer = takeCanned("openFolder");
+        return answer;
+    }
+    let panel = openPanel(false);
+    msgI(panel, sel("setCanCreateDirectories:"), 1);
+    let response = msg(panel, sel("runModal"));
+    if (response != PANEL_OK) {
+        return "";
+    }
+    let path = panelPath(panel);
+    return path;
+}
+
+## Ask where to save (NSSavePanel), proposing the file name `suggestedName`
+## ("" for none). Returns the chosen path (the panel has already asked about
+## replacing an existing file), or "" when cancelled. Nothing is written.
+## The panel takes any name as typed: "drawing" stays "drawing", and its
+## replace check sees only that name — use `saveFileWithTypes` to have the
+## panel add (and check) an extension. Canned answer: the path.
+pub func saveFile(suggestedName: string): string {
+    if (useCanned("saveFile")) {
+        let answer = takeCanned("saveFile: " + suggestedName);
+        return answer;
+    }
+    let panel = msg(cls("NSSavePanel"), sel("savePanel"));
+    msgI(panel, sel("setCanCreateDirectories:"), 1);
+    if (suggestedName.len() > 0) {
+        let ns_name = nsstr(suggestedName);
+        msgI(panel, sel("setNameFieldStringValue:"), ns_name);
+    }
+    let response = msg(panel, sel("runModal"));
+    if (response != PANEL_OK) {
+        return "";
+    }
+    let path = panelPath(panel);
+    return path;
+}
+
+## Ask where to save a file of one of the types `allowedExtensions`
+## (written without the dot: `["png"]`, `["txt", "md"]`), proposing
+## `suggestedName` ("" for none). The NSSavePanel is restricted to those
+## types (`allowedContentTypes`): a name typed without one of their
+## extensions gets the first type's preferred extension ("drawing" →
+## "drawing.png"; "jpg" prefers "jpeg"), and the panel asks about replacing
+## an existing file under that full name. Returns the chosen path, with the
+## extension, or "" when cancelled. Nothing is written. `[]` allows any name
+## (the same as `saveFile`). Canned answer: the path, completed with the
+## extension by the same rule (so a test can answer "…/drawing" and get
+## "…/drawing.png", as from the panel).
+pub func saveFileWithTypes(suggestedName: string, allowedExtensions: list[string]): string {
+    if (useCanned("saveFileWithTypes")) {
+        let answer = takeCanned("saveFileWithTypes: " + suggestedName + " [" + allowedExtensions.join(", ") + "]");
+        let completed = withAllowedExtension(answer, allowedExtensions);
+        return completed;
+    }
+    let panel = msg(cls("NSSavePanel"), sel("savePanel"));
+    msgI(panel, sel("setCanCreateDirectories:"), 1);
+    restrictTypes(panel, allowedExtensions);
+    if (suggestedName.len() > 0) {
+        let ns_name = nsstr(suggestedName);
+        msgI(panel, sel("setNameFieldStringValue:"), ns_name);
+    }
+    let response = msg(panel, sel("runModal"));
+    if (response != PANEL_OK) {
+        return "";
+    }
+    let path = panelPath(panel);
+    return path;
+}
+
+# ── the clipboard ──────────────────────────────────────────────────────────
+
+## The general pasteboard.
+func pasteboard(): int {
+    let pb = msg(cls("NSPasteboard"), sel("generalPasteboard"));
+    return pb;
+}
+
+## Put `text` on the clipboard (replacing everything on it). Returns whether
+## the pasteboard accepted it.
+pub func copyText(text: string): bool {
+    let pb = pasteboard();
+    msg(pb, sel("clearContents"));
+    let ns_text = nsstr(text);
+    let ns_type = nsstr(PASTEBOARD_TEXT);
+    let result = msgII(pb, sel("setString:forType:"), ns_text, ns_type);
+    let ok = result & 255;
+    let accepted = ok != 0;
+    return accepted;
+}
+
+## The clipboard's NSString of type PASTEBOARD_TEXT (0 when it holds no text).
+func clipboardNSString(): int {
+    let pb = pasteboard();
+    let ns_type = nsstr(PASTEBOARD_TEXT);
+    let ns = msgI(pb, sel("stringForType:"), ns_type);
+    return ns;
+}
+
+## The clipboard's text ("" when it holds no text).
+pub func pasteText(): string {
+    let ns = clipboardNSString();
+    let text = str_of(ns);
+    return text;
+}
+
+## Whether the clipboard holds text.
+pub func clipboardHasText(): bool {
+    let ns = clipboardNSString();
+    let has = ns != 0;
+    return has;
+}
+
+## A saved copy of everything on the clipboard (every item, every type), from
+## `saveClipboard`, for `restoreClipboard`. `handle` is a retained NSArray of
+## NSPasteboardItems.
+pub class ClipboardContents {
+    ## The retained NSArray of NSPasteboardItem copies.
+    pub let handle: int;
+
+    ## Wrap a retained NSArray of NSPasteboardItems (made by `saveClipboard`).
+    pub func constructor(handle: int) {
+        this.handle = handle;
+    }
+
+    ## How many items were saved. Throws RuntimeError once the copy has been
+    ## given to `restoreClipboard`.
+    pub func count(): int {
+        requireLiveSave(this.handle, "ClipboardContents.count");
+        let n = msg(this.handle, sel("count"));
+        return n;
+    }
+}
+
+## Whether `handle` is a saved clipboard copy not yet restored.
+func isLiveSave(handle: int): bool {
+    let found = g_live_saves.get(handle) ?? false;
+    return found;
+}
+
+## Throw RuntimeError unless `handle` is a saved clipboard copy not yet
+## restored (`what` names the caller in the message).
+func requireLiveSave(handle: int, what: string): void {
+    let live = isLiveSave(handle);
+    if (not live) {
+        throw RuntimeError("appkit.dialogs." + what + ": this ClipboardContents was already restored (and released); save the clipboard again");
+    }
+    return;
+}
+
+## Copy everything on the clipboard (all items, all their types) so it can be
+## put back with `restoreClipboard` — e.g. around a test that uses the real
+## clipboard.
+pub func saveClipboard(): ClipboardContents {
+    let pb = pasteboard();
+    let items = msg(pb, sel("pasteboardItems"));
+    let copies = msg(cls("NSMutableArray"), sel("array"));
+    msgV(copies, sel("retain"));
+    var n = 0;
+    if (items != 0) {
+        n = msg(items, sel("count"));
+    }
+    var i = 0;
+    while (i < n) {
+        let item = msgI(items, sel("objectAtIndex:"), i);
+        let types = msg(item, sel("types"));
+        let copy = make("NSPasteboardItem");
+        let tn = msg(types, sel("count"));
+        var j = 0;
+        while (j < tn) {
+            let t = msgI(types, sel("objectAtIndex:"), j);
+            let data = msgI(item, sel("dataForType:"), t);
+            if (data != 0) {
+                msgII(copy, sel("setData:forType:"), data, t);
+            }
+            j = j + 1;
+        }
+        msgI(copies, sel("addObject:"), copy);
+        msgV(copy, sel("release"));
+        i = i + 1;
+    }
+    g_live_saves[copies] = true;
+    let saved = ClipboardContents(copies);
+    return saved;
+}
+
+## Put back what `saveClipboard` saved (replacing the clipboard's contents)
+## and release the saved copy. A `ClipboardContents` restores once: a second
+## `restoreClipboard` (or `count()`) on it throws RuntimeError instead of
+## touching the released copy.
+pub func restoreClipboard(saved: ClipboardContents): void {
+    let handle = saved.handle;
+    requireLiveSave(handle, "restoreClipboard");
+    g_live_saves.remove(handle);
+    let pb = pasteboard();
+    msg(pb, sel("clearContents"));
+    let n = msg(handle, sel("count"));
+    if (n > 0) {
+        msgI(pb, sel("writeObjects:"), handle);
+    }
+    msgV(handle, sel("release"));
+    return;
+}
+
+# ── text files ─────────────────────────────────────────────────────────────
+
+## The result of `readTextFile`: `succeeded`, the file's text in
+## `contents` ("" on failure) and, on failure, Foundation's description of
+## the problem in `failure` ("" on success). (The field names are unusual
+## because older native toolchains misread a captured object's field when
+## another type used the same name; fixed since, see the collection's
+## Agents.md.)
+pub struct TextRead {
+    pub succeeded: bool;
+    pub contents: string;
+    pub failure: string;
+}
+
+## A pointer-sized cell holding nil, for an `NSError **` argument.
+func newErrorCell(): int {
+    let cell = malloc(8);
+    Volatile[int].at(cell).write(0);
+    return cell;
+}
+
+## The localized description of the NSError in `cell` (`fallback` when the
+## call left it nil), and free the cell.
+func takeError(cell: int, fallback: string): string {
+    let err = Volatile[int].at(cell).read();
+    free(cell);
+    if (err == 0) {
+        return fallback;
+    }
+    let message = str_of(msg(err, sel("localizedDescription")));
+    if (message == "") {
+        return fallback;
+    }
+    return message;
+}
+
+## Read the UTF-8 text file at `path`. Never throws for a file problem: a
+## missing or unreadable file, a folder, or bytes that are not valid UTF-8
+## give `succeeded` false and the reason in `failure`.
+pub func readTextFile(path: string): TextRead {
+    let cell = newErrorCell();
+    let ns = msgIII(cls("NSString"), sel("stringWithContentsOfFile:encoding:error:"), nsstr(path), UTF8, cell);
+    if (ns == 0) {
+        let why = takeError(cell, "could not read " + path);
+        let failed = TextRead(succeeded = false, contents = "", failure = why);
+        return failed;
+    }
+    free(cell);
+    let text = str_of(ns);
+    let read = TextRead(succeeded = true, contents = text, failure = "");
+    return read;
+}
+
+## Write `text` to `path` as UTF-8, replacing the file (atomically: a
+## temporary file renamed over it). Returns "" on success, else Foundation's
+## description of the problem (a missing folder, no permission, …). Never
+## throws for a file problem.
+pub func writeTextFile(path: string, text: string): string {
+    let cell = newErrorCell();
+    let ok = msgIIII(nsstr(text), sel("writeToFile:atomically:encoding:error:"), nsstr(path), 1, UTF8, cell) & 255;
+    if (ok == 0) {
+        let why = takeError(cell, "could not write " + path);
+        return why;
+    }
+    free(cell);
+    return "";
+}
+
+# ── sounds ─────────────────────────────────────────────────────────────────
+
+## Play the system alert sound (NSBeep).
+## Silent in a quiet `--self-test` run (see appkit.app.isQuietSelfTest).
+pub func beep(): void {
+    if (isQuietSelfTest()) {
+        return;
+    }
+    NSBeep();
+    return;
+}
+
+## The shared NSSound named `name` (0 when there is none).
+func namedSound(name: string): int {
+    let ns_name = nsstr(name);
+    let s = msgI(cls("NSSound"), sel("soundNamed:"), ns_name);
+    return s;
+}
+
+## Whether the NSSound `s` is playing.
+func soundIsPlaying(s: int): bool {
+    let result = msg(s, sel("isPlaying"));
+    let bit = result & 255;
+    let playing = bit != 0;
+    return playing;
+}
+
+## Release the copies in `g_sound_copies` that have finished playing.
+func pruneSoundCopies(): void {
+    var still: list[int] = [];
+    for (c in g_sound_copies) {
+        let busy = soundIsPlaying(c);
+        if (busy) {
+            still.push(c);
+        } else {
+            msgV(c, sel("release"));
+        }
+    }
+    g_sound_copies = still;
+    return;
+}
+
+## Whether a sound named `name` exists (a system sound such as "Tink",
+## "Glass", "Ping", or a sound file in the app's bundle, without extension).
+pub func hasSound(name: string): bool {
+    let s = namedSound(name);
+    let found = s != 0;
+    return found;
+}
+
+## Start playing the sound named `name` (see `hasSound`) and return at once.
+## Calls in quick succession overlap: while the shared named sound is still
+## playing, a copy of it plays (kept until it finishes). Returns false when
+## there is no such sound or the sound device refused to play it.
+pub func playSound(name: string): bool {
+    pruneSoundCopies();
+    let shared_sound = namedSound(name);
+    if (shared_sound == 0) {
+        return false;
+    }
+    var s = shared_sound;
+    let busy = soundIsPlaying(shared_sound);
+    if (busy) {
+        s = msg(shared_sound, sel("copy"));
+        if (s == 0) {
+            return false;
+        }
+        g_sound_copies.push(s);
+    }
+    # A quiet `--self-test` run plays it at volume 0: the same calls, no sound.
+    if (isQuietSelfTest()) {
+        msgF(s, sel("setVolume:"), 0.0 as float32);
+    }
+    let result = msg(s, sel("play"));
+    let bit = result & 255;
+    let started = bit != 0;
+    return started;
+}
+
+## How many extra sound copies `playSound` is still holding (they are released
+## once they finish, on a later `playSound`).
+pub func soundCopiesPlaying(): int {
+    let n = g_sound_copies.len();
+    return n;
+}
+
+# ── the workspace ──────────────────────────────────────────────────────────
+
+## Open `url` ("https://…", "mailto:…", "file:///…") in its default app
+## (NSWorkspace). Returns false when `url` is not a valid URL or nothing opens
+## it. Canned answer: "yes" or "no" (nothing is opened).
+pub func openURL(url: string): bool {
+    if (useCanned("openURL")) {
+        let answer = takeCanned("openURL: " + url);
+        let ok = cannedBool("openURL", answer);
+        return ok;
+    }
+    let ns_url = nsstr(url);
+    let u = msgI(cls("NSURL"), sel("URLWithString:"), ns_url);
+    if (u == 0) {
+        return false;
+    }
+    let ws = msg(cls("NSWorkspace"), sel("sharedWorkspace"));
+    let result = msgI(ws, sel("openURL:"), u);
+    let bit = result & 255;
+    let opened = bit != 0;
+    return opened;
+}
+
+## Show the file or folder at `path` selected in a Finder window. Returns
+## false when it does not exist. Canned answer: "yes" or "no" (the Finder is
+## not touched).
+pub func revealInFinder(path: string): bool {
+    if (useCanned("revealInFinder")) {
+        let answer = takeCanned("revealInFinder: " + path);
+        let ok = cannedBool("revealInFinder", answer);
+        return ok;
+    }
+    let ws = msg(cls("NSWorkspace"), sel("sharedWorkspace"));
+    let ns_path = nsstr(path);
+    let ns_root = nsstr("");
+    let result = msgII(ws, sel("selectFile:inFileViewerRootedAtPath:"), ns_path, ns_root);
+    let bit = result & 255;
+    let shown = bit != 0;
+    return shown;
+}

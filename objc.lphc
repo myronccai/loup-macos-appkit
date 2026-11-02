@@ -1,0 +1,195 @@
+@mode(host.native)
+
+# appkit.objc — the Objective-C runtime layer under the AppKit proxies.
+#
+# Every Objective-C message is `objc_msgSend` called with the method's own C
+# signature: each shape below is one declaration bound to that symbol with
+# `@symbol("objc_msgSend")` (Runtime §2-3.4). Pointers (`id`, `Class`, `SEL`)
+# are `int` words; `CGFloat` / `NSTimeInterval` / `double` are `float`; `BOOL`
+# and `NSInteger` are `int`. Names say the argument shape after (recv, sel):
+# `I` an int/pointer, `D` a double, `S` a Loup string (passed as a C string);
+# `RetD` returns a double.
+#
+# Structs by value: an NSPoint / NSSize argument is two `D`s on arm64 and
+# x86-64; an NSRect argument is four `D`s on arm64 only. A struct RESULT cannot
+# be returned to Loup: read struct-valued properties with `point_of` /
+# `size_of` / `rect_of` (key-value coding into an NSValue, copied to memory).
+#
+# Everything here runs on the main thread (AppKit's rule).
+
+extern native "objc" func objc_getClass(name: string): int;
+extern native "objc" func sel_registerName(name: string): int;
+pub extern native "objc" func objc_allocateClassPair(superclass: int, name: string, extra: int): int;
+pub extern native "objc" func objc_registerClassPair(cls: int): void;
+pub extern native "objc" func class_addMethod(cls: int, sel: int, imp: uint64, types: string): bool;
+pub extern native "objc" func objc_autoreleasePoolPush(): int;
+pub extern native "objc" func objc_autoreleasePoolPop(pool: int): void;
+pub extern native "c" func malloc(n: int): int;
+pub extern native "c" func free(p: int): void;
+extern native "CoreFoundation.framework" func CFNumberCreate(alloc: int, kind: int, ptr: int): int;
+extern native "CoreFoundation.framework" func CFRelease(obj: int): void;
+extern native "AppKit.framework" func NSApplicationLoad(): bool;
+
+@symbol("objc_msgSend") pub extern native "objc" func msg(recv: int, sel: int): int;
+@symbol("objc_msgSend") pub extern native "objc" func msgV(recv: int, sel: int): void;
+@symbol("objc_msgSend") pub extern native "objc" func msgI(recv: int, sel: int, a: int): int;
+@symbol("objc_msgSend") pub extern native "objc" func msgII(recv: int, sel: int, a: int, b: int): int;
+@symbol("objc_msgSend") pub extern native "objc" func msgIII(recv: int, sel: int, a: int, b: int, c: int): int;
+@symbol("objc_msgSend") pub extern native "objc" func msgIIII(recv: int, sel: int, a: int, b: int, c: int, d: int): int;
+@symbol("objc_msgSend") pub extern native "objc" func msgS(recv: int, sel: int, s: string): int;
+@symbol("objc_msgSend") pub extern native "objc" func msgIS(recv: int, sel: int, a: int, s: string): int;
+@symbol("objc_msgSend") pub extern native "objc" func msgD(recv: int, sel: int, d: float): int;
+@symbol("objc_msgSend") pub extern native "objc" func msgDD(recv: int, sel: int, a: float, b: float): int;
+@symbol("objc_msgSend") pub extern native "objc" func msgDDD(recv: int, sel: int, a: float, b: float, c: float): int;
+@symbol("objc_msgSend") pub extern native "objc" func msgDDDD(recv: int, sel: int, a: float, b: float, c: float, d: float): int;
+@symbol("objc_msgSend") pub extern native "objc" func msgDDDDI(recv: int, sel: int, a: float, b: float, c: float, d: float, e: int): int;
+@symbol("objc_msgSend") pub extern native "objc" func msgDDDDII(recv: int, sel: int, a: float, b: float, c: float, d: float, e: int, f: int): int;
+@symbol("objc_msgSend") pub extern native "objc" func msgID(recv: int, sel: int, a: int, d: float): int;
+@symbol("objc_msgSend") pub extern native "objc" func msgIID(recv: int, sel: int, a: int, b: int, d: float): int;
+@symbol("objc_msgSend") pub extern native "objc" func msgDIIII(recv: int, sel: int, d: float, a: int, b: int, c: int, e: int): int;
+@symbol("objc_msgSend") pub extern native "objc" func msgRetD(recv: int, sel: int): float;
+@symbol("objc_msgSend") pub extern native "objc" func msgRetDI(recv: int, sel: int, a: int): float;
+
+## NSUTF8StringEncoding.
+const UTF8: int = 4;
+## kCFNumberDoubleType.
+const CF_NUMBER_DOUBLE: int = 13;
+
+## The class named `name` (0 when no such class is loaded).
+pub func cls(name: string): int {
+    let c = objc_getClass(name);
+    return c;
+}
+
+## The selector named `name`.
+pub func sel(name: string): int {
+    let s = sel_registerName(name);
+    return s;
+}
+
+## `[[cls alloc] init]`.
+pub func make(class_name: string): int {
+    let obj = msg(msg(cls(class_name), sel("alloc")), sel("init"));
+    return obj;
+}
+
+## An autoreleased NSString holding `text`.
+pub func nsstr(text: string): int {
+    let s = msgS(cls("NSString"), sel("stringWithUTF8String:"), text);
+    return s;
+}
+
+## The text of an NSString (`""` for nil), copied out through a malloc'd
+## buffer: `getCString:maxLength:encoding:` writes the UTF-8 bytes, which are
+## read back eight at a time from the 8-byte-aligned buffer.
+pub func str_of(ns: int): string {
+    if (ns == 0) {
+        return "";
+    }
+    let n = msgI(ns, sel("lengthOfBytesUsingEncoding:"), UTF8);
+    let cap = ((n + 1 + 7) / 8) * 8;
+    let buf = malloc(cap);
+    msgIII(ns, sel("getCString:maxLength:encoding:"), buf, n + 1, UTF8);
+    var bytes: list[int] = [];
+    var i = 0;
+    while (i < n) {
+        let word = Volatile[int].at(buf + i).read();
+        var k = 0;
+        while (k < 8 and i + k < n) {
+            bytes.push((word >> (8 * k)) & 255);
+            k = k + 1;
+        }
+        i = i + 8;
+    }
+    free(buf);
+    let text = bytesFromInts(bytes).toText();
+    return text;
+}
+
+## The double stored at `addr` (a CFNumber made from it, then `doubleValue`:
+## Loup has no float bit cast on the native lanes).
+pub func double_at(addr: int): float {
+    let n = CFNumberCreate(0, CF_NUMBER_DOUBLE, addr);
+    let d = msgRetD(n, sel("doubleValue"));
+    CFRelease(n);
+    return d;
+}
+
+## A point, a size or a rectangle in AppKit's coordinates (origin bottom-left).
+pub struct Rect {
+    pub x: float;
+    pub y: float;
+    pub w: float;
+    pub h: float;
+}
+
+## `count` doubles of the struct-valued property `key` of `obj`, read through
+## key-value coding (an NSValue) into memory.
+func doubles_of(obj: int, key: string, count: int): list[float] {
+    var out: list[float] = [];
+    let value = msgI(obj, sel("valueForKey:"), nsstr(key));
+    if (value == 0) {
+        return out;
+    }
+    let buf = malloc(8 * count);
+    msgII(value, sel("getValue:size:"), buf, 8 * count);
+    var i = 0;
+    while (i < count) {
+        out.push(double_at(buf + 8 * i));
+        i = i + 1;
+    }
+    free(buf);
+    return out;
+}
+
+## The NSRect-valued property `key` of `obj` (`frame`, `bounds`, …).
+pub func rect_of(obj: int, key: string): Rect {
+    let d = doubles_of(obj, key, 4);
+    if (d.len() < 4) {
+        return Rect(x = 0.0, y = 0.0, w = 0.0, h = 0.0);
+    }
+    let r = Rect(x = d[0], y = d[1], w = d[2], h = d[3]);
+    return r;
+}
+
+## The NSPoint-valued property `key` of `obj` (`locationInWindow`, …), as a
+## Rect whose `w` and `h` are 0.
+pub func point_of(obj: int, key: string): Rect {
+    let d = doubles_of(obj, key, 2);
+    if (d.len() < 2) {
+        return Rect(x = 0.0, y = 0.0, w = 0.0, h = 0.0);
+    }
+    let r = Rect(x = d[0], y = d[1], w = 0.0, h = 0.0);
+    return r;
+}
+
+## An NSMutableArray holding `items` (object pointers).
+pub func nsarray(items: list[int]): int {
+    let arr = msg(cls("NSMutableArray"), sel("array"));
+    for (item in items) {
+        msgI(arr, sel("addObject:"), item);
+    }
+    return arr;
+}
+
+## An NSMutableArray of NSStrings.
+pub func nsstrings(items: list[string]): int {
+    var objs: list[int] = [];
+    for (s in items) {
+        objs.push(nsstr(s));
+    }
+    let arr = nsarray(objs);
+    return arr;
+}
+
+## `[NSNumber numberWithInteger:n]`.
+pub func nsint(n: int): int {
+    let num = msgI(cls("NSNumber"), sel("numberWithInteger:"), n);
+    return num;
+}
+
+## Make sure AppKit is loaded and linked (its classes are found by name).
+pub func load_appkit(): void {
+    NSApplicationLoad();
+    return;
+}

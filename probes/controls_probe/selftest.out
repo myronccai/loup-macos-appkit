@@ -1,0 +1,186 @@
+label text: Controls Probe ✓
+label setText: Controls ✓
+label color: 0.30,0.65,1.00,1.00
+label font size: 18.00
+note font: .AppleSystemUIFontMonospaced-Regular
+aligned: right
+centered: center
+note alignment: natural
+bad alignment: ValueError
+systemFont: 12.00 valid=true
+monospacedFont: 10.00
+fontNamed Menlo: Menlo-Regular
+fontNamed missing valid: false
+fixed pitch: mono, Menlo, system, digit font, missing: true true false false false
+button clicks: 2
+button title: OK
+button setTitle: Done
+button key is return: true
+button bezel: 0
+star bezel: 12
+star symbol: true
+bad symbol: false
+bezels: 0 1 2 5 7 10 11 13 15
+disabled enabled: false
+disabled click count: 2
+button frame: 20.00 440.00 90.00 32.00
+as Control: true false true
+check initial: false
+check after click: true changes=1
+check setChecked(false): false changes=1
+check title: Feature on
+radio count: 3 buttons=3
+radio initial: 0 Small
+radio click 2: 2 Large changes=1
+radio set 1: 1 Medium changes=1
+radio none: -1 ''
+radio click 0: 0 changes=2
+radio button 0 height>0: true
+switch initial: false
+switch toggle: true changes=1
+switch setOn(false): false changes=1
+field text: hello
+field placeholder: Type here
+field typed: abc changes=1
+field submit: submits=1
+field setText: set ✓ changes=1
+field editable: true
+field setEditable(false): false
+secure text: hunter2 changes=1
+secure placeholder: Password
+as TextInput: hunter2 set ✓
+search: loup submits=1
+search placeholder: Search
+slider: 25.00 in 0.00..100.00
+slider setValue: 60.00 changes=1
+slider clamp: 100.00
+slider new range: 150.00 in -10.00..200.00
+stepper: 4.00 in 0.00..10.00 by 2.00
+stepper up x3: 10.00 changes=3
+stepper down: 8.00
+stepper wrap: 0.00
+stepper set: 7.00 in 1.00..20.00 by 1.00
+popup items: Red|Green|Blue count=3
+popup selected: 0 Red
+popup select 3: 3 Purple changes=1
+popup selectTitle: 1 Green
+popup setItems: One|Two sel=One
+popup removeAll: 0 sel=-1
+combo: Kiwi items=Apple|Banana|Cherry count=3
+combo selected: -1
+combo select 1: Banana 1
+combo setText: Fig count=4
+combo changes: 1
+combo typed: Lime changes=2
+combo placeholder: Fruit as TextInput=Lime
+combo removeAll: 0
+segments: Day|Week|Month count=3
+segment selected: 0 Day
+segment set 2: 2 changes=1
+segment setLabel: Fortnight
+bar: 3.00 / 10.00 indeterminate=false
+bar set: 13.00 / 20.00
+busy indeterminate: true
+busy animating: true
+spinner animating: true indeterminate=true
+spinner stopped: false
+level: 7.00 in 0.00..10.00 style=1
+level set: 9.00
+rating: 3.00 style=3
+rating set: 4.00 changes=1
+level styles: 0 1 2 3
+well color: 1.00,0.50,0.00,1.00
+well setColor: 0.20,0.40,0.60,0.80 changes=1
+date: 2025-07-04 y=2025 m=7 d=4
+date setDateText: 1999-12-31 changes=1
+date rollover: 2026-01-01
+bad date text: ValueError
+calendar: 2026-11-01
+leap day: 2024-02-29
+date styles: 0 1 2
+symbol: true hasImage=true
+symbol size>0: true
+icon: true hasImage=true
+icon size: 512.00 x 512.00
+missing: false hasImage=false
+missing size: 0.00 x 0.00
+bad symbol image: false
+bad scaling: ValueError
+bad control size: ValueError
+system colors: 32 all named=true
+unknown system color: ValueError
+srgb color: 0.20,0.40,0.60,1.00 system=false name=''
+srgb same light/dark: true
+labelColor dark on light: true
+labelColor light on dark: true
+secondary differs light/dark: true
+components follow appearance: true
+systemRed is red: true
+accent is a system color: true
+withAlpha: 0.25 0.50
+none color: true name=''
+status color: secondaryLabelColor
+status sRGB = resolved: true
+field color: systemGreenColor
+image tint: systemOrangeColor
+system font weights rise: true
+regular weight: 0.00
+light < regular < bold: true
+digit font: 14.00 medium=true
+mono bold: 12.00 bold=true
+withSize: 30.00 same weight=true
+digit font: 1111 = 8888 wide: true
+digits label font: 20.00 light=true
+alignment names: left|center|right|justified|natural round trip=true
+digits raw = right: true
+button alignment: left color kept=systemRedColor
+field alignment: right
+bad alignment value: ValueError
+wrap max width: 150.00
+wrap is multi-line: true
+textWidth grows: true
+fit start: 22.00
+fit long text: shrunk=true min ok=true fits=true
+fit keeps the face: true
+fit short text: 22.00
+fit off restores: 22.00
+fit bad scale: ValueError
+title color: systemRedColor title=Plus
+title drawn red (window not key): true
+setTitle keeps color: Minus systemRedColor
+applyFont keeps color: systemRedColor size=15.00
+clearTitleColor: true title=Minus red=false
+bezel color: systemBlueColor tint=systemGreenColor
+default bezel color none: true
+bezel color / tint drawn in a quiet render: false / false
+key equivalent: k mods=true
+⌥⌘K clicks: true clicks=1
+⌘K alone: false clicks=1
+typeKey x3: 123 changes=3 editing=true
+deleteBackward: 12 changes=4
+selectAll: '12'
+type over selection: 9 changes=5
+typeText(''): '' changes=6
+typeText('') when empty: '' changes=7
+typeText then typeKey: abc changes=9
+typeKey(''): ValueError
+submits on end editing: true secure=false search=false combo=false
+handlers so far: returns=0 submits=4 ends=4
+Return: returns+1 submits+1 ends+1 editing=true
+focus moves away: returns+0 submits+1 ends+1 editing=false
+setSubmitsOnEndEditing(false): false
+focus moves away again: returns+0 submits+0 ends+1
+Return again: def returns+1 submits+1 ends+1
+clearFocus: returns+0 submits+0 ends+1 editing=false
+popup choose: 2 Yearly picks=1
+popup choose 7: ValueError picks=1
+priorities: 1000.00 750.00 250.00 50.00
+squeezed field shorter: true
+resistant field keeps height: true
+resistance read back: 750.00 1000.00
+hugging read back: 750.00 250.00
+field focusable: true
+setFocusable(false): false
+refusing field takes focus: false
+setFocusable(true): true
+setFocusable on a plain view: ValueError

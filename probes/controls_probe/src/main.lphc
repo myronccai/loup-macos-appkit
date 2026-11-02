@@ -1,0 +1,1060 @@
+@mode(host.native)
+
+# Probe for appkit.controls: every control proxy in one window. With
+# `--self-test [png]` it drives each control programmatically, prints the
+# observed values (checked against selftest.out by run_all.sh --probes, so
+# only machine-independent values are printed: no appearance-dependent
+# colors, no screen scale), writes a snapshot to `png` and quits.
+
+from appkit.app import (appInit, run, quit, after, isSelfTest, isDarkMode, Window, View, Bitmap,
+    Pixel, MOD_COMMAND, MOD_OPTION, PRIORITY_REQUIRED, PRIORITY_HIGH, PRIORITY_LOW, PRIORITY_FITTING);
+from appkit.controls import (Font, Color, Control, systemFont, monospacedFont, fontNamed, Label,
+    Button, Checkbox, RadioGroup, Switch, TextInput, TextField, SecureField, SearchField, Slider,
+    Stepper, PopUpButton, ComboBox, SegmentedControl, ProgressBar, Spinner, LevelIndicator,
+    ColorWell, DatePicker, ImageView, BEZEL_AUTOMATIC, BEZEL_PUSH, BEZEL_FLEXIBLE_PUSH, BEZEL_DISCLOSURE,
+    BEZEL_CIRCULAR, BEZEL_HELP, BEZEL_SMALL_SQUARE, BEZEL_TOOLBAR, BEZEL_ACCESSORY_BAR_ACTION,
+    BEZEL_ACCESSORY_BAR, BEZEL_BADGE, LEVEL_RELEVANCY, LEVEL_CONTINUOUS, LEVEL_DISCRETE,
+    LEVEL_RATING, DATE_STEPPER, DATE_CALENDAR, DATE_FIELD, ColorRef, systemColor, srgbColor,
+    systemColorNames, systemFontWithWeight, monospacedDigitSystemFont, monospacedFontWithWeight,
+    textAlignmentValue, textAlignmentName, TEXT_LEFT, TEXT_CENTER, TEXT_RIGHT, TEXT_JUSTIFIED,
+    TEXT_NATURAL, WEIGHT_ULTRALIGHT, WEIGHT_THIN, WEIGHT_LIGHT, WEIGHT_REGULAR, WEIGHT_MEDIUM,
+    WEIGHT_SEMIBOLD, WEIGHT_BOLD, WEIGHT_HEAVY, WEIGHT_BLACK, COLOR_LABEL, COLOR_SECONDARY_LABEL,
+    COLOR_SYSTEM_RED, COLOR_SYSTEM_GREEN, COLOR_SYSTEM_BLUE, COLOR_SYSTEM_ORANGE,
+    COLOR_CONTROL_ACCENT);
+from appkit.layout import (VStack, HStack, ALIGN_CENTER, ALIGN_FILL, fittingSize);
+
+const ICON: string = "/System/Library/CoreServices/CoreTypes.bundle/Contents/Resources/AlertNoteIcon.icns";
+
+var g_clicks: int = 0;
+var g_check_changes: int = 0;
+var g_radio_changes: int = 0;
+var g_switch_changes: int = 0;
+var g_text_changes: int = 0;
+var g_submits: int = 0;
+var g_secure_changes: int = 0;
+var g_search_submits: int = 0;
+var g_slider_changes: int = 0;
+var g_stepper_changes: int = 0;
+var g_popup_changes: int = 0;
+var g_combo_changes: int = 0;
+var g_segment_changes: int = 0;
+var g_level_changes: int = 0;
+var g_color_changes: int = 0;
+var g_date_changes: int = 0;
+
+## `x` with two decimals (deterministic across builds).
+func f2(x: float): string {
+    var neg = "";
+    var v = x;
+    if (v < 0.0) {
+        neg = "-";
+        v = 0.0 - v;
+    }
+    let cents = ((v * 100.0) + 0.5) as int;
+    let whole = cents / 100;
+    let frac = cents % 100;
+    var fs = frac.to_string();
+    if (frac < 10) {
+        fs = "0" + fs;
+    }
+    let s = neg + whole.to_string() + "." + fs;
+    return s;
+}
+
+## `items` joined with "|". (The self-test's closures join the lists that
+## `popup.items()` and the like return through this typed parameter: inside
+## a closure, Stage0 native refuses `join` on the un-annotated result of a
+## method called on a captured object — see Agents.md, "Toolchain traps".)
+func joined(items: list[string]): string {
+    let s = items.join("|");
+    return s;
+}
+
+func color_text(c: Color): string {
+    let s = f2(c.r) + "," + f2(c.g) + "," + f2(c.b) + "," + f2(c.a);
+    return s;
+}
+
+func show(name: string, value: string): void {
+    println(name + ": " + value);
+    return;
+}
+
+func bstr(b: bool): string {
+    return b.to_string();
+}
+
+## Any control, seen through the Control base class.
+func enabled_of(c: Control): string {
+    let s = bstr(c.isEnabled());
+    return s;
+}
+
+## Any text input, seen through the TextInput base class.
+func text_of(t: TextInput): string {
+    let s = t.text();
+    return s;
+}
+
+func istr(n: int): string {
+    return n.to_string();
+}
+
+# ── the L-controls additions: colors, weights, alignment, label sizing,
+# button colors and key equivalents, text-input typing, layout priorities ──
+# The views live in a Ui object built once and kept in a module-level list,
+# and the self-test reads them back in plain module functions.
+
+var g_nu_returns: int = 0;
+var g_nu_submits: int = 0;
+var g_nu_ends: int = 0;
+var g_nu_changes: int = 0;
+var g_nu_key_clicks: int = 0;
+var g_nu_picks: int = 0;
+
+class Ui {
+    pub let nu_win: Window;
+    pub let nu_status: Label;
+    pub let nu_digits: Label;
+    pub let nu_wrap: Label;
+    pub let nu_fit: Label;
+    pub let nu_plus: Button;
+    pub let nu_key: Button;
+    pub let nu_input: TextField;
+    pub let nu_other: TextField;
+    pub let nu_secure: SecureField;
+    pub let nu_search: SearchField;
+    pub let nu_combo: ComboBox;
+    pub let nu_popup: PopUpButton;
+    pub let nu_tinted: ImageView;
+    pub let nu_squeezed: TextField;
+    pub let nu_resistant: TextField;
+    pub let nu_squeeze_win: Window;
+
+    pub func constructor(win: Window) {
+        let header = Label("L-controls: semantic colors, weights, typing");
+        header.setFontWeight(15.0, WEIGHT_SEMIBOLD);
+        win.add(header, 20.0, 760.0, 420.0, 22.0);
+
+        let status = Label("secondary label color");
+        status.applyTextColor(systemColor(COLOR_SECONDARY_LABEL));
+        win.add(status, 20.0, 736.0, 200.0, 20.0);
+
+        let digits = Label("0123456789");
+        digits.applyFont(monospacedDigitSystemFont(20.0, WEIGHT_LIGHT));
+        digits.setAlignment(TEXT_RIGHT);
+        win.add(digits, 230.0, 732.0, 200.0, 26.0);
+
+        let wrap = Label("A wrapping label with a preferred maximum width.");
+        wrap.setWraps(true);
+        wrap.setMaxWidth(150.0);
+        win.add(wrap, 450.0, 712.0, 150.0, 60.0);
+
+        let fit = Label("1");
+        fit.applyFont(monospacedDigitSystemFont(22.0, WEIGHT_REGULAR));
+        fit.setShrinkToFit(110.0, 0.5);
+        win.add(fit, 580.0, 640.0, 110.0, 30.0);
+
+        let plus = Button("Plus");
+        plus.setTitleColor(systemColor(COLOR_SYSTEM_RED));
+        win.add(plus, 20.0, 696.0, 90.0, 32.0);
+
+        let key = Button("⌥⌘K");
+        key.setKeyEquivalentWithModifiers("k", MOD_COMMAND + MOD_OPTION);
+        key.setBezelColor(systemColor(COLOR_SYSTEM_BLUE));
+        key.setContentTint(systemColor(COLOR_SYSTEM_GREEN));
+        key.onClick(func(): void { global g_nu_key_clicks; g_nu_key_clicks = g_nu_key_clicks + 1; });
+        win.add(key, 115.0, 696.0, 90.0, 32.0);
+
+        let input = TextField("");
+        input.setPlaceholder("typeKey");
+        input.onChange(func(): void { global g_nu_changes; g_nu_changes = g_nu_changes + 1; });
+        input.onSubmit(func(): void { global g_nu_submits; g_nu_submits = g_nu_submits + 1; });
+        input.onReturn(func(): void { global g_nu_returns; g_nu_returns = g_nu_returns + 1; });
+        input.onEndEditing(func(): void { global g_nu_ends; g_nu_ends = g_nu_ends + 1; });
+        win.add(input, 215.0, 700.0, 110.0, 24.0);
+
+        let other = TextField("other");
+        win.add(other, 330.0, 700.0, 110.0, 24.0);
+
+        let secure = SecureField();
+        win.add(secure, 20.0, 664.0, 100.0, 24.0);
+        let search = SearchField();
+        win.add(search, 125.0, 664.0, 100.0, 24.0);
+        let combo = ComboBox(["One", "Two"], "One");
+        win.add(combo, 230.0, 662.0, 100.0, 26.0);
+
+        let popup = PopUpButton(["Monthly", "Quarterly", "Yearly"]);
+        popup.onChange(func(): void { global g_nu_picks; g_nu_picks = g_nu_picks + 1; });
+        win.add(popup, 335.0, 662.0, 120.0, 26.0);
+
+        let tinted = ImageView();
+        tinted.setSymbol("heart.fill", 22.0);
+        tinted.applyTint(systemColor(COLOR_SYSTEM_ORANGE));
+        win.add(tinted, 460.0, 660.0, 30.0, 30.0);
+
+        # A second (never shown) window whose content is too short for its
+        # two rows: the plain field gives way, the one with required vertical
+        # compression resistance keeps its natural height.
+        let squeeze_win = Window("Squeeze", 300.0, 30.0);
+        let rows = VStack();
+        rows.setSpacing(4.0);
+        rows.setAlignment(ALIGN_FILL);
+        let row1 = HStack();
+        row1.setAlignment(ALIGN_CENTER);
+        let slider1 = Slider(0.0, 1.0, 0.5);
+        row1.addExpanding(slider1);
+        let squeezed = TextField("128");
+        squeezed.setWidth(50.0);
+        row1.add(squeezed);
+        rows.add(row1);
+        let row2 = HStack();
+        row2.setAlignment(ALIGN_CENTER);
+        let slider2 = Slider(0.0, 1.0, 0.5);
+        row2.addExpanding(slider2);
+        let resistant = TextField("128");
+        resistant.setWidth(50.0);
+        resistant.setCompressionResistance(PRIORITY_HIGH, PRIORITY_REQUIRED);
+        row2.add(resistant);
+        rows.add(row2);
+        squeeze_win.setContent(rows);
+
+        this.nu_win = win;
+        this.nu_status = status;
+        this.nu_digits = digits;
+        this.nu_wrap = wrap;
+        this.nu_fit = fit;
+        this.nu_plus = plus;
+        this.nu_key = key;
+        this.nu_input = input;
+        this.nu_other = other;
+        this.nu_secure = secure;
+        this.nu_search = search;
+        this.nu_combo = combo;
+        this.nu_popup = popup;
+        this.nu_tinted = tinted;
+        this.nu_squeezed = squeezed;
+        this.nu_resistant = resistant;
+        this.nu_squeeze_win = squeeze_win;
+    }
+}
+
+var g_ui: list[Ui] = [];
+
+func ui(): Ui {
+    let u = g_ui[0];
+    return u;
+}
+
+## Whether `a` and `b` are the same color to within 1/255 per component.
+func same_color(a: Color, b: Color): bool {
+    let d = 1.0 / 255.0;
+    let same = (a.r - b.r) < d and (b.r - a.r) < d and (a.g - b.g) < d and (b.g - a.g) < d
+        and (a.b - b.b) < d and (b.b - a.b) < d and (a.a - b.a) < d and (b.a - a.a) < d;
+    return same;
+}
+
+func luminance(c: Color): float {
+    let l = 0.2126 * c.r + 0.7152 * c.g + 0.0722 * c.b;
+    return l;
+}
+
+## Whether the view's render has a pixel that is clearly red (the title of a
+## button drawn in the system red).
+func has_red_pixel(view: View): bool {
+    let bitmap = view.render();
+    var found = false;
+    var py = 0;
+    while (py < bitmap.height() and not found) {
+        var px = 0;
+        while (px < bitmap.width() and not found) {
+            let p = bitmap.pixelAt(px, py);
+            if (p.r > 180 and p.g < 110 and p.b < 110) {
+                found = true;
+            }
+            px = px + 1;
+        }
+        py = py + 1;
+    }
+    bitmap.release();
+    return found;
+}
+
+## Whether the view's render has a pixel close to the color `c` in the
+## app's appearance (each sRGB channel within 40 of 255 × the component).
+func has_pixel_near(view: View, c: ColorRef): bool {
+    let parts = c.components();
+    let want_r = (parts.r * 255.0) as int;
+    let want_g = (parts.g * 255.0) as int;
+    let want_b = (parts.b * 255.0) as int;
+    let bitmap = view.render();
+    var found = false;
+    var py = 0;
+    while (py < bitmap.height() and not found) {
+        var px = 0;
+        while (px < bitmap.width() and not found) {
+            let p = bitmap.pixelAt(px, py);
+            let dr = p.r - want_r;
+            let dg = p.g - want_g;
+            let db = p.b - want_b;
+            if (dr > -40 and dr < 40 and dg > -40 and dg < 40 and db > -40 and db < 40) {
+                found = true;
+            }
+            px = px + 1;
+        }
+        py = py + 1;
+    }
+    bitmap.release();
+    return found;
+}
+
+func testColors(): void {
+    let u = ui();
+    let names = systemColorNames();
+    var all_named = true;
+    for (n in names) {
+        let c = systemColor(n);
+        if (not c.isSystem() or c.name() != n) {
+            all_named = false;
+            println("system color mismatch: " + n + " -> '" + c.name() + "'");
+        }
+    }
+    show("system colors", istr(names.len()) + " all named=" + bstr(all_named));
+    var bad = "no error";
+    try {
+        systemColor("chartreuseColor");
+    } catch (ValueError as e) {
+        bad = "ValueError";
+    }
+    show("unknown system color", bad);
+    let fixed = srgbColor(0.2, 0.4, 0.6, 1.0);
+    show("srgb color", color_text(fixed.components()) + " system=" + bstr(fixed.isSystem()) + " name='" + fixed.name() + "'");
+    show("srgb same light/dark", bstr(same_color(fixed.componentsIn(false), fixed.componentsIn(true))));
+    let label_color = systemColor(COLOR_LABEL);
+    show("labelColor dark on light", bstr(luminance(label_color.componentsIn(false)) < 0.2));
+    show("labelColor light on dark", bstr(luminance(label_color.componentsIn(true)) > 0.8));
+    let secondary = systemColor(COLOR_SECONDARY_LABEL);
+    show("secondary differs light/dark", bstr(not same_color(secondary.componentsIn(false), secondary.componentsIn(true))));
+    show("components follow appearance", bstr(same_color(secondary.components(), secondary.componentsIn(isDarkMode()))));
+    let red = systemColor(COLOR_SYSTEM_RED);
+    let light_red = red.componentsIn(false);
+    show("systemRed is red", bstr(light_red.r > 0.9 and light_red.g < 0.4 and light_red.b < 0.4));
+    show("accent is a system color", bstr(systemColor(COLOR_CONTROL_ACCENT).isSystem()));
+    show("withAlpha", f2(srgbColor(1.0, 0.0, 0.0, 1.0).withAlpha(0.25).components().a) + " "
+        + f2(systemColor(COLOR_SYSTEM_BLUE).withAlpha(0.5).componentsIn(false).a));
+    show("none color", bstr(ColorRef(0).isNone()) + " name='" + ColorRef(0).name() + "'");
+
+    # Label and field text colors
+    show("status color", u.nu_status.textColorRef().name());
+    show("status sRGB = resolved", bstr(same_color(u.nu_status.textColor(), u.nu_status.textColorRef().components())));
+    u.nu_other.applyTextColor(systemColor(COLOR_SYSTEM_GREEN));
+    show("field color", u.nu_other.textColorRef().name());
+    show("image tint", u.nu_tinted.tint().name());
+    return;
+}
+
+func testFonts(): void {
+    let u = ui();
+    let weights = [WEIGHT_ULTRALIGHT, WEIGHT_THIN, WEIGHT_LIGHT, WEIGHT_REGULAR, WEIGHT_MEDIUM,
+        WEIGHT_SEMIBOLD, WEIGHT_BOLD, WEIGHT_HEAVY, WEIGHT_BLACK];
+    var rising = true;
+    var previous = -2.0;
+    for (w in weights) {
+        let weight = systemFontWithWeight(13.0, w).weight();
+        if (weight <= previous) {
+            rising = false;
+        }
+        previous = weight;
+    }
+    show("system font weights rise", bstr(rising));
+    show("regular weight", f2(systemFontWithWeight(13.0, WEIGHT_REGULAR).weight()));
+    show("light < regular < bold", bstr(systemFontWithWeight(13.0, WEIGHT_LIGHT).weight() < 0.0
+        and systemFontWithWeight(13.0, WEIGHT_BOLD).weight() > 0.0));
+    let digit_font = monospacedDigitSystemFont(14.0, WEIGHT_MEDIUM);
+    show("digit font", f2(digit_font.size()) + " medium=" + bstr(digit_font.weight() > 0.0));
+    let mono_bold = monospacedFontWithWeight(12.0, WEIGHT_BOLD);
+    show("mono bold", f2(mono_bold.size()) + " bold=" + bstr(mono_bold.weight() > 0.2));
+    let bigger = digit_font.withSize(30.0);
+    show("withSize", f2(bigger.size()) + " same weight=" + bstr(bigger.weight() == digit_font.weight()));
+
+    # Fixed-width digits: "1111" and "8888" measure the same in the digit
+    # font (measured with the new Label.textWidth).
+    let probe = Label("1111");
+    probe.applyFont(monospacedDigitSystemFont(20.0, WEIGHT_REGULAR));
+    let ones = probe.textWidth();
+    probe.setText("8888");
+    let eights = probe.textWidth();
+    show("digit font: 1111 = 8888 wide", bstr(ones == eights));
+    show("digits label font", f2(u.nu_digits.font().size()) + " light=" + bstr(u.nu_digits.font().weight() < 0.0));
+    return;
+}
+
+func testAlignment(): void {
+    let u = ui();
+    let names = [TEXT_LEFT, TEXT_CENTER, TEXT_RIGHT, TEXT_JUSTIFIED, TEXT_NATURAL];
+    var round_trip = true;
+    for (n in names) {
+        if (textAlignmentName(textAlignmentValue(n)) != n) {
+            round_trip = false;
+        }
+    }
+    show("alignment names", joined(names) + " round trip=" + bstr(round_trip));
+    show("digits raw = right", bstr(u.nu_digits.alignment() == TEXT_RIGHT));
+    u.nu_plus.setAlignment(TEXT_LEFT);
+    show("button alignment", u.nu_plus.alignment() + " color kept=" + u.nu_plus.titleColor().name());
+    u.nu_plus.setAlignment(TEXT_CENTER);
+    u.nu_other.setAlignment(TEXT_RIGHT);
+    show("field alignment", u.nu_other.alignment());
+    var bad = "no error";
+    try {
+        textAlignmentValue("middle");
+    } catch (ValueError as e) {
+        bad = "ValueError";
+    }
+    show("bad alignment value", bad);
+    return;
+}
+
+func testLabels(): void {
+    let u = ui();
+    show("wrap max width", f2(u.nu_wrap.maxWidth()));
+    let one_line = Label("x");
+    show("wrap is multi-line", bstr(u.nu_wrap.textHeight() > 2.0 * one_line.textHeight()));
+    let short = Label("Hello");
+    let long = Label("Hello, wide world");
+    show("textWidth grows", bstr(short.textWidth() > 0.0 and long.textWidth() > short.textWidth()));
+
+    # Shrink-to-fit
+    show("fit start", f2(u.nu_fit.font().size()));
+    u.nu_fit.setText("1234567890123");
+    let shrunk = u.nu_fit.font().size();
+    show("fit long text", "shrunk=" + bstr(shrunk < 22.0) + " min ok=" + bstr(shrunk >= 11.0)
+        + " fits=" + bstr(u.nu_fit.textWidth() <= 110.0 or shrunk == 11.0));
+    show("fit keeps the face", bstr(u.nu_fit.font().weight() == monospacedDigitSystemFont(22.0, WEIGHT_REGULAR).weight()));
+    u.nu_fit.setText("42");
+    show("fit short text", f2(u.nu_fit.font().size()));
+    u.nu_fit.setText("1234567890123");
+    u.nu_fit.setShrinkToFit(0.0, 1.0);
+    show("fit off restores", f2(u.nu_fit.font().size()));
+    u.nu_fit.setShrinkToFit(110.0, 0.5);
+    u.nu_fit.setText("3.14159265358979");
+    var bad = "no error";
+    try {
+        u.nu_fit.setShrinkToFit(100.0, 0.0);
+    } catch (ValueError as e) {
+        bad = "ValueError";
+    }
+    show("fit bad scale", bad);
+    return;
+}
+
+func testButtons(): void {
+    let u = ui();
+    show("title color", u.nu_plus.titleColor().name() + " title=" + u.nu_plus.title());
+    show("title drawn red (window not key)", bstr(has_red_pixel(u.nu_plus)));
+    u.nu_plus.setTitle("Minus");
+    show("setTitle keeps color", u.nu_plus.title() + " " + u.nu_plus.titleColor().name());
+    u.nu_plus.applyFont(systemFontWithWeight(15.0, WEIGHT_BOLD));
+    show("applyFont keeps color", u.nu_plus.titleColor().name() + " size=" + f2(u.nu_plus.font().size()));
+    u.nu_plus.clearTitleColor();
+    show("clearTitleColor", bstr(u.nu_plus.titleColor().isNone()) + " title=" + u.nu_plus.title()
+        + " red=" + bstr(has_red_pixel(u.nu_plus)));
+    u.nu_plus.setTitleColor(systemColor(COLOR_SYSTEM_RED));
+    u.nu_plus.setTitle("Plus");
+    show("bezel color", u.nu_key.bezelColor().name() + " tint=" + u.nu_key.contentTint().name());
+    show("default bezel color none", bstr(u.nu_plus.bezelColor().isNone()));
+    # AppKit draws a bezel color and a content tint only in a key window; a
+    # quiet self-test's window never is, so a render shows a plain button.
+    show("bezel color / tint drawn in a quiet render", bstr(has_pixel_near(u.nu_key, u.nu_key.bezelColor()))
+        + " / " + bstr(has_pixel_near(u.nu_key, u.nu_key.contentTint())));
+    show("key equivalent", u.nu_key.keyEquivalent() + " mods=" + bstr(u.nu_key.keyEquivalentModifiers() == MOD_COMMAND + MOD_OPTION));
+    let taken = u.nu_win.sendKey("k", MOD_COMMAND + MOD_OPTION);
+    show("⌥⌘K clicks", bstr(taken) + " clicks=" + istr(g_nu_key_clicks));
+    let plain = u.nu_win.sendKey("k", MOD_COMMAND);
+    show("⌘K alone", bstr(plain) + " clicks=" + istr(g_nu_key_clicks));
+    return;
+}
+
+var g_mark: list[int] = [0, 0, 0];
+
+## Remember the Return / submit / end-editing counts.
+func mark(): void {
+    g_mark[0] = g_nu_returns;
+    g_mark[1] = g_nu_submits;
+    g_mark[2] = g_nu_ends;
+    return;
+}
+
+## How many of each ran since `mark()`.
+func deltas(): string {
+    let s = "returns+" + istr(g_nu_returns - g_mark[0]) + " submits+" + istr(g_nu_submits - g_mark[1])
+        + " ends+" + istr(g_nu_ends - g_mark[2]);
+    return s;
+}
+
+func testTyping(): void {
+    let u = ui();
+    let field = u.nu_input;
+    field.typeKey("1");
+    field.typeKey("2");
+    field.typeKey("3");
+    show("typeKey x3", field.text() + " changes=" + istr(g_nu_changes) + " editing=" + bstr(field.isEditing()));
+    field.deleteBackward();
+    show("deleteBackward", field.text() + " changes=" + istr(g_nu_changes));
+    field.selectAll();
+    show("selectAll", "'" + field.selectedText() + "'");
+    field.typeKey("9");
+    show("type over selection", field.text() + " changes=" + istr(g_nu_changes));
+    field.typeText("");
+    show("typeText('')", "'" + field.text() + "' changes=" + istr(g_nu_changes));
+    field.typeText("");
+    show("typeText('') when empty", "'" + field.text() + "' changes=" + istr(g_nu_changes));
+    field.typeText("ab");
+    field.typeKey("c");
+    show("typeText then typeKey", field.text() + " changes=" + istr(g_nu_changes));
+    var bad = "no error";
+    try {
+        field.typeKey("");
+    } catch (ValueError as e) {
+        bad = "ValueError";
+    }
+    show("typeKey('')", bad);
+
+    # Return, the action and the end of editing
+    show("submits on end editing", bstr(field.submitsOnEndEditing()) + " secure=" + bstr(u.nu_secure.submitsOnEndEditing())
+        + " search=" + bstr(u.nu_search.submitsOnEndEditing()) + " combo=" + bstr(u.nu_combo.submitsOnEndEditing()));
+    show("handlers so far", "returns=" + istr(g_nu_returns) + " submits=" + istr(g_nu_submits) + " ends=" + istr(g_nu_ends));
+    mark();
+    field.submit();
+    show("Return", deltas() + " editing=" + bstr(field.isEditing()));
+    field.typeKey("d");
+    mark();
+    u.nu_other.focus();
+    show("focus moves away", deltas() + " editing=" + bstr(field.isEditing()));
+    field.setSubmitsOnEndEditing(false);
+    show("setSubmitsOnEndEditing(false)", bstr(field.submitsOnEndEditing()));
+    field.typeKey("e");
+    mark();
+    u.nu_other.focus();
+    show("focus moves away again", deltas());
+    field.typeKey("f");
+    mark();
+    field.submit();
+    show("Return again", field.text() + " " + deltas());
+    mark();
+    u.nu_win.clearFocus();
+    show("clearFocus", deltas() + " editing=" + bstr(field.isEditing()));
+    field.setSubmitsOnEndEditing(true);
+
+    # PopUpButton.choose
+    u.nu_popup.choose(2);
+    show("popup choose", istr(u.nu_popup.selectedIndex()) + " " + u.nu_popup.selectedTitle() + " picks=" + istr(g_nu_picks));
+    var bad_pick = "no error";
+    try {
+        u.nu_popup.choose(7);
+    } catch (ValueError as e) {
+        bad_pick = "ValueError";
+    }
+    show("popup choose 7", bad_pick + " picks=" + istr(g_nu_picks));
+    return;
+}
+
+func testPriorities(): void {
+    let u = ui();
+    show("priorities", f2(PRIORITY_REQUIRED) + " " + f2(PRIORITY_HIGH) + " " + f2(PRIORITY_LOW) + " " + f2(PRIORITY_FITTING));
+    let rendered = u.nu_squeeze_win.content().render();
+    rendered.release();
+    let natural = fittingSize(u.nu_squeezed).h;
+    show("squeezed field shorter", bstr(u.nu_squeezed.frame().h < natural));
+    show("resistant field keeps height", bstr(u.nu_resistant.frame().h == natural));
+    show("resistance read back", f2(u.nu_resistant.compressionResistance(false)) + " " + f2(u.nu_resistant.compressionResistance(true)));
+    u.nu_digits.setHugging(PRIORITY_HIGH, PRIORITY_LOW);
+    show("hugging read back", f2(u.nu_digits.hugging(false)) + " " + f2(u.nu_digits.hugging(true)));
+
+    # Focusable
+    show("field focusable", bstr(u.nu_other.isFocusable()));
+    u.nu_other.setFocusable(false);
+    show("setFocusable(false)", bstr(u.nu_other.isFocusable()));
+    u.nu_other.focus();
+    show("refusing field takes focus", bstr(u.nu_other.isEditing()));
+    u.nu_other.setFocusable(true);
+    show("setFocusable(true)", bstr(u.nu_other.isFocusable()));
+    var bad = "no error";
+    try {
+        View(u.nu_win.content().handle).setFocusable(false);
+    } catch (ValueError as e) {
+        bad = "ValueError";
+    }
+    show("setFocusable on a plain view", bad);
+    u.nu_win.clearFocus();
+    return;
+}
+
+func testAdditions(): void {
+    testColors();
+    testFonts();
+    testAlignment();
+    testLabels();
+    testButtons();
+    testTyping();
+    testPriorities();
+    return;
+}
+
+pub func main(): void {
+    appInit("Controls Probe");
+    let win = Window("Controls Probe", 700.0, 790.0);
+    g_ui.push(Ui(win));
+
+    # ── left column ──
+    let title = Label("Controls Probe ✓");
+    title.setFont(18.0, true);
+    title.setTextColor(0.30, 0.65, 1.0, 1.0);
+    win.add(title, 20.0, 520.0, 320.0, 26.0);
+
+    let note = Label("A wrapping label: every standard AppKit control is a Loup proxy that extends View.");
+    note.setWraps(true);
+    note.setSelectable(true);
+    note.applyFont(monospacedFont(11.0, false));
+    win.add(note, 20.0, 478.0, 320.0, 36.0);
+
+    let ok = Button("OK");
+    ok.setKeyEquivalent("\r");
+    ok.onClick(func(): void { global g_clicks; g_clicks = g_clicks + 1; });
+    win.add(ok, 20.0, 440.0, 90.0, 32.0);
+
+    let star = Button("Star");
+    star.setBezelStyle(BEZEL_ACCESSORY_BAR_ACTION);
+    let has_star = star.setSymbol("star.fill");
+    win.add(star, 115.0, 444.0, 90.0, 24.0);
+
+    let help = Button("");
+    help.setBezelStyle(BEZEL_HELP);
+    win.add(help, 210.0, 442.0, 28.0, 28.0);
+
+    let off = Button("Disabled");
+    off.setEnabled(false);
+    off.setControlSize("small");
+    win.add(off, 245.0, 444.0, 90.0, 24.0);
+
+    let check = Checkbox("Enable feature");
+    check.onChange(func(): void { global g_check_changes; g_check_changes = g_check_changes + 1; });
+    win.add(check, 20.0, 410.0, 150.0, 22.0);
+
+    let sw = Switch();
+    sw.onChange(func(): void { global g_switch_changes; g_switch_changes = g_switch_changes + 1; });
+    win.add(sw, 180.0, 408.0, 42.0, 26.0);
+
+    let radios = RadioGroup(["Small", "Medium", "Large"]);
+    radios.onChange(func(): void { global g_radio_changes; g_radio_changes = g_radio_changes + 1; });
+    win.add(radios, 20.0, 330.0, 150.0, 70.0);
+
+    let field = TextField("hello");
+    field.setPlaceholder("Type here");
+    field.onChange(func(): void { global g_text_changes; g_text_changes = g_text_changes + 1; });
+    field.onSubmit(func(): void { global g_submits; g_submits = g_submits + 1; });
+    win.add(field, 20.0, 296.0, 320.0, 24.0);
+
+    let secret = SecureField();
+    secret.setPlaceholder("Password");
+    secret.onChange(func(): void { global g_secure_changes; g_secure_changes = g_secure_changes + 1; });
+    win.add(secret, 20.0, 264.0, 155.0, 24.0);
+
+    let search = SearchField();
+    search.setPlaceholder("Search");
+    search.onSubmit(func(): void { global g_search_submits; g_search_submits = g_search_submits + 1; });
+    win.add(search, 185.0, 264.0, 155.0, 24.0);
+
+    let slider = Slider(0.0, 100.0, 25.0);
+    slider.onChange(func(): void { global g_slider_changes; g_slider_changes = g_slider_changes + 1; });
+    slider.setTickMarks(11, false);
+    win.add(slider, 20.0, 222.0, 230.0, 30.0);
+
+    let stepper = Stepper(0.0, 10.0, 2.0, 4.0);
+    stepper.onChange(func(): void { global g_stepper_changes; g_stepper_changes = g_stepper_changes + 1; });
+    win.add(stepper, 260.0, 224.0, 20.0, 28.0);
+    let step_label = Label("4");
+    win.add(step_label, 285.0, 228.0, 50.0, 20.0);
+
+    let popup = PopUpButton(["Red", "Green", "Blue"]);
+    popup.onChange(func(): void { global g_popup_changes; g_popup_changes = g_popup_changes + 1; });
+    win.add(popup, 20.0, 186.0, 155.0, 26.0);
+
+    let combo = ComboBox(["Apple", "Banana", "Cherry"], "Kiwi");
+    combo.onChange(func(): void { global g_combo_changes; g_combo_changes = g_combo_changes + 1; });
+    win.add(combo, 185.0, 186.0, 155.0, 26.0);
+
+    let seg = SegmentedControl(["Day", "Week", "Month"]);
+    seg.onChange(func(): void { global g_segment_changes; g_segment_changes = g_segment_changes + 1; });
+    win.add(seg, 20.0, 150.0, 220.0, 26.0);
+
+    let bar = ProgressBar(10.0);
+    bar.setValue(3.0);
+    win.add(bar, 20.0, 120.0, 230.0, 20.0);
+
+    let spinner = Spinner();
+    win.add(spinner, 260.0, 118.0, 24.0, 24.0);
+
+    let busy = ProgressBar(1.0);
+    busy.setIndeterminate(true);
+    win.add(busy, 20.0, 94.0, 230.0, 20.0);
+
+    let level = LevelIndicator(0.0, 10.0, 7.0);
+    level.setWarning(6.0);
+    level.setCritical(8.0);
+    win.add(level, 20.0, 64.0, 230.0, 20.0);
+
+    let rating = LevelIndicator(0.0, 5.0, 3.0);
+    rating.setStyle(LEVEL_RATING);
+    rating.setEditable(true);
+    rating.onChange(func(): void { global g_level_changes; g_level_changes = g_level_changes + 1; });
+    win.add(rating, 20.0, 36.0, 100.0, 20.0);
+
+    # ── right column ──
+    let well = ColorWell(1.0, 0.5, 0.0);
+    well.onChange(func(): void { global g_color_changes; g_color_changes = g_color_changes + 1; });
+    win.add(well, 370.0, 500.0, 60.0, 30.0);
+    let well_label = Label("ColorWell");
+    win.add(well_label, 440.0, 506.0, 120.0, 20.0);
+
+    let date = DatePicker();
+    date.onChange(func(): void { global g_date_changes; g_date_changes = g_date_changes + 1; });
+    win.add(date, 370.0, 460.0, 140.0, 28.0);
+
+    let cal = DatePicker();
+    cal.setStyle(DATE_CALENDAR);
+    cal.setDate(2026, 11, 1);
+    win.add(cal, 370.0, 290.0, 160.0, 160.0);
+
+    let timed = DatePicker();
+    timed.setStyle(DATE_FIELD);
+    timed.setShowsTime(true);
+    timed.setDate(2024, 2, 29);
+    win.add(timed, 540.0, 420.0, 150.0, 24.0);
+
+    let symbol = ImageView();
+    let has_symbol = symbol.setSymbol("globe.americas.fill", 40.0);
+    symbol.setTint(0.2, 0.8, 0.4, 1.0);
+    win.add(symbol, 370.0, 200.0, 70.0, 70.0);
+
+    let icon = ImageView();
+    let has_icon = icon.loadFile(ICON);
+    icon.setScaling("down");
+    win.add(icon, 460.0, 200.0, 70.0, 70.0);
+
+    let missing = ImageView();
+    let has_missing = missing.loadFile("/nonexistent/none.png");
+    win.add(missing, 550.0, 200.0, 70.0, 70.0);
+
+    let aligned = Label("right aligned");
+    aligned.setAlignment("right");
+    win.add(aligned, 370.0, 170.0, 300.0, 20.0);
+
+    let centered = Label("centered");
+    centered.setAlignment("center");
+    centered.applyFont(fontNamed("Menlo", 13.0));
+    win.add(centered, 370.0, 146.0, 300.0, 20.0);
+
+    let shows: list[View] = radios.buttons();
+
+    if (isSelfTest()) {
+        after(0.4, func(): void {
+            # Label
+            show("label text", title.text());
+            title.setText("Controls ✓");
+            show("label setText", title.text());
+            show("label color", color_text(title.textColor()));
+            show("label font size", f2(title.font().size()));
+            show("note font", note.font().name());
+            show("aligned", aligned.alignment());
+            show("centered", centered.alignment());
+            show("note alignment", note.alignment());
+            var bad_align = "no error";
+            try {
+                note.setAlignment("sideways");
+            } catch (ValueError as e) {
+                bad_align = "ValueError";
+            }
+            show("bad alignment", bad_align);
+
+            # Fonts
+            let sf = systemFont(12.0, false);
+            show("systemFont", f2(sf.size()) + " valid=" + bstr(sf.isValid()));
+            let mono = monospacedFont(10.0, true);
+            show("monospacedFont", f2(mono.size()));
+            show("fontNamed Menlo", fontNamed("Menlo", 13.0).name());
+            show("fontNamed missing valid", bstr(fontNamed("NoSuchFontXYZ", 12.0).isValid()));
+            show("fixed pitch: mono, Menlo, system, digit font, missing", bstr(mono.isFixedPitch()) + " "
+                + bstr(fontNamed("Menlo", 13.0).isFixedPitch()) + " " + bstr(sf.isFixedPitch()) + " "
+                + bstr(monospacedDigitSystemFont(12.0, WEIGHT_REGULAR).isFixedPitch()) + " "
+                + bstr(fontNamed("NoSuchFontXYZ", 12.0).isFixedPitch()));
+
+            # Button
+            ok.click();
+            ok.click();
+            show("button clicks", istr(g_clicks));
+            show("button title", ok.title());
+            ok.setTitle("Done");
+            show("button setTitle", ok.title());
+            show("button key is return", bstr(ok.keyEquivalent() == "\r"));
+            show("button bezel", istr(ok.bezelStyle()));
+            show("star bezel", istr(star.bezelStyle()));
+            show("star symbol", bstr(has_star));
+            show("bad symbol", bstr(help.setSymbol("no.such.symbol.xyz")));
+            show("bezels", istr(BEZEL_AUTOMATIC) + " " + istr(BEZEL_PUSH) + " " + istr(BEZEL_FLEXIBLE_PUSH) + " " + istr(BEZEL_DISCLOSURE) + " "
+                + istr(BEZEL_CIRCULAR) + " " + istr(BEZEL_SMALL_SQUARE) + " " + istr(BEZEL_TOOLBAR) + " "
+                + istr(BEZEL_ACCESSORY_BAR) + " " + istr(BEZEL_BADGE));
+            show("disabled enabled", bstr(off.isEnabled()));
+            off.click();
+            show("disabled click count", istr(g_clicks));
+            off.sendAction();
+
+            let bf = ok.frame();
+            show("button frame", f2(bf.x) + " " + f2(bf.y) + " " + f2(bf.w) + " " + f2(bf.h));
+            show("as Control", enabled_of(ok) + " " + enabled_of(off) + " " + enabled_of(slider));
+
+            # Checkbox
+            show("check initial", bstr(check.checked()));
+            check.click();
+            show("check after click", bstr(check.checked()) + " changes=" + istr(g_check_changes));
+            check.setChecked(false);
+            show("check setChecked(false)", bstr(check.checked()) + " changes=" + istr(g_check_changes));
+            check.setTitle("Feature on");
+            show("check title", check.title());
+
+            # RadioGroup
+            show("radio count", istr(radios.count()) + " buttons=" + istr(shows.len()));
+            show("radio initial", istr(radios.selectedIndex()) + " " + radios.selectedTitle());
+            radios.click(2);
+            show("radio click 2", istr(radios.selectedIndex()) + " " + radios.selectedTitle() + " changes=" + istr(g_radio_changes));
+            radios.setSelectedIndex(1);
+            show("radio set 1", istr(radios.selectedIndex()) + " " + radios.titleAt(1) + " changes=" + istr(g_radio_changes));
+            radios.setSelectedIndex(-1);
+            show("radio none", istr(radios.selectedIndex()) + " '" + radios.selectedTitle() + "'");
+            radios.click(0);
+            show("radio click 0", istr(radios.selectedIndex()) + " changes=" + istr(g_radio_changes));
+            radios.setEnabled(true);
+            let rf = shows[0].frame();
+            show("radio button 0 height>0", bstr(rf.h > 0.0));
+
+            # Switch
+            show("switch initial", bstr(sw.isOn()));
+            sw.toggle();
+            show("switch toggle", bstr(sw.isOn()) + " changes=" + istr(g_switch_changes));
+            sw.setOn(false);
+            show("switch setOn(false)", bstr(sw.isOn()) + " changes=" + istr(g_switch_changes));
+            sw.setOn(true);
+
+            # TextField
+            show("field text", field.text());
+            show("field placeholder", field.placeholder());
+            field.setText("");
+            field.typeText("abc");
+            show("field typed", field.text() + " changes=" + istr(g_text_changes));
+            field.submit();
+            show("field submit", "submits=" + istr(g_submits));
+            field.setText("set ✓");
+            show("field setText", field.text() + " changes=" + istr(g_text_changes));
+            show("field editable", bstr(field.isEditable()));
+            field.setEditable(false);
+            show("field setEditable(false)", bstr(field.isEditable()));
+            field.setEditable(true);
+
+            # SecureField
+            secret.typeText("hunter2");
+            show("secure text", secret.text() + " changes=" + istr(g_secure_changes));
+            show("secure placeholder", secret.placeholder());
+            show("as TextInput", text_of(secret) + " " + text_of(field));
+
+            # SearchField
+            search.typeText("loup");
+            search.submit();
+            show("search", search.text() + " submits=" + istr(g_search_submits));
+            show("search placeholder", search.placeholder());
+            search.focus();
+
+            # Slider
+            show("slider", f2(slider.value()) + " in " + f2(slider.min()) + ".." + f2(slider.max()));
+            slider.setValue(60.0);
+            slider.sendAction();
+            show("slider setValue", f2(slider.value()) + " changes=" + istr(g_slider_changes));
+            slider.setValue(500.0);
+            show("slider clamp", f2(slider.value()));
+            slider.setMax(200.0);
+            slider.setMin(-10.0);
+            slider.setValue(150.0);
+            show("slider new range", f2(slider.value()) + " in " + f2(slider.min()) + ".." + f2(slider.max()));
+            slider.setMax(100.0);
+            slider.setMin(0.0);
+            slider.setValue(60.0);
+
+            # Stepper
+            show("stepper", f2(stepper.value()) + " in " + f2(stepper.min()) + ".." + f2(stepper.max()) + " by " + f2(stepper.increment()));
+            stepper.stepUp();
+            stepper.stepUp();
+            stepper.stepUp();
+            show("stepper up x3", f2(stepper.value()) + " changes=" + istr(g_stepper_changes));
+            stepper.stepDown();
+            show("stepper down", f2(stepper.value()));
+            stepper.setWraps(true);
+            stepper.stepUp();
+            stepper.stepUp();
+            show("stepper wrap", f2(stepper.value()));
+            stepper.setWraps(false);
+            stepper.setIncrement(1.0);
+            stepper.setMin(1.0);
+            stepper.setMax(20.0);
+            stepper.setValue(7.0);
+            step_label.setText(f2(stepper.value()));
+            show("stepper set", f2(stepper.value()) + " in " + f2(stepper.min()) + ".." + f2(stepper.max()) + " by " + f2(stepper.increment()));
+
+            # PopUpButton
+            show("popup items", joined(popup.items()) + " count=" + istr(popup.count()));
+            show("popup selected", istr(popup.selectedIndex()) + " " + popup.selectedTitle());
+            popup.addItem("Purple");
+            popup.select(3);
+            popup.sendAction();
+            show("popup select 3", istr(popup.selectedIndex()) + " " + popup.selectedTitle() + " changes=" + istr(g_popup_changes));
+            popup.selectTitle("Green");
+            show("popup selectTitle", istr(popup.selectedIndex()) + " " + popup.selectedTitle());
+            popup.setItems(["One", "Two"]);
+            show("popup setItems", joined(popup.items()) + " sel=" + popup.selectedTitle());
+            popup.removeAll();
+            show("popup removeAll", istr(popup.count()) + " sel=" + istr(popup.selectedIndex()));
+            popup.setItems(["Red", "Green", "Blue"]);
+            popup.select(2);
+
+            # ComboBox
+            show("combo", combo.text() + " items=" + joined(combo.items()) + " count=" + istr(combo.count()));
+            show("combo selected", istr(combo.selectedIndex()));
+            combo.select(1);
+            show("combo select 1", combo.text() + " " + istr(combo.selectedIndex()));
+            combo.addItem("Date");
+            combo.setText("Fig");
+            show("combo setText", combo.text() + " count=" + istr(combo.count()));
+            combo.sendAction();
+            show("combo changes", istr(g_combo_changes));
+            combo.setText("");
+            combo.typeText("Lime");
+            show("combo typed", combo.text() + " changes=" + istr(g_combo_changes));
+            combo.setPlaceholder("Fruit");
+            show("combo placeholder", combo.placeholder() + " as TextInput=" + text_of(combo));
+            combo.removeAll();
+            show("combo removeAll", istr(combo.count()));
+            combo.addItem("Apple");
+            combo.addItem("Cherry");
+            combo.setText("Cherry");
+
+            # SegmentedControl
+            show("segments", joined(seg.labels()) + " count=" + istr(seg.count()));
+            show("segment selected", istr(seg.selectedIndex()) + " " + seg.labelAt(seg.selectedIndex()));
+            seg.setSelectedIndex(2);
+            seg.sendAction();
+            show("segment set 2", istr(seg.selectedIndex()) + " changes=" + istr(g_segment_changes));
+            seg.setLabel(1, "Fortnight");
+            show("segment setLabel", seg.labelAt(1));
+            seg.setSelectedIndex(1);
+
+            # ProgressBar / Spinner
+            show("bar", f2(bar.value()) + " / " + f2(bar.max()) + " indeterminate=" + bstr(bar.isIndeterminate()));
+            bar.setMax(20.0);
+            bar.setValue(13.0);
+            show("bar set", f2(bar.value()) + " / " + f2(bar.max()));
+            show("busy indeterminate", bstr(busy.isIndeterminate()));
+            busy.start();
+            show("busy animating", bstr(busy.isAnimating()));
+            spinner.start();
+            show("spinner animating", bstr(spinner.isAnimating()) + " indeterminate=" + bstr(spinner.isIndeterminate()));
+            spinner.stop();
+            show("spinner stopped", bstr(spinner.isAnimating()));
+            spinner.start();
+
+            # LevelIndicator
+            show("level", f2(level.value()) + " in " + f2(level.min()) + ".." + f2(level.max()) + " style=" + istr(level.style()));
+            level.setValue(9.0);
+            show("level set", f2(level.value()));
+            show("rating", f2(rating.value()) + " style=" + istr(rating.style()));
+            rating.setValue(4.0);
+            rating.sendAction();
+            show("rating set", f2(rating.value()) + " changes=" + istr(g_level_changes));
+            show("level styles", istr(LEVEL_RELEVANCY) + " " + istr(LEVEL_CONTINUOUS) + " " + istr(LEVEL_DISCRETE) + " " + istr(LEVEL_RATING));
+
+            # ColorWell
+            show("well color", color_text(well.color()));
+            well.setColor(0.2, 0.4, 0.6, 0.8);
+            well.sendAction();
+            show("well setColor", color_text(well.color()) + " changes=" + istr(g_color_changes));
+            well.setColor(0.95, 0.35, 0.2, 1.0);
+
+            # DatePicker
+            date.setDate(2025, 7, 4);
+            show("date", date.date() + " y=" + istr(date.year()) + " m=" + istr(date.month()) + " d=" + istr(date.day()));
+            date.setDateText("1999-12-31");
+            date.sendAction();
+            show("date setDateText", date.date() + " changes=" + istr(g_date_changes));
+            date.setDate(2025, 13, 1);
+            show("date rollover", date.date());
+            var bad_date = "no error";
+            try {
+                date.setDateText("July 4");
+            } catch (ValueError as e) {
+                bad_date = "ValueError";
+            }
+            show("bad date text", bad_date);
+            show("calendar", cal.date());
+            show("leap day", timed.date());
+            show("date styles", istr(DATE_STEPPER) + " " + istr(DATE_CALENDAR) + " " + istr(DATE_FIELD));
+            date.setStyle(DATE_STEPPER);
+            date.setShowsTime(false);
+            date.setDate(2026, 11, 1);
+
+            # ImageView
+            show("symbol", bstr(has_symbol) + " hasImage=" + bstr(symbol.hasImage()));
+            show("symbol size>0", bstr(symbol.imageWidth() > 0.0 and symbol.imageHeight() > 0.0));
+            show("icon", bstr(has_icon) + " hasImage=" + bstr(icon.hasImage()));
+            show("icon size", f2(icon.imageWidth()) + " x " + f2(icon.imageHeight()));
+            show("missing", bstr(has_missing) + " hasImage=" + bstr(missing.hasImage()));
+            show("missing size", f2(missing.imageWidth()) + " x " + f2(missing.imageHeight()));
+            show("bad symbol image", bstr(missing.setSymbol("no.such.symbol.xyz", 20.0)));
+            missing.setSymbol("photo", 32.0);
+            missing.setScaling("fit");
+            var bad_scale = "no error";
+            try {
+                missing.setScaling("zoom");
+            } catch (ValueError as e) {
+                bad_scale = "ValueError";
+            }
+            show("bad scaling", bad_scale);
+            missing.setScaling("none");
+            missing.setScaling("fill");
+            missing.setScaling("fit");
+
+            # Control size names
+            var bad_size = "no error";
+            try {
+                off.setControlSize("huge");
+            } catch (ValueError as e) {
+                bad_size = "ValueError";
+            }
+            show("bad control size", bad_size);
+            off.setControlSize("mini");
+            off.setControlSize("large");
+            off.setControlSize("regular");
+            off.setControlSize("small");
+
+            note.setWraps(false);
+            note.setWraps(true);
+            note.setAlignment("left");
+            slider.setVertical(false);
+
+            testAdditions();
+
+            let args = runtime.args();
+            if (args.len() > 1) {
+                win.snapshot(args[1]);
+            }
+            quit();
+        });
+    }
+    run(win);
+}

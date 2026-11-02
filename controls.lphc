@@ -1,0 +1,2397 @@
+@mode(host.native)
+
+# appkit.controls — proxies for the standard AppKit controls: labels, buttons,
+# check boxes, radio groups, switches, text / secure / search fields, sliders,
+# steppers, pop-up buttons, combo boxes, segmented controls, progress bars and
+# spinners, level indicators, color wells, date pickers and image views, plus
+# a Font helper.
+#
+# Every proxy is an immutable wrapper (`handle` = the Objective-C object) that
+# extends appkit.app.View, so it can be placed with `Window.add`, `setFrame`
+# or any appkit layout container. Event handlers go through appkit.app's
+# registries (`onAction`, `onTextChange`); the few pieces of per-control state
+# AppKit does not keep (radio groups, spinner animation) live in module-level
+# registries keyed by the Objective-C object.
+#
+# Controls are created and used on the main thread only (AppKit's rule).
+#
+# ── Colors ──
+# The sRGB form stays everywhere it was (`Label.setTextColor(r, g, b, a)`,
+# `textColor(): Color`, `ColorWell`, `ImageView.setTint`). A `ColorRef` is an
+# NSColor proxy: `systemColor(COLOR_SECONDARY_LABEL)` (any `COLOR_*` name;
+# `systemColorNames()` lists them) is a dynamic system color that AppKit
+# re-resolves for light and dark mode every time it draws, `srgbColor(r, g,
+# b, a)` a fixed one. Apply one with `Label.applyTextColor`,
+# `TextInput.applyTextColor`, `Button.setTitleColor` / `setBezelColor` /
+# `setContentTint`, `ImageView.applyTint`, and in a canvas with
+# `Graphics.applyFillColor` / `applyStrokeColor`. Read it back with `name()`
+# ("secondaryLabelColor"; "" for a fixed color), `components()` (sRGB in the
+# app's appearance) or `componentsIn(dark)` (in light or dark mode).
+#
+# ── Fonts ──
+# `systemFont(size, bold)`, `monospacedFont(size, bold)` and `fontNamed` stay;
+# `systemFontWithWeight(size, WEIGHT_*)`, `monospacedFontWithWeight` and
+# `monospacedDigitSystemFont(size, WEIGHT_*)` (the system font with
+# fixed-width digits — timers, calculators, figures) take the nine NSFontWeight
+# values `WEIGHT_ULTRALIGHT` … `WEIGHT_BLACK`. `Font.weight()` reads the weight
+# back, `Font.withSize(size)` keeps the face at another size,
+# `Font.isFixedPitch()` says whether every glyph has one width. Apply a font
+# with `Control.applyFont` (labels, fields, buttons — a button with a title
+# color keeps it), `TableView.setColumnFont` or `TextArea`'s own `applyFont`.
+#
+# ── Text alignment ──
+# Alignment names are strings — `TEXT_LEFT`, `TEXT_CENTER`, `TEXT_RIGHT`,
+# `TEXT_JUSTIFIED`, `TEXT_NATURAL` — taken by `Control.setAlignment` (every
+# control proxy), `TextArea.setAlignment` and `TableView.setColumnAlignment`.
+# NSTextAlignment's raw values differ by ABI (center is 1 on arm64 and 2 on
+# x86-64, right the reverse); `textAlignmentValue(name)` gives the raw value
+# for this process and `textAlignmentName(value)` maps one back, for raw cell
+# code (`setAlignment:` on an NSCell or an NSParagraphStyle).
+#
+# ── Labels ──
+# `setWraps(true)` wraps; `setMaxWidth(w)` (preferredMaxLayoutWidth) gives a
+# wrapping label inside a stack the width its multi-line height is computed
+# for. `textWidth()` / `textHeight()` measure the size the label needs for its
+# text (its intrinsic content size). `setShrinkToFit(width, minScale)` steps
+# the font down (to `minScale` × its size at most) whenever the text would be
+# wider than `width`, now and on every later `setText`.
+#
+# ── Buttons ──
+# `setTitleColor(color)` draws the title in `color` through an attributed
+# title (with the button's font and alignment), so it shows whatever the
+# window's state — AppKit greys `setBezelColor` / `setContentTint` out while
+# the window is not key, and a quiet self-test's window never is. `setTitle`,
+# `applyFont`, `setFont` and `setAlignment` keep the title color.
+# In a quiet self-test a bezel color and a content tint therefore NEVER
+# show in `Window.render` / `snapshot` (the controls probe measures it: the
+# ⌥⌘K button renders without its blue bezel): the window is never key, and
+# making it key would mean activating the app, which takes the keyboard
+# focus from the user's app (see appkit.app, Test helpers). Check them with
+# `bezelColor()` / `contentTint()`; use `setTitleColor` for a color a
+# screenshot must show. A visible run (`LOUP_APPKIT_VISIBLE=1`, which
+# activates the app) or a real launch draws them.
+# `setKeyEquivalentWithModifiers(key, MOD_…)` (appkit.app's masks) adds ⌥, ⌃
+# or ⇧; `keyEquivalentModifiers()` reads the mask back.
+#
+# ── Text input (TextField, SecureField, SearchField, ComboBox) ──
+#   `onChange`      every edit (keystroke, paste, cut, delete).
+#   `onSubmit`      the control's ACTION: Return, AND — for a TextField (made
+#                   with textFieldWithString:, whose cell has
+#                   sendsActionOnEndEditing set) — whenever editing ends (Tab,
+#                   a click elsewhere, the focus moving to another field,
+#                   Window.clearFocus). A SecureField, a SearchField and a
+#                   ComboBox send it on Return only (a SearchField also when
+#                   its clear button empties it, a ComboBox when an item is
+#                   picked from its list). Unchanged for compatibility;
+#                   `setSubmitsOnEndEditing(false)` makes a TextField
+#                   Return-only, `(true)` makes any of them submit on end
+#                   editing too.
+#   `onReturn`      Return only (the field editor's insertNewline: command,
+#                   seen through control:textView:doCommandBySelector:); it
+#                   runs before `onSubmit`, which still runs.
+#   `onEndEditing`  editing ended (controlTextDidEndEditing:): Return, Tab,
+#                   the focus moving away. After Return the field stays
+#                   focused and is edited again (the next `typeKey` goes on
+#                   typing in it).
+#   Test typing: `typeText(text)` focuses the field (which selects all its
+#   text) and types over it; `typeText("")` therefore clears it and always
+#   runs the change handler, even on an empty field. `typeKey(text)` types at
+#   the insertion point WITHOUT re-focusing (a field not being edited is
+#   focused once, with the insertion point at the end), so successive calls
+#   append and each runs the change handler; `deleteBackward()` deletes like
+#   the Delete key; `selectAll()` selects the text (the next `typeKey` types
+#   over it); `submit()` presses Return (onReturn, then onSubmit).
+#   `isEditing()` and `selectedText()` read the state back.
+#
+# ── Views (appkit.app.View) ──
+# Every proxy also has View's `setHugging(h, v)` / `setCompressionResistance(h,
+# v)` (Auto Layout priorities, `PRIORITY_*` in appkit.app) and
+# `setFocusable(false)` (refusesFirstResponder: a click does not take the
+# keyboard focus or draw a focus ring).
+
+from appkit.objc import (cls, sel, make, nsstr, str_of, point_of, nsstrings, msg, msgV,
+    msgI, msgII, msgIII, msgIIII, msgD, msgDD, msgDDDD, msgID, msgRetD, malloc, free,
+    class_addMethod);
+from appkit.app import (View, onAction, onTextChange, runHandler, targetClass, target);
+
+## `+[NSSlider sliderWithValue:minValue:maxValue:target:action:]`.
+@symbol("objc_msgSend") extern native "objc" func msgDDDII(recv: int, sel: int, a: float, b: float, c: float, d: int, e: int): int;
+
+# ── constants ──────────────────────────────────────────────────────────────
+
+## Button bezel style: chosen by AppKit from the content and position (the
+## default for new buttons since macOS 14).
+pub const BEZEL_AUTOMATIC: int = 0;
+## Button bezel style: the standard rounded push button.
+pub const BEZEL_PUSH: int = 1;
+## Button bezel style: a push button that grows vertically with its content.
+pub const BEZEL_FLEXIBLE_PUSH: int = 2;
+## Button bezel style: a disclosure triangle.
+pub const BEZEL_DISCLOSURE: int = 5;
+## Button bezel style: a round button (for an icon).
+pub const BEZEL_CIRCULAR: int = 7;
+## Button bezel style: the round "?" help button.
+pub const BEZEL_HELP: int = 9;
+## Button bezel style: a small square button (e.g. +/- under a list).
+pub const BEZEL_SMALL_SQUARE: int = 10;
+## Button bezel style: a toolbar button.
+pub const BEZEL_TOOLBAR: int = 11;
+## Button bezel style: an accessory-bar action button (formerly "round rect").
+pub const BEZEL_ACCESSORY_BAR_ACTION: int = 12;
+## Button bezel style: an accessory-bar (scope bar) button.
+pub const BEZEL_ACCESSORY_BAR: int = 13;
+## Button bezel style: a small badge-like button (formerly "inline").
+pub const BEZEL_BADGE: int = 15;
+
+## LevelIndicator style: relevancy bars.
+pub const LEVEL_RELEVANCY: int = 0;
+## LevelIndicator style: one continuous capacity bar (the default).
+pub const LEVEL_CONTINUOUS: int = 1;
+## LevelIndicator style: discrete capacity segments.
+pub const LEVEL_DISCRETE: int = 2;
+## LevelIndicator style: star rating.
+pub const LEVEL_RATING: int = 3;
+
+## DatePicker style: a text field with a stepper (the default).
+pub const DATE_STEPPER: int = 0;
+## DatePicker style: a graphical month calendar.
+pub const DATE_CALENDAR: int = 1;
+## DatePicker style: a text field only.
+pub const DATE_FIELD: int = 2;
+
+## Text alignment names (Control.setAlignment, TextArea.setAlignment,
+## TableView.setColumnAlignment, textAlignmentValue).
+pub const TEXT_LEFT: string = "left";
+pub const TEXT_CENTER: string = "center";
+pub const TEXT_RIGHT: string = "right";
+pub const TEXT_JUSTIFIED: string = "justified";
+## The writing direction's natural alignment (left for English).
+pub const TEXT_NATURAL: string = "natural";
+
+## Font weights (NSFontWeight) for systemFontWithWeight,
+## monospacedDigitSystemFont, monospacedFontWithWeight and Control.setFontWeight.
+pub const WEIGHT_ULTRALIGHT: float = -0.8;
+pub const WEIGHT_THIN: float = -0.6;
+pub const WEIGHT_LIGHT: float = -0.4;
+pub const WEIGHT_REGULAR: float = 0.0;
+pub const WEIGHT_MEDIUM: float = 0.23;
+pub const WEIGHT_SEMIBOLD: float = 0.3;
+pub const WEIGHT_BOLD: float = 0.4;
+pub const WEIGHT_HEAVY: float = 0.56;
+pub const WEIGHT_BLACK: float = 0.62;
+
+## System color names for `systemColor` — dynamic NSColors that follow light
+## and dark mode (and, for the accent, the user's accent color).
+## Text: primary, secondary (captions, status lines), tertiary, quaternary.
+pub const COLOR_LABEL: string = "labelColor";
+pub const COLOR_SECONDARY_LABEL: string = "secondaryLabelColor";
+pub const COLOR_TERTIARY_LABEL: string = "tertiaryLabelColor";
+pub const COLOR_QUATERNARY_LABEL: string = "quaternaryLabelColor";
+## Text in a text view or field, its background, placeholder and links.
+pub const COLOR_TEXT: string = "textColor";
+pub const COLOR_TEXT_BACKGROUND: string = "textBackgroundColor";
+pub const COLOR_PLACEHOLDER_TEXT: string = "placeholderTextColor";
+pub const COLOR_SELECTED_TEXT_BACKGROUND: string = "selectedTextBackgroundColor";
+pub const COLOR_LINK: string = "linkColor";
+## The user's accent color, and control faces and text.
+pub const COLOR_CONTROL_ACCENT: string = "controlAccentColor";
+pub const COLOR_CONTROL: string = "controlColor";
+pub const COLOR_CONTROL_TEXT: string = "controlTextColor";
+pub const COLOR_DISABLED_CONTROL_TEXT: string = "disabledControlTextColor";
+pub const COLOR_CONTROL_BACKGROUND: string = "controlBackgroundColor";
+pub const COLOR_SELECTED_CONTENT_BACKGROUND: string = "selectedContentBackgroundColor";
+## Window and page backgrounds, separators and grids.
+pub const COLOR_WINDOW_BACKGROUND: string = "windowBackgroundColor";
+pub const COLOR_UNDER_PAGE_BACKGROUND: string = "underPageBackgroundColor";
+pub const COLOR_SEPARATOR: string = "separatorColor";
+pub const COLOR_GRID: string = "gridColor";
+## The adaptable system hues (a little brighter in dark mode).
+pub const COLOR_SYSTEM_RED: string = "systemRedColor";
+pub const COLOR_SYSTEM_ORANGE: string = "systemOrangeColor";
+pub const COLOR_SYSTEM_YELLOW: string = "systemYellowColor";
+pub const COLOR_SYSTEM_GREEN: string = "systemGreenColor";
+pub const COLOR_SYSTEM_MINT: string = "systemMintColor";
+pub const COLOR_SYSTEM_TEAL: string = "systemTealColor";
+pub const COLOR_SYSTEM_CYAN: string = "systemCyanColor";
+pub const COLOR_SYSTEM_BLUE: string = "systemBlueColor";
+pub const COLOR_SYSTEM_INDIGO: string = "systemIndigoColor";
+pub const COLOR_SYSTEM_PURPLE: string = "systemPurpleColor";
+pub const COLOR_SYSTEM_PINK: string = "systemPinkColor";
+pub const COLOR_SYSTEM_BROWN: string = "systemBrownColor";
+pub const COLOR_SYSTEM_GRAY: string = "systemGrayColor";
+
+## NSControlStateValueOn.
+const STATE_ON: int = 1;
+## NSProgressIndicatorStyleBar / Spinning.
+const PROGRESS_BAR: int = 0;
+const PROGRESS_SPINNING: int = 1;
+## NSDatePickerElementFlagYearMonthDay and …HourMinute.
+const DATE_ELEMENTS_YMD: int = 224;
+const DATE_ELEMENTS_HM: int = 12;
+## NSCalendarUnitYear / Month / Day.
+const UNIT_YEAR: int = 4;
+const UNIT_MONTH: int = 8;
+const UNIT_DAY: int = 16;
+## NSImageScaleProportionallyUpOrDown / ProportionallyDown / AxesIndependently / None.
+const SCALE_FIT: int = 3;
+const SCALE_DOWN: int = 0;
+const SCALE_FILL: int = 1;
+const SCALE_NONE: int = 2;
+## NSImageLeft (image to the left of a button's title).
+const IMAGE_LEFT: int = 2;
+## NSUserInterfaceLayoutOrientationVertical, NSLayoutAttributeLeading.
+const ORIENTATION_VERTICAL: int = 1;
+const ATTRIBUTE_LEADING: int = 5;
+## NSBundleExecutableArchitectureARM64.
+const ARCH_ARM64: int = 16777228;
+## NSColorTypeCatalog (a named color: every system color).
+const COLOR_TYPE_CATALOG: int = 2;
+
+# ── registries (state AppKit does not keep for us) ─────────────────────────
+
+var g_radio_buttons: dict[int, list[int]] = {};
+var g_radio_change: dict[int, fn(): void] = {};
+var g_animating: dict[int, bool] = {};
+var g_calendar: int = 0;
+var g_arch: int = -1;
+## Button → the NSColor (retained) its title is drawn in (setTitleColor).
+var g_title_color: dict[int, int] = {};
+## Label → its shrink-to-fit width, minimum scale and base font (retained).
+var g_fit_width: dict[int, float] = {};
+var g_fit_scale: dict[int, float] = {};
+var g_fit_font: dict[int, int] = {};
+## Text field → its onReturn / onEndEditing handler.
+var g_return: dict[int, fn(): void] = {};
+var g_end_editing: dict[int, fn(): void] = {};
+var g_return_method: bool = false;
+var g_end_method: bool = false;
+
+# ── helpers ────────────────────────────────────────────────────────────────
+
+func flag(b: bool): int {
+    if (b) {
+        return 1;
+    }
+    return 0;
+}
+
+## A BOOL result (only the low byte is defined).
+func bool_of(word: int): bool {
+    let b = (word & 255) != 0;
+    return b;
+}
+
+## An sRGB NSColor.
+func nscolor(r: float, g: float, b: float, a: float): int {
+    let c = msgDDDD(cls("NSColor"), sel("colorWithSRGBRed:green:blue:alpha:"), r, g, b, a);
+    return c;
+}
+
+## The strings in an NSArray of NSStrings.
+func strings_of(arr: int): list[string] {
+    var out: list[string] = [];
+    if (arr == 0) {
+        return out;
+    }
+    let n = msg(arr, sel("count"));
+    var i = 0;
+    while (i < n) {
+        out.push(str_of(msgI(arr, sel("objectAtIndex:"), i)));
+        i = i + 1;
+    }
+    return out;
+}
+
+## Whether this process runs as arm64 (NSTextAlignment's values differ by ABI).
+func is_arm64(): bool {
+    if (g_arch == -1) {
+        let app = msg(cls("NSRunningApplication"), sel("currentApplication"));
+        g_arch = msg(app, sel("executableArchitecture"));
+    }
+    return g_arch == ARCH_ARM64;
+}
+
+## The raw NSTextAlignment value of the alignment `name` — TEXT_LEFT,
+## TEXT_CENTER, TEXT_RIGHT, TEXT_JUSTIFIED or TEXT_NATURAL — for this process's
+## ABI (center and right swap values between arm64 and x86-64). For raw
+## `setAlignment:` on a cell or a paragraph style. Throws ValueError for any
+## other name.
+pub func textAlignmentValue(name: string): int {
+    let v = alignment_value(name);
+    return v;
+}
+
+## The alignment name (TEXT_*) of the raw NSTextAlignment `value` on this
+## process's ABI.
+pub func textAlignmentName(value: int): string {
+    let n = alignment_name(value);
+    return n;
+}
+
+## The NSTextAlignment value for "left", "center", "right", "justified" or
+## "natural".
+func alignment_value(name: string): int {
+    if (name == "left") {
+        return 0;
+    }
+    if (name == "center") {
+        if (is_arm64()) { return 1; }
+        return 2;
+    }
+    if (name == "right") {
+        if (is_arm64()) { return 2; }
+        return 1;
+    }
+    if (name == "justified") {
+        return 3;
+    }
+    if (name == "natural") {
+        return 4;
+    }
+    throw ValueError("appkit.controls: unknown alignment '" + name + "' (left, center, right, justified, natural)");
+}
+
+func alignment_name(value: int): string {
+    if (value == 0) { return "left"; }
+    if (value == 3) { return "justified"; }
+    if (value == 4) { return "natural"; }
+    var center = 2;
+    if (is_arm64()) { center = 1; }
+    if (value == center) { return "center"; }
+    return "right";
+}
+
+## The Gregorian calendar the date pickers use (created once).
+func gregorian(): int {
+    if (g_calendar == 0) {
+        g_calendar = msgI(msg(cls("NSCalendar"), sel("alloc")), sel("initWithCalendarIdentifier:"), nsstr("gregorian"));
+    }
+    return g_calendar;
+}
+
+## `n` as decimal digits, zero-padded on the left to `width`.
+func pad(n: int, width: int): string {
+    var s = n.to_string();
+    while (s.len() < width) {
+        s = "0" + s;
+    }
+    return s;
+}
+
+## An sRGB color with components in 0..1.
+pub struct Color {
+    pub r: float;
+    pub g: float;
+    pub b: float;
+    pub a: float;
+}
+
+## The sRGB components of the NSColor `c` (black when it has none).
+func color_of(c: int): Color {
+    if (c == 0) {
+        return Color(r = 0.0, g = 0.0, b = 0.0, a = 1.0);
+    }
+    let srgb = msgI(c, sel("colorUsingColorSpace:"), msg(cls("NSColorSpace"), sel("sRGBColorSpace")));
+    if (srgb == 0) {
+        return Color(r = 0.0, g = 0.0, b = 0.0, a = 1.0);
+    }
+    let col = Color(r = msgRetD(srgb, sel("redComponent")), g = msgRetD(srgb, sel("greenComponent")),
+        b = msgRetD(srgb, sel("blueComponent")), a = msgRetD(srgb, sel("alphaComponent")));
+    return col;
+}
+
+## The sRGB components of `c` resolved under the appearance `appearance` (an
+## NSAppearance; 0: the current one). A dynamic color resolves against
+## `+[NSAppearance currentAppearance]`, which is set for the read and restored.
+func color_under(c: int, appearance: int): Color {
+    if (appearance == 0) {
+        let plain = color_of(c);
+        return plain;
+    }
+    let appearance_cls = cls("NSAppearance");
+    let saved = msg(appearance_cls, sel("currentAppearance"));
+    msgV(saved, sel("retain"));
+    msgI(appearance_cls, sel("setCurrentAppearance:"), appearance);
+    let col = color_of(c);
+    msgI(appearance_cls, sel("setCurrentAppearance:"), saved);
+    msgV(saved, sel("release"));
+    return col;
+}
+
+# ── colors ─────────────────────────────────────────────────────────────────
+
+## Every name `systemColor` accepts (the COLOR_* constants), in order.
+pub func systemColorNames(): list[string] {
+    let names = [COLOR_LABEL, COLOR_SECONDARY_LABEL, COLOR_TERTIARY_LABEL, COLOR_QUATERNARY_LABEL,
+        COLOR_TEXT, COLOR_TEXT_BACKGROUND, COLOR_PLACEHOLDER_TEXT, COLOR_SELECTED_TEXT_BACKGROUND,
+        COLOR_LINK, COLOR_CONTROL_ACCENT, COLOR_CONTROL, COLOR_CONTROL_TEXT,
+        COLOR_DISABLED_CONTROL_TEXT, COLOR_CONTROL_BACKGROUND, COLOR_SELECTED_CONTENT_BACKGROUND,
+        COLOR_WINDOW_BACKGROUND, COLOR_UNDER_PAGE_BACKGROUND, COLOR_SEPARATOR, COLOR_GRID,
+        COLOR_SYSTEM_RED, COLOR_SYSTEM_ORANGE, COLOR_SYSTEM_YELLOW, COLOR_SYSTEM_GREEN,
+        COLOR_SYSTEM_MINT, COLOR_SYSTEM_TEAL, COLOR_SYSTEM_CYAN, COLOR_SYSTEM_BLUE,
+        COLOR_SYSTEM_INDIGO, COLOR_SYSTEM_PURPLE, COLOR_SYSTEM_PINK, COLOR_SYSTEM_BROWN,
+        COLOR_SYSTEM_GRAY];
+    return names;
+}
+
+## An NSColor: a dynamic system color (`systemColor`) that AppKit resolves
+## for light or dark mode each time it draws, or a fixed sRGB one
+## (`srgbColor`). `color_handle` is the NSColor (retained; 0 for "no color",
+## e.g. a button without a bezel color). Apply it with `Label.applyTextColor`,
+## `Button.setTitleColor`, `Graphics.applyFillColor`, ….
+pub class ColorRef {
+    pub let color_handle: int;
+
+    pub func constructor(color_handle: int) {
+        this.color_handle = color_handle;
+    }
+
+    ## Whether there is no color (handle 0).
+    pub func isNone(): bool {
+        return this.color_handle == 0;
+    }
+
+    ## Whether this is a named system color (it follows the appearance).
+    pub func isSystem(): bool {
+        if (this.color_handle == 0) {
+            return false;
+        }
+        let kind = msg(this.color_handle, sel("type"));
+        return kind == COLOR_TYPE_CATALOG;
+    }
+
+    ## The system color's name ("secondaryLabelColor", a COLOR_* value); ""
+    ## for a fixed color or none.
+    pub func name(): string {
+        if (not this.isSystem()) {
+            return "";
+        }
+        let n = str_of(msg(this.color_handle, sel("colorNameComponent")));
+        return n;
+    }
+
+    ## The sRGB components as the app draws them now (its current
+    ## appearance); black for no color.
+    pub func components(): Color {
+        let app = msg(cls("NSApplication"), sel("sharedApplication"));
+        let appearance = msg(app, sel("effectiveAppearance"));
+        let c = color_under(this.color_handle, appearance);
+        return c;
+    }
+
+    ## The sRGB components in light (`dark` false: Aqua) or dark mode
+    ## (DarkAqua), whatever the app's appearance.
+    pub func componentsIn(dark: bool): Color {
+        var name = "NSAppearanceNameAqua";
+        if (dark) {
+            name = "NSAppearanceNameDarkAqua";
+        }
+        let appearance = msgI(cls("NSAppearance"), sel("appearanceNamed:"), nsstr(name));
+        let c = color_under(this.color_handle, appearance);
+        return c;
+    }
+
+    ## The same color with opacity `alpha` (0..1); a system color stays
+    ## dynamic.
+    pub func withAlpha(alpha: float): ColorRef {
+        let h = msgD(this.color_handle, sel("colorWithAlphaComponent:"), alpha);
+        msgV(h, sel("retain"));
+        let c = ColorRef(h);
+        return c;
+    }
+}
+
+## The dynamic system color `name` (a COLOR_* constant, e.g.
+## COLOR_SECONDARY_LABEL or COLOR_SYSTEM_RED). Throws ValueError for a name
+## not in `systemColorNames()`.
+pub func systemColor(name: string): ColorRef {
+    var known = false;
+    for (n in systemColorNames()) {
+        if (n == name) {
+            known = true;
+        }
+    }
+    if (not known) {
+        throw ValueError("appkit.controls: unknown system color '" + name + "' (see systemColorNames())");
+    }
+    let color_cls = cls("NSColor");
+    let answers = msgI(color_cls, sel("respondsToSelector:"), sel(name)) & 255;
+    var h = 0;
+    if (answers != 0) {
+        h = msg(color_cls, sel(name));
+    }
+    if (h == 0) {
+        throw ValueError("appkit.controls: this macOS has no system color '" + name + "'");
+    }
+    msgV(h, sel("retain"));
+    let c = ColorRef(h);
+    return c;
+}
+
+## A fixed sRGB color (components in 0..1); it looks the same in light and
+## dark mode.
+pub func srgbColor(r: float, g: float, b: float, a: float): ColorRef {
+    let h = nscolor(r, g, b, a);
+    msgV(h, sel("retain"));
+    let c = ColorRef(h);
+    return c;
+}
+
+## `obj`'s NSColor property read with `getter` as a ColorRef (retained; handle
+## 0 when it has none).
+func color_ref_of(obj: int, getter: string): ColorRef {
+    let h = msg(obj, sel(getter));
+    if (h != 0) {
+        msgV(h, sel("retain"));
+    }
+    let c = ColorRef(h);
+    return c;
+}
+
+# ── fonts ──────────────────────────────────────────────────────────────────
+
+## An NSFont. Make one with `systemFont`, `monospacedFont` or `fontNamed`;
+## apply it with `Control.applyFont`.
+pub class Font {
+    pub let handle: int;
+
+    pub func constructor(handle: int) {
+        this.handle = handle;
+    }
+
+    ## The point size.
+    pub func size(): float {
+        let s = msgRetD(this.handle, sel("pointSize"));
+        return s;
+    }
+
+    ## The PostScript name (e.g. ".AppleSystemUIFontBold", "Menlo-Regular").
+    pub func name(): string {
+        let n = str_of(msg(this.handle, sel("fontName")));
+        return n;
+    }
+
+    ## Whether the font exists (`fontNamed` gives handle 0 for an unknown name).
+    pub func isValid(): bool {
+        return this.handle != 0;
+    }
+
+    ## Whether every glyph of the font has the same advance width
+    ## (NSFont isFixedPitch): true for `monospacedFont`, `TextArea.setFont(size,
+    ## true)`, Menlo; false for the system font, including
+    ## `monospacedDigitSystemFont` (only its digits are fixed-width) and a
+    ## missing font (handle 0).
+    pub func isFixedPitch(): bool {
+        if (this.handle == 0) {
+            return false;
+        }
+        let r = msg(this.handle, sel("isFixedPitch")) & 255;
+        let fixed = r != 0;
+        return fixed;
+    }
+
+    ## The weight (NSFontWeight, -1..1: WEIGHT_REGULAR is 0, WEIGHT_BOLD 0.4),
+    ## read from the font's descriptor traits; 0 when it reports none.
+    pub func weight(): float {
+        if (this.handle == 0) {
+            return 0.0;
+        }
+        let descriptor = msg(this.handle, sel("fontDescriptor"));
+        let traits = msgI(descriptor, sel("objectForKey:"), nsstr("NSCTFontTraitsAttribute"));
+        if (traits == 0) {
+            return 0.0;
+        }
+        let number = msgI(traits, sel("objectForKey:"), nsstr("NSCTFontWeightTrait"));
+        if (number == 0) {
+            return 0.0;
+        }
+        let w = msgRetD(number, sel("doubleValue"));
+        return w;
+    }
+
+    ## The same face (weight, digit style and all) at `size` points.
+    pub func withSize(size: float): Font {
+        let descriptor = msg(this.handle, sel("fontDescriptor"));
+        let h = msgID(cls("NSFont"), sel("fontWithDescriptor:size:"), descriptor, size);
+        let f = Font(h);
+        return f;
+    }
+}
+
+## The system font at `size` points and `weight` (a WEIGHT_* constant).
+pub func systemFontWithWeight(size: float, weight: float): Font {
+    let h = msgDD(cls("NSFont"), sel("systemFontOfSize:weight:"), size, weight);
+    let f = Font(h);
+    return f;
+}
+
+## The system font with fixed-width (tabular) digits at `size` points and
+## `weight` (a WEIGHT_* constant): figures line up and a running counter does
+## not jitter, while letters keep the proportional system look.
+pub func monospacedDigitSystemFont(size: float, weight: float): Font {
+    let h = msgDD(cls("NSFont"), sel("monospacedDigitSystemFontOfSize:weight:"), size, weight);
+    let f = Font(h);
+    return f;
+}
+
+## The monospaced system font (SF Mono) at `size` points and `weight`.
+pub func monospacedFontWithWeight(size: float, weight: float): Font {
+    let h = msgDD(cls("NSFont"), sel("monospacedSystemFontOfSize:weight:"), size, weight);
+    let f = Font(h);
+    return f;
+}
+
+## The system font at `size` points, bold or regular.
+pub func systemFont(size: float, bold: bool): Font {
+    var h = 0;
+    if (bold) {
+        h = msgD(cls("NSFont"), sel("boldSystemFontOfSize:"), size);
+    } else {
+        h = msgD(cls("NSFont"), sel("systemFontOfSize:"), size);
+    }
+    let f = Font(h);
+    return f;
+}
+
+## The monospaced system font (SF Mono) at `size` points.
+pub func monospacedFont(size: float, bold: bool): Font {
+    var weight = 0.0;
+    if (bold) {
+        weight = 0.4;
+    }
+    let h = msgDD(cls("NSFont"), sel("monospacedSystemFontOfSize:weight:"), size, weight);
+    let f = Font(h);
+    return f;
+}
+
+## The font named `name` (e.g. "Menlo", "Helvetica-Bold") at `size` points;
+## `isValid()` is false when no such font is installed.
+pub func fontNamed(name: string, size: float): Font {
+    let h = msgID(cls("NSFont"), sel("fontWithName:size:"), nsstr(name), size);
+    let f = Font(h);
+    return f;
+}
+
+# ── the control base ───────────────────────────────────────────────────────
+
+## Any NSControl: enabling, fonts, text alignment and sending the action.
+## Every control proxy below except ProgressBar/Spinner extends it.
+pub class Control : View {
+    pub func constructor(handle: int) {
+        super(handle);
+    }
+
+    pub func setEnabled(enabled: bool): void {
+        msgI(this.handle, sel("setEnabled:"), flag(enabled));
+        return;
+    }
+
+    pub func isEnabled(): bool {
+        let e = bool_of(msg(this.handle, sel("isEnabled")));
+        return e;
+    }
+
+    ## Use the system font at `size` points, bold or regular.
+    pub func setFont(size: float, bold: bool): void {
+        let f = systemFont(size, bold);
+        msgI(this.handle, sel("setFont:"), f.handle);
+        return;
+    }
+
+    ## Use `font` (from `systemFont`, `monospacedFont` or `fontNamed`).
+    pub func applyFont(font: Font): void {
+        msgI(this.handle, sel("setFont:"), font.handle);
+        return;
+    }
+
+    ## Use the system font at `size` points and `weight` (a WEIGHT_* constant).
+    pub func setFontWeight(size: float, weight: float): void {
+        let f = systemFontWithWeight(size, weight);
+        this.applyFont(f);
+        return;
+    }
+
+    ## The control's current font.
+    pub func font(): Font {
+        let f = Font(msg(this.handle, sel("font")));
+        return f;
+    }
+
+    ## Align the control's text: "left", "center", "right", "justified" or
+    ## "natural" (throws ValueError for anything else).
+    pub func setAlignment(alignment: string): void {
+        msgI(this.handle, sel("setAlignment:"), alignment_value(alignment));
+        return;
+    }
+
+    ## The text alignment as a name ("left", "center", …).
+    pub func alignment(): string {
+        let a = alignment_name(msg(this.handle, sel("alignment")));
+        return a;
+    }
+
+    ## Control size: "mini", "small", "regular" (default) or "large".
+    pub func setControlSize(size: string): void {
+        var v = 0;
+        if (size == "small") {
+            v = 1;
+        } else if (size == "mini") {
+            v = 2;
+        } else if (size == "large") {
+            v = 3;
+        } else if (size != "regular") {
+            throw ValueError("appkit.controls: unknown control size '" + size + "' (mini, small, regular, large)");
+        }
+        msgI(this.handle, sel("setControlSize:"), v);
+        return;
+    }
+
+    ## Send the control's action now, as if the user had used it (runs the
+    ## handler given to `onChange` / `onClick` / `onSubmit`). For tests and
+    ## for programmatic changes that should notify.
+    pub func sendAction(): void {
+        let action = msg(this.handle, sel("action"));
+        if (action == 0) {
+            return;
+        }
+        msgII(this.handle, sel("sendAction:to:"), action, msg(this.handle, sel("target")));
+        return;
+    }
+}
+
+# ── Label ──────────────────────────────────────────────────────────────────
+
+## A non-editable, non-bezeled text label.
+pub class Label : Control {
+    ## A one-line label showing `text`.
+    pub func constructor(text: string) {
+        super(msgI(cls("NSTextField"), sel("labelWithString:"), nsstr(text)));
+    }
+
+    pub func text(): string {
+        let t = str_of(msg(this.handle, sel("stringValue")));
+        return t;
+    }
+
+    ## Show `text` (with shrink-to-fit on, the font is fitted to it again).
+    pub func setText(text: string): void {
+        msgI(this.handle, sel("setStringValue:"), nsstr(text));
+        if (g_fit_width.contains_key(this.handle)) {
+            this.fitFont();
+        }
+        return;
+    }
+
+    ## Text color as sRGB components in 0..1.
+    pub func setTextColor(r: float, g: float, b: float, a: float): void {
+        msgI(this.handle, sel("setTextColor:"), nscolor(r, g, b, a));
+        return;
+    }
+
+    ## The text color's sRGB components.
+    pub func textColor(): Color {
+        let c = color_of(msg(this.handle, sel("textColor")));
+        return c;
+    }
+
+    ## Draw the text in `color` (a ColorRef: `systemColor(COLOR_…)` follows
+    ## light and dark mode).
+    pub func applyTextColor(color: ColorRef): void {
+        msgI(this.handle, sel("setTextColor:"), color.color_handle);
+        return;
+    }
+
+    ## The text color as a ColorRef (`name()` is "secondaryLabelColor" after
+    ## `applyTextColor(systemColor(COLOR_SECONDARY_LABEL))`).
+    pub func textColorRef(): ColorRef {
+        let c = color_ref_of(this.handle, "textColor");
+        return c;
+    }
+
+    ## The width the label needs to show its text on one line in its font
+    ## (its intrinsic content width, AppKit's small text inset included).
+    pub func textWidth(): float {
+        let size = point_of(this.handle, "intrinsicContentSize");
+        let w = size.x;
+        return w;
+    }
+
+    ## The height the label needs for its text (with `setWraps(true)` and
+    ## `setMaxWidth(w)`: the height of the text wrapped at that width).
+    pub func textHeight(): float {
+        let size = point_of(this.handle, "intrinsicContentSize");
+        let h = size.y;
+        return h;
+    }
+
+    ## The width a wrapping label's height is computed for
+    ## (preferredMaxLayoutWidth): without it a wrapping label in a stack
+    ## reports a one-line intrinsic size. 0 lets AppKit use the label's frame.
+    pub func setMaxWidth(width: float): void {
+        msgD(this.handle, sel("setPreferredMaxLayoutWidth:"), width);
+        return;
+    }
+
+    pub func maxWidth(): float {
+        let w = msgRetD(this.handle, sel("preferredMaxLayoutWidth"));
+        return w;
+    }
+
+    ## Shrink-to-fit: whenever the text is wider than `width` points (see
+    ## `textWidth`), draw it in a smaller size of the label's font — in steps
+    ## of half a point, down to `minScale` × the font's size (e.g. 0.5) —
+    ## and in the font's own size when it fits. Applies now and on every
+    ## `setText`; `applyFont` / `setFont` change the font it starts from.
+    ## Text that does not fit even at the minimum size is truncated.
+    ## `width` <= 0 switches it off and restores the font.
+    pub func setShrinkToFit(width: float, minScale: float): void {
+        if (width > 0.0 and (minScale <= 0.0 or minScale > 1.0)) {
+            throw ValueError("appkit.controls: Label.setShrinkToFit needs a minimum scale in (0, 1], got " + minScale.to_string());
+        }
+        if (g_fit_font.contains_key(this.handle)) {
+            let base = g_fit_font[this.handle];
+            msgI(this.handle, sel("setFont:"), base);
+            msgV(base, sel("release"));
+            g_fit_font.remove(this.handle);
+            g_fit_width.remove(this.handle);
+            g_fit_scale.remove(this.handle);
+        }
+        if (width <= 0.0) {
+            return;
+        }
+        let font = msg(this.handle, sel("font"));
+        msgV(font, sel("retain"));
+        g_fit_font[this.handle] = font;
+        g_fit_width[this.handle] = width;
+        g_fit_scale[this.handle] = minScale;
+        this.fitFont();
+        return;
+    }
+
+    ## Use `font`; with shrink-to-fit on, it becomes the size fitted from.
+    pub override func applyFont(font: Font): void {
+        msgI(this.handle, sel("setFont:"), font.handle);
+        if (g_fit_font.contains_key(this.handle)) {
+            msgV(g_fit_font[this.handle], sel("release"));
+            msgV(font.handle, sel("retain"));
+            g_fit_font[this.handle] = font.handle;
+            this.fitFont();
+        }
+        return;
+    }
+
+    ## Use the system font at `size` points, bold or regular.
+    pub override func setFont(size: float, bold: bool): void {
+        let f = systemFont(size, bold);
+        this.applyFont(f);
+        return;
+    }
+
+    ## Fit the shrink-to-fit base font to the current text.
+    func fitFont(): void {
+        let base = Font(g_fit_font[this.handle]);
+        let width = g_fit_width[this.handle];
+        let full = base.size();
+        let smallest = full * g_fit_scale[this.handle];
+        msgI(this.handle, sel("setFont:"), base.handle);
+        var size = full;
+        while (this.textWidth() > width and size - 0.5 >= smallest) {
+            size = size - 0.5;
+            let smaller = base.withSize(size);
+            msgI(this.handle, sel("setFont:"), smaller.handle);
+        }
+        return;
+    }
+
+    ## Wrap long text onto several lines (true) or truncate it with "…" (false,
+    ## the default for a label).
+    pub func setWraps(wraps: bool): void {
+        if (wraps) {
+            msgI(this.handle, sel("setLineBreakMode:"), 0);
+            msgI(this.handle, sel("setUsesSingleLineMode:"), 0);
+            msgI(this.handle, sel("setMaximumNumberOfLines:"), 0);
+        } else {
+            msgI(this.handle, sel("setLineBreakMode:"), 4);
+            msgI(this.handle, sel("setMaximumNumberOfLines:"), 1);
+        }
+        return;
+    }
+
+    ## Let the user select (and copy) the text.
+    pub func setSelectable(selectable: bool): void {
+        msgI(this.handle, sel("setSelectable:"), flag(selectable));
+        return;
+    }
+}
+
+# ── Button ─────────────────────────────────────────────────────────────────
+
+## A push button.
+pub class Button : Control {
+    ## A standard rounded push button titled `title`.
+    pub func constructor(title: string) {
+        super(msgIII(cls("NSButton"), sel("buttonWithTitle:target:action:"), nsstr(title), 0, 0));
+    }
+
+    pub func title(): string {
+        let t = str_of(msg(this.handle, sel("title")));
+        return t;
+    }
+
+    ## Set the title (a title color set with `setTitleColor` is kept).
+    pub func setTitle(title: string): void {
+        msgI(this.handle, sel("setTitle:"), nsstr(title));
+        this.restyleTitle();
+        return;
+    }
+
+    ## Draw the title in `color` (a ColorRef; a system color follows light
+    ## and dark mode). It is an attributed title carrying the color, the
+    ## button's font and its alignment, so — unlike the bezel color and
+    ## content tint — it shows whatever the window's state, a quiet
+    ## self-test's non-key window included.
+    pub func setTitleColor(color: ColorRef): void {
+        if (g_title_color.contains_key(this.handle)) {
+            msgV(g_title_color[this.handle], sel("release"));
+        }
+        msgV(color.color_handle, sel("retain"));
+        g_title_color[this.handle] = color.color_handle;
+        this.restyleTitle();
+        return;
+    }
+
+    ## The title color set with `setTitleColor` (read from the attributed
+    ## title); `isNone()` when the title is drawn in AppKit's own color.
+    pub func titleColor(): ColorRef {
+        if (not g_title_color.contains_key(this.handle)) {
+            let none = ColorRef(0);
+            return none;
+        }
+        let attributed = msg(this.handle, sel("attributedTitle"));
+        var h = 0;
+        if (attributed != 0 and msg(attributed, sel("length")) > 0) {
+            h = msgIII(attributed, sel("attribute:atIndex:effectiveRange:"), nsstr("NSColor"), 0, 0);
+        } else {
+            h = g_title_color[this.handle];
+        }
+        if (h != 0) {
+            msgV(h, sel("retain"));
+        }
+        let c = ColorRef(h);
+        return c;
+    }
+
+    ## Go back to AppKit's own title color.
+    pub func clearTitleColor(): void {
+        if (not g_title_color.contains_key(this.handle)) {
+            return;
+        }
+        msgV(g_title_color[this.handle], sel("release"));
+        g_title_color.remove(this.handle);
+        let title = msg(this.handle, sel("title"));
+        msgI(this.handle, sel("setTitle:"), title);
+        return;
+    }
+
+    ## Rebuild the attributed title from the plain title, the font, the
+    ## alignment and the title color (no-op without a title color).
+    func restyleTitle(): void {
+        if (not g_title_color.contains_key(this.handle)) {
+            return;
+        }
+        let para = make("NSMutableParagraphStyle");
+        msgI(para, sel("setAlignment:"), msg(this.handle, sel("alignment")));
+        let attrs = msg(cls("NSMutableDictionary"), sel("dictionary"));
+        msgII(attrs, sel("setObject:forKey:"), g_title_color[this.handle], nsstr("NSColor"));
+        let font = msg(this.handle, sel("font"));
+        if (font != 0) {
+            msgII(attrs, sel("setObject:forKey:"), font, nsstr("NSFont"));
+        }
+        msgII(attrs, sel("setObject:forKey:"), para, nsstr("NSParagraphStyle"));
+        let title = msg(this.handle, sel("title"));
+        let text = msgII(msg(cls("NSAttributedString"), sel("alloc")), sel("initWithString:attributes:"), title, attrs);
+        msgI(this.handle, sel("setAttributedTitle:"), text);
+        msgV(text, sel("release"));
+        msgV(para, sel("release"));
+        return;
+    }
+
+    ## Use `font` (a title color is kept).
+    pub override func applyFont(font: Font): void {
+        msgI(this.handle, sel("setFont:"), font.handle);
+        this.restyleTitle();
+        return;
+    }
+
+    ## Use the system font at `size` points, bold or regular (a title color
+    ## is kept).
+    pub override func setFont(size: float, bold: bool): void {
+        let f = systemFont(size, bold);
+        this.applyFont(f);
+        return;
+    }
+
+    ## Align the title (TEXT_* names; a title color is kept).
+    pub override func setAlignment(alignment: string): void {
+        msgI(this.handle, sel("setAlignment:"), alignment_value(alignment));
+        this.restyleTitle();
+        return;
+    }
+
+    ## The bezel's color (AppKit draws it only while the window is key — a
+    ## quiet self-test's window never is; `bezelColor()` still reads it back).
+    pub func setBezelColor(color: ColorRef): void {
+        msgI(this.handle, sel("setBezelColor:"), color.color_handle);
+        return;
+    }
+
+    ## The bezel color (`isNone()` for AppKit's default).
+    pub func bezelColor(): ColorRef {
+        let c = color_ref_of(this.handle, "bezelColor");
+        return c;
+    }
+
+    ## Tint the button's image and (without a title color) its title — drawn
+    ## only while the window is key, like the bezel color (so never in a
+    ## quiet self-test's render; `contentTint()` reads it back).
+    pub func setContentTint(color: ColorRef): void {
+        msgI(this.handle, sel("setContentTintColor:"), color.color_handle);
+        return;
+    }
+
+    ## The content tint (`isNone()` for none).
+    pub func contentTint(): ColorRef {
+        let c = color_ref_of(this.handle, "contentTintColor");
+        return c;
+    }
+
+    ## The key that clicks the button with a modifier mask (appkit.app's
+    ## MOD_NONE, MOD_COMMAND, MOD_OPTION, …, added together), e.g. ("k",
+    ## MOD_COMMAND + MOD_OPTION) for ⌥⌘K. `Window.sendKey` presses it.
+    pub func setKeyEquivalentWithModifiers(key: string, modifiers: int): void {
+        msgI(this.handle, sel("setKeyEquivalent:"), nsstr(key));
+        msgI(this.handle, sel("setKeyEquivalentModifierMask:"), modifiers);
+        return;
+    }
+
+    ## The key equivalent's modifier mask (MOD_* bits).
+    pub func keyEquivalentModifiers(): int {
+        let m = msg(this.handle, sel("keyEquivalentModifierMask"));
+        return m;
+    }
+
+    ## Run `handler` when the button is clicked (replaces an earlier one).
+    pub func onClick(handler: fn(): void): void {
+        onAction(this.handle, handler);
+        return;
+    }
+
+    ## Click the button programmatically (highlights it and runs the handler).
+    pub func click(): void {
+        msgI(this.handle, sel("performClick:"), 0);
+        return;
+    }
+
+    ## The key that clicks the button: "\r" makes it the default button
+    ## (Return, drawn in the accent color), "\u{1b}" Escape (a Cancel button),
+    ## a letter a ⌘-shortcut; "" removes it.
+    pub func setKeyEquivalent(key: string): void {
+        msgI(this.handle, sel("setKeyEquivalent:"), nsstr(key));
+        return;
+    }
+
+    ## The key that clicks the button ("" for none). AppKit reports "" for the
+    ## default button while its window is not key, so a button that is its
+    ## window's default button reports "\r" whatever the window's state.
+    pub func keyEquivalent(): string {
+        let k = str_of(msg(this.handle, sel("keyEquivalent")));
+        if (k.len() > 0) {
+            return k;
+        }
+        if (this.isDefault()) {
+            return "\r";
+        }
+        return k;
+    }
+
+    ## Whether the button is its window's default button (key equivalent
+    ## "\r"; false while it is not in a window).
+    pub func isDefault(): bool {
+        let win = msg(this.handle, sel("window"));
+        if (win == 0) {
+            return false;
+        }
+        let default_cell = msg(win, sel("defaultButtonCell"));
+        if (default_cell == 0) {
+            return false;
+        }
+        let is_default = default_cell == msg(this.handle, sel("cell"));
+        return is_default;
+    }
+
+    ## One of the BEZEL_* constants.
+    pub func setBezelStyle(style: int): void {
+        msgI(this.handle, sel("setBezelStyle:"), style);
+        return;
+    }
+
+    pub func bezelStyle(): int {
+        let s = msg(this.handle, sel("bezelStyle"));
+        return s;
+    }
+
+    ## Show the SF Symbol `name` (e.g. "star.fill") left of the title (or alone
+    ## when the title is ""). Returns false when there is no such symbol.
+    pub func setSymbol(name: string): bool {
+        let img = msgII(cls("NSImage"), sel("imageWithSystemSymbolName:accessibilityDescription:"), nsstr(name), 0);
+        if (img == 0) {
+            return false;
+        }
+        msgI(this.handle, sel("setImage:"), img);
+        msgI(this.handle, sel("setImagePosition:"), IMAGE_LEFT);
+        return true;
+    }
+}
+
+# ── Checkbox ───────────────────────────────────────────────────────────────
+
+## A check box with a title.
+pub class Checkbox : Control {
+    pub func constructor(title: string) {
+        super(msgIII(cls("NSButton"), sel("checkboxWithTitle:target:action:"), nsstr(title), 0, 0));
+    }
+
+    pub func checked(): bool {
+        let s = msg(this.handle, sel("state"));
+        return s == STATE_ON;
+    }
+
+    ## Set the state without running the change handler.
+    pub func setChecked(checked: bool): void {
+        msgI(this.handle, sel("setState:"), flag(checked));
+        return;
+    }
+
+    ## Run `handler` when the user toggles the box.
+    pub func onChange(handler: fn(): void): void {
+        onAction(this.handle, handler);
+        return;
+    }
+
+    ## Toggle the box as a click would (runs the change handler).
+    pub func click(): void {
+        msgI(this.handle, sel("performClick:"), 0);
+        return;
+    }
+
+    pub func title(): string {
+        let t = str_of(msg(this.handle, sel("title")));
+        return t;
+    }
+
+    pub func setTitle(title: string): void {
+        msgI(this.handle, sel("setTitle:"), nsstr(title));
+        return;
+    }
+}
+
+# ── RadioGroup ─────────────────────────────────────────────────────────────
+
+## The action of radio button `index` of `group`: make it the only one on,
+## then run the group's change handler.
+func radio_action(group: int, index: int): fn(): void {
+    let handler = func(): void {
+        let buttons = g_radio_buttons[group];
+        var i = 0;
+        while (i < buttons.len()) {
+            if (i != index) {
+                msgI(buttons[i], sel("setState:"), 0);
+            }
+            i = i + 1;
+        }
+        if (g_radio_change.contains_key(group)) {
+            let h = g_radio_change[group];
+            runHandler(h, "radio group change");
+        }
+    };
+    return handler;
+}
+
+## A set of radio buttons of which at most one is on. The group itself is a
+## vertical stack holding the buttons (place it like any view); `buttons()`
+## returns them as Views to lay them out elsewhere instead (the group keeps
+## them exclusive wherever they are).
+pub class RadioGroup : View {
+    ## One radio button per title; the first one is selected.
+    pub func constructor(titles: list[string]) {
+        super(msg(cls("NSStackView"), sel("new")));
+        msgI(this.handle, sel("setOrientation:"), ORIENTATION_VERTICAL);
+        msgI(this.handle, sel("setAlignment:"), ATTRIBUTE_LEADING);
+        msgD(this.handle, sel("setSpacing:"), 6.0);
+        var handles: list[int] = [];
+        var i = 0;
+        while (i < titles.len()) {
+            let b = msgIII(cls("NSButton"), sel("radioButtonWithTitle:target:action:"), nsstr(titles[i]), 0, 0);
+            if (i == 0) {
+                msgI(b, sel("setState:"), STATE_ON);
+            } else {
+                msgI(b, sel("setState:"), 0);
+            }
+            msgI(this.handle, sel("addArrangedSubview:"), b);
+            onAction(b, radio_action(this.handle, i));
+            handles.push(b);
+            i = i + 1;
+        }
+        g_radio_buttons[this.handle] = handles;
+    }
+
+    ## The radio buttons, in order.
+    pub func buttons(): list[View] {
+        var out: list[View] = [];
+        for (b in g_radio_buttons[this.handle]) {
+            out.push(View(b));
+        }
+        return out;
+    }
+
+    pub func count(): int {
+        let n = g_radio_buttons[this.handle].len();
+        return n;
+    }
+
+    pub func titleAt(index: int): string {
+        let t = str_of(msg(g_radio_buttons[this.handle][index], sel("title")));
+        return t;
+    }
+
+    ## The index of the button that is on, or -1.
+    pub func selectedIndex(): int {
+        let buttons = g_radio_buttons[this.handle];
+        var i = 0;
+        while (i < buttons.len()) {
+            if (msg(buttons[i], sel("state")) == STATE_ON) {
+                return i;
+            }
+            i = i + 1;
+        }
+        return -1;
+    }
+
+    ## The title of the selected button ("" when none is).
+    pub func selectedTitle(): string {
+        let i = this.selectedIndex();
+        if (i < 0) {
+            return "";
+        }
+        let t = this.titleAt(i);
+        return t;
+    }
+
+    ## Turn on button `index` (-1: none) without running the change handler.
+    pub func setSelectedIndex(index: int): void {
+        let buttons = g_radio_buttons[this.handle];
+        var i = 0;
+        while (i < buttons.len()) {
+            if (i == index) {
+                msgI(buttons[i], sel("setState:"), STATE_ON);
+            } else {
+                msgI(buttons[i], sel("setState:"), 0);
+            }
+            i = i + 1;
+        }
+        return;
+    }
+
+    ## Run `handler` when the user picks a button.
+    pub func onChange(handler: fn(): void): void {
+        g_radio_change[this.handle] = handler;
+        return;
+    }
+
+    ## Click button `index` programmatically (runs the change handler).
+    pub func click(index: int): void {
+        msgI(g_radio_buttons[this.handle][index], sel("performClick:"), 0);
+        return;
+    }
+
+    pub func setEnabled(enabled: bool): void {
+        for (b in g_radio_buttons[this.handle]) {
+            msgI(b, sel("setEnabled:"), flag(enabled));
+        }
+        return;
+    }
+}
+
+# ── Switch ─────────────────────────────────────────────────────────────────
+
+## An on/off switch (NSSwitch).
+pub class Switch : Control {
+    pub func constructor() {
+        super(make("NSSwitch"));
+    }
+
+    pub func isOn(): bool {
+        let s = msg(this.handle, sel("state"));
+        return s == STATE_ON;
+    }
+
+    ## Set the state without running the change handler.
+    pub func setOn(on: bool): void {
+        msgI(this.handle, sel("setState:"), flag(on));
+        return;
+    }
+
+    ## Run `handler` when the user flips the switch.
+    pub func onChange(handler: fn(): void): void {
+        onAction(this.handle, handler);
+        return;
+    }
+
+    ## Flip the switch as the user would (runs the change handler).
+    pub func toggle(): void {
+        this.setOn(not this.isOn());
+        this.sendAction();
+        return;
+    }
+}
+
+# ── text fields ────────────────────────────────────────────────────────────
+
+## `- (void)controlTextDidEndEditing:(NSNotification*)note` (added to
+## LoupTarget by the first onEndEditing).
+func impTextDidEndEditing(self_obj: int, cmd: int, note: int): void {
+    let field = msg(note, sel("object"));
+    if (g_end_editing.contains_key(field)) {
+        runHandler(g_end_editing[field], "end editing");
+    }
+    return;
+}
+
+## `- (BOOL)control:(NSControl*)c textView:(NSTextView*)tv
+## doCommandBySelector:(SEL)command` (added by the first onReturn): Return is
+## the field editor's insertNewline: command. Answers NO, so AppKit goes on as
+## usual (ends editing and sends the action).
+func impDoCommand(self_obj: int, cmd: int, control: int, text_view: int, command: int): int {
+    if (command == sel("insertNewline:") and g_return.contains_key(control)) {
+        runHandler(g_return[control], "return");
+    }
+    return 0;
+}
+
+## Add `name` (implemented by `imp`) to LoupTarget; throws RuntimeError when
+## the class already has such a method (one an app added with class_addMethod).
+func add_target_method(name: string, imp: uint64, types: string, what: string): void {
+    let added = class_addMethod(targetClass(), sel(name), imp, types);
+    if (not added) {
+        throw RuntimeError("appkit.controls: " + what + ": LoupTarget already has " + name
+            + " (added by the app with class_addMethod)");
+    }
+    return;
+}
+
+## Make LoupTarget the delegate of `field` again, so NSControl registers it
+## for the delegate notifications it answers now (it checks when the delegate
+## is set).
+func reset_delegate(field: int): void {
+    msgI(field, sel("setDelegate:"), 0);
+    msgI(field, sel("setDelegate:"), target());
+    return;
+}
+
+## The two NSUInteger fields of the NSRange-valued property `key` of `obj`
+## (key-value coding into an NSValue, then memory).
+func range_of(obj: int, key: string): list[int] {
+    var out: list[int] = [];
+    let value = msgI(obj, sel("valueForKey:"), nsstr(key));
+    if (value == 0) {
+        out.push(0);
+        out.push(0);
+        return out;
+    }
+    let buf = malloc(16);
+    msgII(value, sel("getValue:size:"), buf, 16);
+    out.push(Volatile[int].at(buf).read());
+    out.push(Volatile[int].at(buf + 8).read());
+    free(buf);
+    return out;
+}
+
+## The editable text-field behaviour shared by TextField, SecureField,
+## SearchField and ComboBox (see "Text input" in the module header for the
+## exact handler contract).
+pub class TextInput : Control {
+    pub func constructor(handle: int) {
+        super(handle);
+    }
+
+    pub func text(): string {
+        let t = str_of(msg(this.handle, sel("stringValue")));
+        return t;
+    }
+
+    ## Replace the text (does not run the change handler).
+    pub func setText(text: string): void {
+        msgI(this.handle, sel("setStringValue:"), nsstr(text));
+        return;
+    }
+
+    ## Draw the text in `color` (a ColorRef).
+    pub func applyTextColor(color: ColorRef): void {
+        msgI(this.handle, sel("setTextColor:"), color.color_handle);
+        return;
+    }
+
+    ## The text color as a ColorRef.
+    pub func textColorRef(): ColorRef {
+        let c = color_ref_of(this.handle, "textColor");
+        return c;
+    }
+
+    ## Run `handler` when the user presses Return in the field — Return only,
+    ## not when editing ends otherwise (compare `onSubmit`). It runs first;
+    ## the field then sends its action (`onSubmit`) as usual. Replaces an
+    ## earlier one.
+    pub func onReturn(handler: fn(): void): void {
+        if (not g_return_method) {
+            add_target_method("control:textView:doCommandBySelector:", addressOf(impDoCommand), "c@:@@:", "TextInput.onReturn");
+            g_return_method = true;
+        }
+        g_return[this.handle] = handler;
+        reset_delegate(this.handle);
+        return;
+    }
+
+    ## Run `handler` whenever editing of the field ends (Return, Tab, a
+    ## click elsewhere, the focus moving to another view, Window.clearFocus)
+    ## — controlTextDidEndEditing:. Replaces an earlier one.
+    pub func onEndEditing(handler: fn(): void): void {
+        if (not g_end_method) {
+            add_target_method("controlTextDidEndEditing:", addressOf(impTextDidEndEditing), "v@:@", "TextInput.onEndEditing");
+            g_end_method = true;
+        }
+        g_end_editing[this.handle] = handler;
+        reset_delegate(this.handle);
+        return;
+    }
+
+    ## Whether the field sends its action (runs `onSubmit`) when editing ends
+    ## as well as on Return (the cell's sendsActionOnEndEditing). True for a
+    ## new TextField, false for a SecureField, a SearchField and a ComboBox.
+    pub func setSubmitsOnEndEditing(submits: bool): void {
+        msgI(msg(this.handle, sel("cell")), sel("setSendsActionOnEndEditing:"), flag(submits));
+        return;
+    }
+
+    pub func submitsOnEndEditing(): bool {
+        let s = bool_of(msg(msg(this.handle, sel("cell")), sel("sendsActionOnEndEditing")));
+        return s;
+    }
+
+    ## Whether the field is being edited (it has the field editor: it has the
+    ## keyboard focus, or would have in a key window).
+    pub func isEditing(): bool {
+        return msg(this.handle, sel("currentEditor")) != 0;
+    }
+
+    ## The selected text while the field is being edited ("" otherwise).
+    pub func selectedText(): string {
+        let editor = msg(this.handle, sel("currentEditor"));
+        if (editor == 0) {
+            return "";
+        }
+        let range = range_of(editor, "selectedRange");
+        let start = range[0];
+        let length = range[1];
+        if (length == 0) {
+            return "";
+        }
+        let part = msgII(msg(editor, sel("string")), sel("substringWithRange:"), start, length);
+        let s = str_of(part);
+        return s;
+    }
+
+    ## The field editor, starting to edit the field when it is not being
+    ## edited (focus, then the insertion point at the end of the text instead
+    ## of the whole text selected). 0 when the field is in no window.
+    func editorAtEnd(): int {
+        let current = msg(this.handle, sel("currentEditor"));
+        if (current != 0) {
+            return current;
+        }
+        this.focus();
+        let editor = msg(this.handle, sel("currentEditor"));
+        if (editor != 0) {
+            msgI(editor, sel("moveToEndOfDocument:"), 0);
+        }
+        return editor;
+    }
+
+    ## Type `text` at the insertion point as the keyboard would, WITHOUT
+    ## re-focusing: successive calls append, and each runs the change handler
+    ## (a live update per key). A field not being edited is focused first
+    ## with the insertion point at the end of its text. Throws ValueError for
+    ## "" (no key) and RuntimeError when the field is in no window.
+    pub func typeKey(text: string): void {
+        if (text.len() == 0) {
+            throw ValueError("appkit.controls: TextInput.typeKey needs at least one character");
+        }
+        let editor = this.editorAtEnd();
+        if (editor == 0) {
+            throw RuntimeError("appkit.controls: TextInput.typeKey: the field is in no window");
+        }
+        msgI(editor, sel("insertText:"), nsstr(text));
+        return;
+    }
+
+    ## Press Delete (backspace) as the keyboard would: delete the selection,
+    ## or the character before the insertion point (nothing at the start —
+    ## then no change handler runs). Focuses the field like `typeKey`.
+    pub func deleteBackward(): void {
+        let editor = this.editorAtEnd();
+        if (editor == 0) {
+            throw RuntimeError("appkit.controls: TextInput.deleteBackward: the field is in no window");
+        }
+        msgI(editor, sel("deleteBackward:"), 0);
+        return;
+    }
+
+    ## Select the whole text as ⌘A would (the next `typeKey` types over it,
+    ## `deleteBackward` deletes it). Focuses the field like `typeKey`.
+    pub func selectAll(): void {
+        let editor = this.editorAtEnd();
+        if (editor == 0) {
+            throw RuntimeError("appkit.controls: TextInput.selectAll: the field is in no window");
+        }
+        msgI(editor, sel("selectAll:"), 0);
+        return;
+    }
+
+    ## The grey hint shown while the field is empty.
+    pub func placeholder(): string {
+        let p = str_of(msg(this.handle, sel("placeholderString")));
+        return p;
+    }
+
+    pub func setPlaceholder(text: string): void {
+        msgI(this.handle, sel("setPlaceholderString:"), nsstr(text));
+        return;
+    }
+
+    ## Run `handler` on every edit (each keystroke, paste, cut).
+    pub func onChange(handler: fn(): void): void {
+        onTextChange(this.handle, handler);
+        return;
+    }
+
+    ## Run `handler` when the field sends its action: on Return, and — for a
+    ## TextField — also whenever editing ends (Tab, a click elsewhere,
+    ## another field taking the focus, Window.clearFocus), because its cell
+    ## sends the action on end editing. A SecureField, a SearchField and a
+    ## ComboBox send it on Return only (a SearchField also when its clear
+    ## button empties it). For Return only use `onReturn`; for the end of
+    ## editing `onEndEditing`; `setSubmitsOnEndEditing(false)` makes a
+    ## TextField's onSubmit Return-only too.
+    pub func onSubmit(handler: fn(): void): void {
+        onAction(this.handle, handler);
+        return;
+    }
+
+    pub func setEditable(editable: bool): void {
+        msgI(this.handle, sel("setEditable:"), flag(editable));
+        return;
+    }
+
+    pub func isEditable(): bool {
+        let e = bool_of(msg(this.handle, sel("isEditable")));
+        return e;
+    }
+
+    ## Move the keyboard focus to the field (it must be in a window).
+    pub func focus(): void {
+        let win = msg(this.handle, sel("window"));
+        if (win != 0) {
+            msgI(win, sel("makeFirstResponder:"), this.handle);
+        }
+        return;
+    }
+
+    ## Focus the field and type `text` as the keyboard would. Focusing
+    ## selects the whole text, so `text` REPLACES it (two calls leave the
+    ## second text; use `typeKey` to append). Runs the change handler — also
+    ## for `typeText("")`, which clears the field (and still runs the handler
+    ## when it was empty already). Does nothing when the field is in no
+    ## window. For tests and input automation.
+    pub func typeText(text: string): void {
+        this.focus();
+        let editor = msg(this.handle, sel("currentEditor"));
+        if (editor == 0) {
+            return;
+        }
+        if (text.len() > 0) {
+            msgI(editor, sel("insertText:"), nsstr(text));
+            return;
+        }
+        let had_text = msg(msg(editor, sel("string")), sel("length")) > 0;
+        if (had_text) {
+            msgI(editor, sel("deleteBackward:"), 0);
+        } else {
+            msgV(editor, sel("didChangeText"));
+        }
+        return;
+    }
+
+    ## Press Return in the field as the keyboard would: `onReturn`, then the
+    ## action (`onSubmit`). A field that is not being edited only sends its
+    ## action (after running `onReturn`).
+    pub func submit(): void {
+        let editor = msg(this.handle, sel("currentEditor"));
+        if (editor == 0) {
+            if (g_return.contains_key(this.handle)) {
+                runHandler(g_return[this.handle], "return");
+            }
+            this.sendAction();
+            return;
+        }
+        msgI(editor, sel("doCommandBySelector:"), sel("insertNewline:"));
+        return;
+    }
+}
+
+## An editable one-line text field.
+pub class TextField : TextInput {
+    pub func constructor(text: string) {
+        super(msgI(cls("NSTextField"), sel("textFieldWithString:"), nsstr(text)));
+    }
+}
+
+## A text field that shows bullets instead of the characters (passwords).
+pub class SecureField : TextInput {
+    pub func constructor() {
+        super(make("NSSecureTextField"));
+    }
+}
+
+## A rounded search field with a magnifying glass and a clear button.
+## `onSubmit` runs on Return (and when the clear button empties it);
+## `onChange` on every keystroke.
+pub class SearchField : TextInput {
+    pub func constructor() {
+        super(make("NSSearchField"));
+        msgI(this.handle, sel("setSendsWholeSearchString:"), 1);
+    }
+}
+
+# ── Slider ─────────────────────────────────────────────────────────────────
+
+## A horizontal (or vertical) slider over a range of values; it reports
+## changes continuously while dragged.
+pub class Slider : Control {
+    pub func constructor(min: float, max: float, value: float) {
+        super(msgDDDII(cls("NSSlider"), sel("sliderWithValue:minValue:maxValue:target:action:"),
+            value, min, max, 0, 0));
+        msgI(this.handle, sel("setContinuous:"), 1);
+    }
+
+    pub func value(): float {
+        let v = msgRetD(this.handle, sel("doubleValue"));
+        return v;
+    }
+
+    ## Move the knob (clamped to the range; does not run the change handler).
+    pub func setValue(value: float): void {
+        msgD(this.handle, sel("setDoubleValue:"), value);
+        return;
+    }
+
+    pub func min(): float {
+        let v = msgRetD(this.handle, sel("minValue"));
+        return v;
+    }
+
+    pub func max(): float {
+        let v = msgRetD(this.handle, sel("maxValue"));
+        return v;
+    }
+
+    pub func setMin(min: float): void {
+        msgD(this.handle, sel("setMinValue:"), min);
+        return;
+    }
+
+    pub func setMax(max: float): void {
+        msgD(this.handle, sel("setMaxValue:"), max);
+        return;
+    }
+
+    ## Run `handler` whenever the user moves the knob (continuously).
+    pub func onChange(handler: fn(): void): void {
+        onAction(this.handle, handler);
+        return;
+    }
+
+    ## Show `count` tick marks; with `snap`, the knob only stops on them.
+    pub func setTickMarks(count: int, snap: bool): void {
+        msgI(this.handle, sel("setNumberOfTickMarks:"), count);
+        msgI(this.handle, sel("setAllowsTickMarkValuesOnly:"), flag(snap));
+        return;
+    }
+
+    ## Run vertically (give it a tall, narrow frame).
+    pub func setVertical(vertical: bool): void {
+        msgI(this.handle, sel("setVertical:"), flag(vertical));
+        return;
+    }
+}
+
+# ── Stepper ────────────────────────────────────────────────────────────────
+
+## The up/down arrows that step a value within a range.
+pub class Stepper : Control {
+    pub func constructor(min: float, max: float, increment: float, value: float) {
+        super(make("NSStepper"));
+        msgD(this.handle, sel("setMinValue:"), min);
+        msgD(this.handle, sel("setMaxValue:"), max);
+        msgD(this.handle, sel("setIncrement:"), increment);
+        msgD(this.handle, sel("setDoubleValue:"), value);
+        msgI(this.handle, sel("setValueWraps:"), 0);
+    }
+
+    pub func value(): float {
+        let v = msgRetD(this.handle, sel("doubleValue"));
+        return v;
+    }
+
+    ## Set the value (clamped; does not run the change handler).
+    pub func setValue(value: float): void {
+        msgD(this.handle, sel("setDoubleValue:"), value);
+        return;
+    }
+
+    pub func min(): float {
+        let v = msgRetD(this.handle, sel("minValue"));
+        return v;
+    }
+
+    pub func max(): float {
+        let v = msgRetD(this.handle, sel("maxValue"));
+        return v;
+    }
+
+    pub func increment(): float {
+        let v = msgRetD(this.handle, sel("increment"));
+        return v;
+    }
+
+    pub func setMin(min: float): void {
+        msgD(this.handle, sel("setMinValue:"), min);
+        return;
+    }
+
+    pub func setMax(max: float): void {
+        msgD(this.handle, sel("setMaxValue:"), max);
+        return;
+    }
+
+    pub func setIncrement(increment: float): void {
+        msgD(this.handle, sel("setIncrement:"), increment);
+        return;
+    }
+
+    ## Wrap from max to min (and back) instead of stopping at the ends.
+    pub func setWraps(wraps: bool): void {
+        msgI(this.handle, sel("setValueWraps:"), flag(wraps));
+        return;
+    }
+
+    ## Run `handler` when the user clicks an arrow.
+    pub func onChange(handler: fn(): void): void {
+        onAction(this.handle, handler);
+        return;
+    }
+
+    ## Step up once as the up arrow does (runs the change handler).
+    pub func stepUp(): void {
+        this.step(1.0);
+        return;
+    }
+
+    ## Step down once as the down arrow does (runs the change handler).
+    pub func stepDown(): void {
+        this.step(-1.0);
+        return;
+    }
+
+    func step(direction: float): void {
+        let lo = this.min();
+        let hi = this.max();
+        var v = this.value() + direction * this.increment();
+        let wraps = bool_of(msg(this.handle, sel("valueWraps")));
+        if (v > hi) {
+            if (wraps) { v = lo; } else { v = hi; }
+        }
+        if (v < lo) {
+            if (wraps) { v = hi; } else { v = lo; }
+        }
+        this.setValue(v);
+        this.sendAction();
+        return;
+    }
+}
+
+# ── PopUpButton ────────────────────────────────────────────────────────────
+
+## A pop-up menu of titles, one of them selected.
+pub class PopUpButton : Control {
+    ## A pop-up with `items` (the first selected). Titles must be unique:
+    ## AppKit drops an earlier item with the same title.
+    pub func constructor(items: list[string]) {
+        super(make("NSPopUpButton"));
+        msgI(this.handle, sel("setPullsDown:"), 0);
+        msgI(this.handle, sel("addItemsWithTitles:"), nsstrings(items));
+    }
+
+    ## The item titles, in order.
+    pub func items(): list[string] {
+        let t = strings_of(msg(this.handle, sel("itemTitles")));
+        return t;
+    }
+
+    pub func count(): int {
+        let n = msg(this.handle, sel("numberOfItems"));
+        return n;
+    }
+
+    pub func addItem(title: string): void {
+        msgI(this.handle, sel("addItemWithTitle:"), nsstr(title));
+        return;
+    }
+
+    ## Replace all items with `items`.
+    pub func setItems(items: list[string]): void {
+        msgV(this.handle, sel("removeAllItems"));
+        msgI(this.handle, sel("addItemsWithTitles:"), nsstrings(items));
+        return;
+    }
+
+    pub func removeAll(): void {
+        msgV(this.handle, sel("removeAllItems"));
+        return;
+    }
+
+    ## The selected item's index, or -1.
+    pub func selectedIndex(): int {
+        let i = msg(this.handle, sel("indexOfSelectedItem"));
+        return i;
+    }
+
+    ## The selected item's title ("" when none).
+    pub func selectedTitle(): string {
+        let t = str_of(msg(this.handle, sel("titleOfSelectedItem")));
+        return t;
+    }
+
+    ## Select item `index` (does not run the change handler).
+    pub func select(index: int): void {
+        msgI(this.handle, sel("selectItemAtIndex:"), index);
+        return;
+    }
+
+    ## Select the item titled `title` (none if there is no such item).
+    pub func selectTitle(title: string): void {
+        msgI(this.handle, sel("selectItemWithTitle:"), nsstr(title));
+        return;
+    }
+
+    ## Pick item `index` as the user would from the open menu: select it and
+    ## send the action (runs the change handler) —
+    ## `performActionForItemAtIndex:` on the pop-up's menu. Throws
+    ## ValueError for an index out of range.
+    pub func choose(index: int): void {
+        if (index < 0 or index >= this.count()) {
+            throw ValueError("appkit.controls: PopUpButton.choose: no item " + index.to_string()
+                + " (" + this.count().to_string() + " items)");
+        }
+        msgI(msg(this.handle, sel("menu")), sel("performActionForItemAtIndex:"), index);
+        return;
+    }
+
+    ## Run `handler` when the user picks an item.
+    pub func onChange(handler: fn(): void): void {
+        onAction(this.handle, handler);
+        return;
+    }
+}
+
+# ── ComboBox ───────────────────────────────────────────────────────────────
+
+## An editable text field with a drop-down list of suggestions. It is a
+## TextInput (text, placeholder, typeText, onSubmit, …); `onChange` also runs
+## when an item is picked from the list.
+pub class ComboBox : TextInput {
+    pub func constructor(items: list[string], text: string) {
+        super(make("NSComboBox"));
+        msgI(this.handle, sel("addItemsWithObjectValues:"), nsstrings(items));
+        msgI(this.handle, sel("setStringValue:"), nsstr(text));
+        msgI(this.handle, sel("setCompletes:"), 1);
+    }
+
+    ## The list items, in order.
+    pub func items(): list[string] {
+        let t = strings_of(msg(this.handle, sel("objectValues")));
+        return t;
+    }
+
+    pub func count(): int {
+        let n = msg(this.handle, sel("numberOfItems"));
+        return n;
+    }
+
+    pub func addItem(item: string): void {
+        msgI(this.handle, sel("addItemWithObjectValue:"), nsstr(item));
+        return;
+    }
+
+    pub func removeAll(): void {
+        msgV(this.handle, sel("removeAllItems"));
+        return;
+    }
+
+    ## The index of the list item picked, or -1 (e.g. after typing).
+    pub func selectedIndex(): int {
+        let i = msg(this.handle, sel("indexOfSelectedItem"));
+        return i;
+    }
+
+    ## Pick list item `index` (its text fills the field; no change handler).
+    pub func select(index: int): void {
+        msgI(this.handle, sel("selectItemAtIndex:"), index);
+        return;
+    }
+
+    ## Run `handler` when the text is edited, an item is picked from the list
+    ## or Return is pressed (use either this or `onSubmit`, not both: both
+    ## use the control's action).
+    pub override func onChange(handler: fn(): void): void {
+        onTextChange(this.handle, handler);
+        onAction(this.handle, handler);
+        return;
+    }
+}
+
+# ── SegmentedControl ───────────────────────────────────────────────────────
+
+## A row of segments of which one is selected (select-one tracking).
+pub class SegmentedControl : Control {
+    pub func constructor(labels: list[string]) {
+        super(msgIIII(cls("NSSegmentedControl"), sel("segmentedControlWithLabels:trackingMode:target:action:"),
+            nsstrings(labels), 0, 0, 0));
+        msgI(this.handle, sel("setSelectedSegment:"), 0);
+    }
+
+    pub func count(): int {
+        let n = msg(this.handle, sel("segmentCount"));
+        return n;
+    }
+
+    pub func labelAt(index: int): string {
+        let t = str_of(msgI(this.handle, sel("labelForSegment:"), index));
+        return t;
+    }
+
+    ## All segment labels, in order.
+    pub func labels(): list[string] {
+        var out: list[string] = [];
+        let n = this.count();
+        var i = 0;
+        while (i < n) {
+            out.push(this.labelAt(i));
+            i = i + 1;
+        }
+        return out;
+    }
+
+    pub func setLabel(index: int, text: string): void {
+        msgII(this.handle, sel("setLabel:forSegment:"), nsstr(text), index);
+        return;
+    }
+
+    ## The selected segment, or -1.
+    pub func selectedIndex(): int {
+        let i = msg(this.handle, sel("selectedSegment"));
+        return i;
+    }
+
+    ## Select segment `index` (does not run the change handler).
+    pub func setSelectedIndex(index: int): void {
+        msgI(this.handle, sel("setSelectedSegment:"), index);
+        return;
+    }
+
+    ## Run `handler` when the user picks a segment.
+    pub func onChange(handler: fn(): void): void {
+        onAction(this.handle, handler);
+        return;
+    }
+}
+
+# ── ProgressBar / Spinner ──────────────────────────────────────────────────
+
+## A progress bar: determinate (value 0..max) or indeterminate (an animated
+## stripe between `start()` and `stop()`).
+pub class ProgressBar : View {
+    ## A determinate bar from 0 to `max`, at 0.
+    pub func constructor(max: float) {
+        super(make("NSProgressIndicator"));
+        msgI(this.handle, sel("setStyle:"), PROGRESS_BAR);
+        msgI(this.handle, sel("setIndeterminate:"), 0);
+        msgD(this.handle, sel("setMinValue:"), 0.0);
+        msgD(this.handle, sel("setMaxValue:"), max);
+        msgD(this.handle, sel("setDoubleValue:"), 0.0);
+    }
+
+    pub func value(): float {
+        let v = msgRetD(this.handle, sel("doubleValue"));
+        return v;
+    }
+
+    pub func setValue(value: float): void {
+        msgD(this.handle, sel("setDoubleValue:"), value);
+        return;
+    }
+
+    pub func max(): float {
+        let v = msgRetD(this.handle, sel("maxValue"));
+        return v;
+    }
+
+    pub func setMax(max: float): void {
+        msgD(this.handle, sel("setMaxValue:"), max);
+        return;
+    }
+
+    ## Switch between determinate (false) and indeterminate (true).
+    pub func setIndeterminate(indeterminate: bool): void {
+        msgI(this.handle, sel("setIndeterminate:"), flag(indeterminate));
+        return;
+    }
+
+    pub func isIndeterminate(): bool {
+        let i = bool_of(msg(this.handle, sel("isIndeterminate")));
+        return i;
+    }
+
+    ## Start the indeterminate animation.
+    pub func start(): void {
+        msgI(this.handle, sel("startAnimation:"), 0);
+        g_animating[this.handle] = true;
+        return;
+    }
+
+    ## Stop the indeterminate animation.
+    pub func stop(): void {
+        msgI(this.handle, sel("stopAnimation:"), 0);
+        g_animating.remove(this.handle);
+        return;
+    }
+
+    ## Whether `start()` was called without a later `stop()`.
+    pub func isAnimating(): bool {
+        let a = g_animating.contains_key(this.handle);
+        return a;
+    }
+}
+
+## A spinning busy indicator (hidden while stopped). Give it a square frame
+## (16 or 32 points).
+pub class Spinner : ProgressBar {
+    pub func constructor() {
+        super(100.0);
+        msgI(this.handle, sel("setStyle:"), PROGRESS_SPINNING);
+        msgI(this.handle, sel("setIndeterminate:"), 1);
+        msgI(this.handle, sel("setDisplayedWhenStopped:"), 0);
+    }
+}
+
+# ── LevelIndicator ─────────────────────────────────────────────────────────
+
+## A capacity / rating / relevancy meter (NSLevelIndicator).
+pub class LevelIndicator : Control {
+    ## A continuous capacity bar from `min` to `max`, at `value`.
+    pub func constructor(min: float, max: float, value: float) {
+        super(make("NSLevelIndicator"));
+        msgI(this.handle, sel("setLevelIndicatorStyle:"), LEVEL_CONTINUOUS);
+        msgD(this.handle, sel("setMinValue:"), min);
+        msgD(this.handle, sel("setMaxValue:"), max);
+        msgD(this.handle, sel("setDoubleValue:"), value);
+    }
+
+    pub func value(): float {
+        let v = msgRetD(this.handle, sel("doubleValue"));
+        return v;
+    }
+
+    pub func setValue(value: float): void {
+        msgD(this.handle, sel("setDoubleValue:"), value);
+        return;
+    }
+
+    pub func min(): float {
+        let v = msgRetD(this.handle, sel("minValue"));
+        return v;
+    }
+
+    pub func max(): float {
+        let v = msgRetD(this.handle, sel("maxValue"));
+        return v;
+    }
+
+    ## One of the LEVEL_* constants. For LEVEL_DISCRETE and LEVEL_RATING the
+    ## range is the number of segments / stars (e.g. 0..5).
+    pub func setStyle(style: int): void {
+        msgI(this.handle, sel("setLevelIndicatorStyle:"), style);
+        return;
+    }
+
+    pub func style(): int {
+        let s = msg(this.handle, sel("levelIndicatorStyle"));
+        return s;
+    }
+
+    ## Above this value the bar turns yellow (capacity styles).
+    pub func setWarning(value: float): void {
+        msgD(this.handle, sel("setWarningValue:"), value);
+        return;
+    }
+
+    ## Above this value the bar turns red (capacity styles).
+    pub func setCritical(value: float): void {
+        msgD(this.handle, sel("setCriticalValue:"), value);
+        return;
+    }
+
+    ## Let the user set the level by clicking / dragging (e.g. a rating).
+    pub func setEditable(editable: bool): void {
+        msgI(this.handle, sel("setEditable:"), flag(editable));
+        return;
+    }
+
+    ## Run `handler` when the user changes an editable indicator.
+    pub func onChange(handler: fn(): void): void {
+        onAction(this.handle, handler);
+        return;
+    }
+}
+
+# ── ColorWell ──────────────────────────────────────────────────────────────
+
+## A color well: shows a color; clicking it opens the color panel.
+pub class ColorWell : Control {
+    ## A well showing the sRGB color (r, g, b), opaque.
+    pub func constructor(r: float, g: float, b: float) {
+        super(make("NSColorWell"));
+        msgI(this.handle, sel("setColor:"), nscolor(r, g, b, 1.0));
+    }
+
+    ## The color's sRGB components (0..1).
+    pub func color(): Color {
+        let c = color_of(msg(this.handle, sel("color")));
+        return c;
+    }
+
+    ## Show the sRGB color (r, g, b, a) (does not run the change handler).
+    pub func setColor(r: float, g: float, b: float, a: float): void {
+        msgI(this.handle, sel("setColor:"), nscolor(r, g, b, a));
+        return;
+    }
+
+    ## Run `handler` when the user picks a color in the color panel.
+    pub func onChange(handler: fn(): void): void {
+        onAction(this.handle, handler);
+        return;
+    }
+}
+
+# ── DatePicker ─────────────────────────────────────────────────────────────
+
+## A date picker (Gregorian calendar, local time zone), showing the date and
+## optionally the time of day.
+pub class DatePicker : Control {
+    ## A text-and-stepper picker for year, month and day, set to today.
+    pub func constructor() {
+        super(make("NSDatePicker"));
+        msgI(this.handle, sel("setCalendar:"), gregorian());
+        msgI(this.handle, sel("setDatePickerStyle:"), DATE_STEPPER);
+        msgI(this.handle, sel("setDatePickerElements:"), DATE_ELEMENTS_YMD);
+        msgI(this.handle, sel("setDateValue:"), msg(cls("NSDate"), sel("date")));
+    }
+
+    ## One of the DATE_* constants (DATE_CALENDAR needs about 140 × 150 points).
+    pub func setStyle(style: int): void {
+        msgI(this.handle, sel("setDatePickerStyle:"), style);
+        return;
+    }
+
+    ## Also show (and edit) hours and minutes.
+    pub func setShowsTime(shows: bool): void {
+        var elements = DATE_ELEMENTS_YMD;
+        if (shows) {
+            elements = DATE_ELEMENTS_YMD | DATE_ELEMENTS_HM;
+        }
+        msgI(this.handle, sel("setDatePickerElements:"), elements);
+        return;
+    }
+
+    func component(unit: int): int {
+        let date = msg(this.handle, sel("dateValue"));
+        let v = msgII(gregorian(), sel("component:fromDate:"), unit, date);
+        return v;
+    }
+
+    pub func year(): int {
+        let v = this.component(UNIT_YEAR);
+        return v;
+    }
+
+    ## 1..12.
+    pub func month(): int {
+        let v = this.component(UNIT_MONTH);
+        return v;
+    }
+
+    ## 1..31.
+    pub func day(): int {
+        let v = this.component(UNIT_DAY);
+        return v;
+    }
+
+    ## The date as "YYYY-MM-DD".
+    pub func date(): string {
+        let text = pad(this.year(), 4) + "-" + pad(this.month(), 2) + "-" + pad(this.day(), 2);
+        return text;
+    }
+
+    ## Show `year`-`month`-`day` at 12:00 local time (does not run the change
+    ## handler). Out-of-range parts roll over as NSCalendar does (month 13 is
+    ## January of the next year).
+    pub func setDate(year: int, month: int, day: int): void {
+        let parts = make("NSDateComponents");
+        msgI(parts, sel("setYear:"), year);
+        msgI(parts, sel("setMonth:"), month);
+        msgI(parts, sel("setDay:"), day);
+        msgI(parts, sel("setHour:"), 12);
+        let date = msgI(gregorian(), sel("dateFromComponents:"), parts);
+        msgV(parts, sel("release"));
+        if (date == 0) {
+            throw ValueError("appkit.controls: no such date " + year.to_string() + "-" + month.to_string() + "-" + day.to_string());
+        }
+        msgI(this.handle, sel("setDateValue:"), date);
+        return;
+    }
+
+    ## Show the date written "YYYY-MM-DD" (throws ValueError otherwise).
+    pub func setDateText(text: string): void {
+        let parts = text.split("-");
+        if (parts.len() != 3) {
+            throw ValueError("appkit.controls: expected a date YYYY-MM-DD, got '" + text + "'");
+        }
+        this.setDate(parts[0].toInt(), parts[1].toInt(), parts[2].toInt());
+        return;
+    }
+
+    ## Run `handler` when the user changes the date.
+    pub func onChange(handler: fn(): void): void {
+        onAction(this.handle, handler);
+        return;
+    }
+}
+
+# ── ImageView ──────────────────────────────────────────────────────────────
+
+## Shows an image from a file or an SF Symbol, scaled to fit its frame.
+pub class ImageView : Control {
+    ## An empty image view; fill it with `loadFile` or `setSymbol`.
+    pub func constructor() {
+        super(make("NSImageView"));
+        msgI(this.handle, sel("setImageScaling:"), SCALE_FIT);
+    }
+
+    ## Show the image file at `path` (PNG, JPEG, PDF, HEIC, …). Returns false
+    ## (and shows nothing) when it cannot be read.
+    pub func loadFile(path: string): bool {
+        let img = msgI(msg(cls("NSImage"), sel("alloc")), sel("initWithContentsOfFile:"), nsstr(path));
+        msgI(this.handle, sel("setImage:"), img);
+        if (img == 0) {
+            return false;
+        }
+        msgV(img, sel("release"));
+        return true;
+    }
+
+    ## Show the SF Symbol `name` (e.g. "star.fill", "folder") drawn at
+    ## `pointSize` points. Returns false when there is no such symbol.
+    pub func setSymbol(name: string, pointSize: float): bool {
+        let img = msgII(cls("NSImage"), sel("imageWithSystemSymbolName:accessibilityDescription:"), nsstr(name), nsstr(name));
+        if (img == 0) {
+            msgI(this.handle, sel("setImage:"), 0);
+            return false;
+        }
+        let config = msgDD(cls("NSImageSymbolConfiguration"), sel("configurationWithPointSize:weight:"), pointSize, 0.0);
+        let sized = msgI(img, sel("imageWithSymbolConfiguration:"), config);
+        msgI(this.handle, sel("setImage:"), sized);
+        return true;
+    }
+
+    ## Tint a symbol image (sRGB components in 0..1).
+    pub func setTint(r: float, g: float, b: float, a: float): void {
+        msgI(this.handle, sel("setContentTintColor:"), nscolor(r, g, b, a));
+        return;
+    }
+
+    ## Tint a symbol image with `color` (a system color follows the
+    ## appearance).
+    pub func applyTint(color: ColorRef): void {
+        msgI(this.handle, sel("setContentTintColor:"), color.color_handle);
+        return;
+    }
+
+    ## The tint (`isNone()` for none).
+    pub func tint(): ColorRef {
+        let c = color_ref_of(this.handle, "contentTintColor");
+        return c;
+    }
+
+    pub func hasImage(): bool {
+        return msg(this.handle, sel("image")) != 0;
+    }
+
+    ## The image's own width in points (0 without an image).
+    pub func imageWidth(): float {
+        let size = point_of(msg(this.handle, sel("image")), "size");
+        let w = size.x;
+        return w;
+    }
+
+    ## The image's own height in points (0 without an image).
+    pub func imageHeight(): float {
+        let size = point_of(msg(this.handle, sel("image")), "size");
+        let h = size.y;
+        return h;
+    }
+
+    ## Scaling: "fit" (proportional, up or down — the default), "down"
+    ## (proportional, never enlarged), "fill" (stretch) or "none".
+    pub func setScaling(mode: string): void {
+        var v = SCALE_FIT;
+        if (mode == "down") {
+            v = SCALE_DOWN;
+        } else if (mode == "fill") {
+            v = SCALE_FILL;
+        } else if (mode == "none") {
+            v = SCALE_NONE;
+        } else if (mode != "fit") {
+            throw ValueError("appkit.controls: unknown image scaling '" + mode + "' (fit, down, fill, none)");
+        }
+        msgI(this.handle, sel("setImageScaling:"), v);
+        return;
+    }
+}
